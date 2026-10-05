@@ -534,8 +534,29 @@ export class AuthService {
     );
   }
 
-  /** The CSRF token to send with a state-changing request, or null if there is none. */
+  /** The CSRF token, as the backend last echoed it in a response body.
+   *
+   * Held in memory rather than read out of the cookie, because this app and the
+   * API are on different hosts and frontend JavaScript can never see the API's
+   * cookies: `document.cookie` only holds this origin's own. The browser still
+   * sends the cookie with every credentialed request (which is the half the
+   * server compares against); this is the half that goes in the header.
+   *
+   * The `/csrf` endpoint echoes the token it just set precisely so callers that
+   * cannot read the cookie do not have to.
+   */
+  private csrfMemory: string | null = null;
+
+  /** The CSRF token to send with a state-changing request, or null if there is none.
+   *
+   * Memory first, cookie as fallback (same-host development, where the cookie is
+   * readable and no body token may have been fetched yet).
+   */
   readCsrfToken(): string | null {
+    if (this.csrfMemory) {
+      return this.csrfMemory;
+    }
+
     if (!this.isBrowser) {
       return null;
     }
@@ -570,19 +591,18 @@ export class AuthService {
 
     if (!user) {
       this.bootstrapPromise = null;
+      // A token from the previous session would only mismatch the next one.
+      this.csrfMemory = null;
     }
   }
 
   /**
-   * Asks for a CSRF token, which arrives as the readable cookie the interceptor
-   * picks it up from.
+   * Asks for a CSRF token, keeping the echoed body value.
    *
    * Subscribed here rather than returned, because an `HttpClient` request is cold:
-   * building one and not subscribing to it sends nothing at all. Nothing needs the
-   * value — the cookie is the store, and the interceptor reads it back at the
-   * moment it needs it — so a failure here is swallowed rather than surfaced.
-   * Duplicating the token in memory would create a second copy of a secret that
-   * exists precisely so that only the server and this cookie hold it.
+   * building one and not subscribing to it sends nothing at all. A failure here is
+   * swallowed rather than surfaced: callers that need the value use
+   * `refreshCsrfToken` and await it instead.
    */
   /**
    * Fetches a new CSRF token, for a request refused with a stale one.
@@ -595,13 +615,17 @@ export class AuthService {
       return of(undefined);
     }
 
-    // Awaitable, and that is the whole point. The caller has to read the new cookie
-    // *after* the browser has stored it, and reading it straight after firing the
-    // request gets the old one — so a retry sent that way carries the token that was
-    // just refused, and is refused again for the same reason.
+    // Awaitable, and that is the whole point. The caller has to use the token
+    // *after* the browser has stored its cookie twin, and sending a header read
+    // before that gets the value that was just refused, which fails again for
+    // exactly the same reason and looks like the fix doing nothing. The body
+    // carries the token, so there is no cookie to wait on.
     return this.http
       .get<CsrfResponseDto>(`${this.baseUrl}/api/auth/csrf`, this.credentials())
       .pipe(
+        tap((response) => {
+          this.csrfMemory = response.csrf_token;
+        }),
         map(() => undefined),
         // A refresh that fails is not worth a second exception on top of the first.
         catchError(() => of(undefined)),
@@ -614,6 +638,9 @@ export class AuthService {
     }
 
     this.http.get<CsrfResponseDto>(`${this.baseUrl}/api/auth/csrf`, this.credentials()).subscribe({
+      next: (response) => {
+        this.csrfMemory = response.csrf_token;
+      },
       error: () => undefined,
     });
   }
