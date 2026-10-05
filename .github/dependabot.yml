@@ -1,0 +1,58 @@
+version: 2
+
+updates:
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "02:30"
+
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "npm"
+    directory: "/backend"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "03:00"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "pip"    # Use "pip" for pip, Poetry, uv, setup.py, etc.
+    directory: "/backend"             
+    schedule:
+      interval: "monthly" 
+      day: "monday"
+      time: "03:30"
+    open-pull-requests-limit: 5 
+    
+    # Group updates together to reduce PR spam
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "docker"    
+    directory: "/backend"             
+    schedule:
+      interval: "monthly" 
+      day: "monday"
+      time: "04:00"
+    open-pull-requests-limit: 5 
+
+  - package-ecosystem: "docker"    
+    directory: "/frontend"             
+    schedule:
+      interval: "monthly" 
+      day: "monday"
+      time: "04:30"
+    open-pull-requests-limit: 5 
+
+  - package-ecosystem: "github-actions"    
+    directory: "/"             
+    schedule:
+      interval: "monthly" 
+      day: "monday"
+      time: "02:50"
+    open-pull-requests-limit: 5 
+
