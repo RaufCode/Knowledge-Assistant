@@ -1,0 +1,23 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+pydantic[email]
+sqlalchemy
+psycopg[binary]
+psycopg2-binary
+openai
+llama-index-core
+llama-index-embeddings-nvidia
+
+# Authentication. jwt/signing only: jose does the part of JWT handling that is
+# easy to get subtly wrong, and no auth framework is pulled in.
+python-jose[cryptography]
+
+# Password hashing. bcrypt is pinned below 4.1 because passlib 1.7.4 probes the
+# backend at import time and raises on 4.1+, with a message about password length
+# that points nowhere near the real cause.
+passlib[bcrypt]
+bcrypt==4.0.1
+
+# Rate limiting on the two endpoints worth guessing against.
+slowapi
