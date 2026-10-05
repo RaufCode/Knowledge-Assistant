@@ -1,0 +1,111 @@
+# Values here mirror backend/.env.example, which mirrors the defaults in
+# backend/app/config.py. Change a setting in one place and carry it to the
+# others, otherwise local and deployed drift apart.
+services:
+  - type: web
+    name: knowledge-assistant-backend
+    runtime: docker
+    plan: free
+    # `main` is the repository default. Deploys track it so local,
+    # preview and production all build from the same branch.
+    branch: main
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+
+    envVars:
+      # `production` is what forces `Secure` on the session cookies and refuses to
+      # seed an administrator from `AUTH_SEED_ADMIN_*`. Nothing else in the
+      # blueprint sets it, so without this the service would run with development
+      # cookie flags in production.
+      - key: ENVIRONMENT
+        value: "production"
+
+      # Signs the session and CSRF tokens. Set in the Render dashboard; a random
+      # value of at least 32 characters. Rotating it signs everybody out.
+      - key: AUTH_SECRET_KEY
+        sync: false
+
+      # The one-time key that admits the first administrator through
+      # `POST /api/auth/bootstrap-admin`. Set in the dashboard, and removed once a
+      # real administrator exists — from then on the route answers 409 whatever the
+      # key is.
+      - key: AUTH_BOOTSTRAP_KEY
+        sync: false
+
+      # Generation key, set in the Render dashboard. An absent or revoked key does
+      # not stop the service booting, it only makes /chat fail, so /health
+      # reports it.
+      - key: NVIDIA_API_KEY
+        sync: false
+
+      # Retrieval key, kept separate so embedding traffic has its own quota.
+      # Required at startup: the policy documents are embedded while the index is
+      # built, so a missing key here is a failed deploy rather than a 503.
+      - key: NVIDIA_EMBEDDING_API_KEY
+        sync: false
+
+      # NVIDIA serves an OpenAI-compatible API at this base URL.
+      - key: NVIDIA_BASE_URL
+        value: https://integrate.api.nvidia.com/v1
+
+      - key: LLM_MODEL
+        value: openai/gpt-oss-20b
+
+      - key: LLM_TEMPERATURE
+        value: "0.5"
+
+      - key: LLM_TOP_P
+        value: "1"
+
+      - key: LLM_MAX_TOKENS
+        value: "1024"
+
+      # A 429/5xx is retried with backoff before a question gives up with a 503.
+      - key: LLM_MAX_ATTEMPTS
+        value: "3"
+
+      - key: EMBED_MODEL
+        value: nvidia/nemotron-3-embed-1b
+
+      # Tuned against this embedding model with `python scripts/tune.py`, which
+      # prints the score of every retrieved chunk. A threshold that is too high
+      # makes every question look like "not found".
+      - key: MIN_SCORE
+        value: "0.40"
+
+      # The frontend is served from its own origin, not localhost, so the
+      # previous value locked the deployed app out of the API. A wildcard is safe
+      # while the API only serves public document data and requires no cookie
+      # session. If a cookie session is added, this becomes the frontend's exact
+      # origin, which is the hostname Render generated for the service below.
+      - key: ALLOWED_ORIGINS
+        value: "*"
+
+      # Neon, set in the Render dashboard. This service no longer provisions a
+      # database of its own, so local and deployed run against the same Neon
+      # instance and a migration cannot land in only one of them.
+      - key: DATABASE_URL
+        sync: false
+
+  # The Angular app, server-rendered, so it needs a Node runtime and not a static
+  # host: `ng build` emits both the browser bundle and the Express server that
+  # renders the first paint.
+  - type: web
+    # No name on purpose. Render generates a free one, which is the way out here:
+    # "knowledge-assistant-frontend" is already taken by an unrelated Vite app, and
+    # a blueprint cannot claim a name that is in use. The name is also the hostname,
+    # so read the generated URL off the service page after the first deploy rather
+    # than assuming it.
+    runtime: node
+    plan: free
+    branch: main
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    startCommand: npm run serve:ssr:frontend
+
+    envVars:
+      # Angular 22 requires ^22.22.3, ^24.15.0 or newer, and resolves the 24.x line
+      # to whatever is current. `PORT` is set by Render and read by src/server.ts,
+      # so it is not declared here.
+      - key: NODE_VERSION
+        value: "24"
