@@ -86,6 +86,47 @@ class UserResponse(BaseModel):
     user: UserDto
 
 
+class UserSummaryDto(BaseModel):
+    """One account, as an administrator's list shows it."""
+
+    id: str
+    name: str
+    email: str
+    role: Role
+    is_active: bool
+    created_at: datetime
+
+
+class UserListResponse(BaseModel):
+    """One page of accounts, with its own page count so the pager cannot disagree."""
+
+    users: list[UserSummaryDto]
+    total: int
+    page: int
+    per_page: int
+    pages: int
+
+
+class UserUpdateRequest(BaseModel):
+    """Corrections to an account. Every field optional and independent."""
+
+    name: NameStr | None = None
+    email: EmailStr | None = None
+    role: Role | None = None
+    is_active: bool | None = None
+
+
+class PasswordResetRequest(BaseModel):
+    """A new password, chosen by an administrator for somebody locked out."""
+
+    password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+
+    @field_validator("password")
+    @classmethod
+    def check_policy(cls, value: str) -> str:
+        return check_password_policy(value)
+
+
 class CsrfResponse(BaseModel):
     """The double-submit token, echoed so the caller need not read the cookie.
 

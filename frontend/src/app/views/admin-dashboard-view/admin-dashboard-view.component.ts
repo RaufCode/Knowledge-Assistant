@@ -132,8 +132,7 @@ import { formatRelativeTime } from '../../shared/utils/relative-time.util';
               </span>
 
               <p class="min-w-0 flex-1 text-sm text-muted-foreground">
-                Nothing yet. Access requests, and questions asked from this browser,
-                will show up here.
+                Nothing yet. Access requests will show up here once people start asking.
               </p>
             </div>
           } @else {

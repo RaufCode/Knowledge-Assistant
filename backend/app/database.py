@@ -302,6 +302,29 @@ def find_open_access_request(db: SessionLocal, email: str) -> AccessRequest | No
     )
 
 
+def revoke_all_sessions(db: SessionLocal, user_id: str) -> int:
+    """Ends every live session for an account, and says how many it ended.
+
+    Used when a password is reset: a reset that leaves the old sessions running
+    resets nothing, because whoever prompted it — or whoever copied the cookie —
+    is still signed in. Revoked rather than deleted, so the rows remain as a
+    record that a session once existed and was ended deliberately.
+    """
+    now = datetime.now(timezone.utc)
+    live = db.scalars(
+        select(RefreshSession).where(
+            RefreshSession.user_id == user_id, RefreshSession.revoked_at.is_(None)
+        )
+    ).all()
+
+    for session in live:
+        session.revoked_at = now
+
+    db.commit()
+
+    return len(live)
+
+
 def revoke_family(db: SessionLocal, family_id: str) -> int:
     """Revokes every live session in one login's family, and says how many.
 

@@ -119,9 +119,9 @@ describe('ChatSidebarComponent', () => {
       item.textContent?.trim(),
     );
 
-    // The account card holds only sign-out. Password changes have no endpoint
-    // behind them, so none is offered.
-    expect(labels).toEqual(['Sign out']);
+    // Changing your own password is offered from the account card, so it does not
+    // require finding yourself in a list of other people first.
+    expect(labels).toEqual(['Change password', 'Sign out']);
   });
 
   it('offers the way back while in the assistant, from the same row', async () => {

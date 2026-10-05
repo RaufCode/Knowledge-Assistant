@@ -1511,3 +1511,140 @@ class AccountCreationTests(AuthTestCase):
 
         self.assertNotEqual(stored.password_hash, self.PASSWORD)
         self.assertTrue(stored.is_active)
+
+
+class UserManagementTest(AuthTestCase):
+    def create_employee(self, email: str, client=None) -> dict:
+        return self.invite_and_accept(
+            client or self.new_client(), email, role="employee"
+        )
+
+    def test_admin_lists_every_account_paged(self):
+        admin = self.signed_in_admin()
+        self.create_employee(f"ama@{COMPANY}")
+        self.create_employee(f"kofi@{COMPANY}")
+
+        response = admin.get("/api/auth/users?page=1")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["total"], 3)
+        self.assertEqual(body["page"], 1)
+        self.assertEqual(body["per_page"], 10)
+        self.assertEqual(body["pages"], 1)
+        self.assertEqual(len(body["users"]), 3)
+
+    def test_employee_is_refused_the_list(self):
+        self.signed_in_admin()
+        employee = self.new_client()
+        self.invite_and_accept(employee, f"ama@{COMPANY}")
+
+        self.assertEqual(employee.get("/api/auth/users").status_code, 403)
+
+    def test_admin_can_make_an_employee_an_admin(self):
+        admin = self.signed_in_admin()
+        user = self.create_employee(f"ama@{COMPANY}")
+
+        response = admin.patch(
+            f"/api/auth/users/{user['id']}",
+            json={"role": "admin"},
+            headers=self.csrf_headers(admin),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["role"], "admin")
+        self.assertEqual(self.stored_user(f"ama@{COMPANY}").role, "admin")
+
+    def test_admin_cannot_demote_themselves(self):
+        admin = self.signed_in_admin()
+        admin_id = admin.get("/api/auth/me").json()["id"]
+
+        response = admin.patch(
+            f"/api/auth/users/{admin_id}",
+            json={"role": "employee"},
+            headers=self.csrf_headers(admin),
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_admin_cannot_take_an_address_in_use(self):
+        admin = self.signed_in_admin()
+        user = self.create_employee(f"ama@{COMPANY}")
+
+        response = admin.patch(
+            f"/api/auth/users/{user['id']}",
+            json={"email": f"admin@{COMPANY}"},
+            headers=self.csrf_headers(admin),
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_reset_password_signs_in_with_the_new_one(self):
+        admin = self.signed_in_admin()
+        user = self.create_employee(f"ama@{COMPANY}")
+
+        response = admin.post(
+            f"/api/auth/users/{user['id']}/password",
+            json={"password": "brand-new-password-1!"},
+            headers=self.csrf_headers(admin),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        employee = self.new_client()
+        self.assertEqual(
+            employee.post(
+                "/api/auth/login",
+                json={"email": f"ama@{COMPANY}", "password": "brand-new-password-1!"},
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.new_client().post(
+                "/api/auth/login",
+                json={"email": f"ama@{COMPANY}", "password": PASSWORD},
+            ).status_code,
+            401,
+        )
+
+    def test_delete_removes_the_account_and_its_access(self):
+        admin = self.signed_in_admin()
+        user = self.create_employee(f"ama@{COMPANY}")
+
+        response = admin.delete(
+            f"/api/auth/users/{user['id']}", headers=self.csrf_headers(admin)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(self.stored_user(f"ama@{COMPANY}"))
+
+        self.assertEqual(
+            self.new_client().post(
+                "/api/auth/login",
+                json={"email": f"ama@{COMPANY}", "password": PASSWORD},
+            ).status_code,
+            401,
+        )
+
+    def test_admin_cannot_delete_themselves(self):
+        admin = self.signed_in_admin()
+        admin_id = admin.get("/api/auth/me").json()["id"]
+
+        response = admin.delete(
+            f"/api/auth/users/{admin_id}", headers=self.csrf_headers(admin)
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_unknown_account_is_a_404(self):
+        admin = self.signed_in_admin()
+
+        self.assertEqual(
+            admin.get("/api/auth/users?page=99").status_code, 200
+        )
+        self.assertEqual(
+            admin.patch(
+                "/api/auth/users/no-such-id",
+                json={"role": "admin"},
+                headers=self.csrf_headers(admin),
+            ).status_code,
+            404,
+        )

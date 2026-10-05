@@ -16,7 +16,7 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from jose import JWTError
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
@@ -24,11 +24,14 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import (
     AccessRequest,
+    Conversation,
     Invite,
+    Message,
     RefreshSession,
     User,
     find_open_access_request,
     find_user_by_email,
+    revoke_all_sessions,
     revoke_family,
 )
 from app.dependencies import (
@@ -56,9 +59,13 @@ from app.schemas_auth import (
     InviteRequest,
     InviteResponse,
     LoginRequest,
+    PasswordResetRequest,
     StatusResponse,
     UserDto,
+    UserListResponse,
     UserResponse,
+    UserSummaryDto,
+    UserUpdateRequest,
 )
 from app.security import (
     REFRESH_TOKEN_TYPE,
@@ -972,6 +979,200 @@ def bootstrap_admin(
     logger.info("bootstrapped the first administrator: %s", user.email)
 
     return UserResponse(user=_user_dto(user))
+
+
+# --------------------------------------------------------------------------- #
+# Managing the accounts that exist.                                             #
+# --------------------------------------------------------------------------- #
+
+# How many rows one page of the accounts list carries. Fixed rather than sent by the
+# client so the page size is a decision made once, and so a caller cannot ask for
+# every account in the system in one response.
+USERS_PAGE_SIZE = 10
+
+
+@router.get("/users", response_model=UserListResponse)
+def list_users(
+    page: int = Query(default=1, ge=1),
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> UserListResponse:
+    """Every account, a page at a time, newest first. Administrators only."""
+    total = db.scalar(select(func.count(User.id))) or 0
+    pages = max(1, -(-total // USERS_PAGE_SIZE))
+    current = min(page, pages)
+
+    rows = db.scalars(
+        select(User)
+        .order_by(User.created_at.desc(), User.id)
+        .offset((current - 1) * USERS_PAGE_SIZE)
+        .limit(USERS_PAGE_SIZE)
+    ).all()
+
+    return UserListResponse(
+        users=[
+            UserSummaryDto(
+                id=row.id,
+                name=row.name,
+                email=row.email,
+                role=row.role,
+                is_active=row.is_active,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ],
+        total=total,
+        page=current,
+        per_page=USERS_PAGE_SIZE,
+        pages=pages,
+    )
+
+
+def _user_or_404(db: Session, user_id: str) -> User:
+    user = db.get(User, user_id)
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="That account no longer exists."
+        )
+
+    return user
+
+
+def _refuse_self(target: User, admin: User, action: str) -> None:
+    """Refuses an administrator acting on their own account.
+
+    Deleting, demoting or deactivating yourself ends with nobody able to
+    administer the system, and the bootstrap route is refused once any
+    administrator exists — so in practice the deployment is finished. Refused
+    with a 409 rather than quietly ignored.
+    """
+    if target.id != admin.id:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=f"You cannot {action} your own account. Ask another administrator to do it.",
+    )
+
+
+@router.patch("/users/{user_id}", response_model=UserSummaryDto)
+def update_user(
+    user_id: str,
+    req: UserUpdateRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    _csrf: None = Depends(require_csrf),
+) -> UserSummaryDto:
+    """Corrects an account: name, address, role, or whether it is on.
+
+    Every field is optional and independent. An address change is refused if it
+    is already somebody else's, and acting on your own account the fatal ways is
+    refused by the same guard as deleting it.
+    """
+    user = _user_or_404(db, user_id)
+
+    if req.email is not None and req.email != user.email:
+        clash = find_user_by_email(db, req.email)
+
+        if clash is not None and clash.id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Another account already uses that address.",
+            )
+
+    if req.role is not None and req.role != "admin":
+        _refuse_self(user, admin, "demote")
+
+    if req.is_active is False:
+        _refuse_self(user, admin, "deactivate")
+
+    if req.name is not None:
+        user.name = req.name
+    if req.email is not None:
+        user.email = req.email
+    if req.role is not None:
+        user.role = req.role
+    if req.is_active is not None:
+        user.is_active = req.is_active
+
+    user.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    logger.info("administrator updated %s by %s", user.email, admin.email)
+
+    return UserSummaryDto(
+        id=user.id,
+        name=user.name,
+        email=user.email,
+        role=user.role,
+        is_active=user.is_active,
+        created_at=user.created_at,
+    )
+
+
+@router.delete("/users/{user_id}", response_model=StatusResponse)
+def delete_user(
+    user_id: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    _csrf: None = Depends(require_csrf),
+) -> StatusResponse:
+    """Removes an account, and everything belonging to it.
+
+    Their conversations go with them rather than being orphaned, and their
+    sessions and invitations with those. From that moment they cannot sign in.
+    """
+    user = _user_or_404(db, user_id)
+    _refuse_self(user, admin, "delete")
+
+    for conversation in db.scalars(
+        select(Conversation).where(Conversation.user_id == user.id)
+    ).all():
+        db.query(Message).filter(Message.conversation_id == conversation.id).delete(
+            synchronize_session=False
+        )
+        db.delete(conversation)
+
+    db.query(RefreshSession).filter(RefreshSession.user_id == user.id).delete()
+    db.query(Invite).filter(Invite.user_id == user.id).delete()
+    db.query(AccessRequest).filter(AccessRequest.email == user.email).delete()
+
+    email = user.email
+    db.delete(user)
+    db.commit()
+
+    logger.info("administrator deleted the account %s", email)
+
+    return StatusResponse(status="deleted")
+
+
+@router.post("/users/{user_id}/password", response_model=StatusResponse)
+def reset_user_password(
+    user_id: str,
+    req: PasswordResetRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    _csrf: None = Depends(require_csrf),
+) -> StatusResponse:
+    """Sets a new password for somebody locked out of their account.
+
+    Every live session is revoked with it: a password reset that leaves old
+    sessions running resets nothing. The administrator hands the new password
+    over themselves — there is no mail service to deliver a link with.
+    """
+    user = _user_or_404(db, user_id)
+
+    user.password_hash = hash_password(req.password)
+    user.is_active = True
+    user.updated_at = datetime.now(timezone.utc)
+
+    revoke_all_sessions(db, user.id)
+    db.commit()
+
+    logger.info("administrator reset the password for %s", user.email)
+
+    return StatusResponse(status="password-reset")
 
 
 def _usable_invite_or_404(db: Session, token: str) -> Invite:

@@ -14,15 +14,13 @@ import { IdentityService } from './identity.service';
  * The administrator's recent activity, assembled from the reads that already exist.
  *
  * There is no event log on the backend, so this builds one out of what can be
- * asked. Access requests carry when they arrived and when they were decided;
- * conversations carry when they were last active. Both are real, and between them
- * they cover the two things an administrator is asked about most: who is waiting
- * for an account, and what questions are being asked.
+ * asked. Access requests carry when they arrived and when they were decided, and
+ * between them they cover what an administrator is asked about most: who is
+ * waiting for an account.
  *
- * The conversations are this browser's own, because the backend scopes them to a
- * client id and has no endpoint that lists anybody else's. That is a real limit
- * rather than a simplification, so each row names who was involved instead of
- * implying it is the whole company's traffic.
+ * Questions asked are deliberately not in here. A feed row per question would
+ * read as surveillance of what people typed, and the conversations count beside
+ * it already says how much is being asked.
  *
  * Nothing here invents an event. A source that cannot be read contributes no rows,
  * which is why every one of them is allowed to come back empty rather than being
@@ -51,18 +49,16 @@ export class ActivityService {
   /**
    * Every event available, newest first.
    *
-   * Merged rather than shown as separate lists: this is read as one chronology, and
-   * two lists stacked by recency would leave the reader working out which row is
-   * the more recent one themselves.
+   * Access requests and their decisions, as one chronology: the ask and the
+   * answer to it belong together, and a decision with nothing to attach it to is
+   * a number nobody can act on.
    */
-  readonly items = computed<ActivityItem[]>(() => {
-    const fromRequests = this.requestsState().flatMap(toRequestActivity);
-    const fromConversations = this.conversationsState().map(toConversationActivity);
-
-    return [...fromRequests, ...fromConversations]
+  readonly items = computed<ActivityItem[]>(() =>
+    this.requestsState()
+      .flatMap(toRequestActivity)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-      .slice(0, ACTIVITY_LIMIT);
-  });
+      .slice(0, ACTIVITY_LIMIT),
+  );
 
   /** True when there is genuinely nothing to show, as opposed to nothing loaded yet. */
   readonly isEmpty = computed(
@@ -158,15 +154,4 @@ function toRequestActivity(row: AccessRequestRowDto): ActivityItem[] {
   };
 
   return [decided, asked];
-}
-
-/** One conversation as an event, named after the conversation itself. */
-function toConversationActivity(conversation: Conversation): ActivityItem {
-  return {
-    id: `conversation-${conversation.id}`,
-    actor: conversation.title ?? 'A new conversation',
-    summary: 'was asked in this browser',
-    createdAt: conversation.updatedAt,
-    icon: 'message-square-text',
-  };
 }
