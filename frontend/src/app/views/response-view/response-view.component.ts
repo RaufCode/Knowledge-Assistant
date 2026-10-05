@@ -6,8 +6,8 @@ import { map } from 'rxjs';
 import { ChatService } from '../../core/services/chat.service';
 import { QuestionInputComponent } from '../../features/ask/components/question-input/question-input.component';
 import { ViewHeaderComponent } from '../../features/chat/components/view-header/view-header.component';
-import { AnswerPendingComponent } from '../../features/response/components/answer-pending/answer-pending.component';
 import { ChatThreadComponent } from '../../features/response/components/chat-thread/chat-thread.component';
+import { SkeletonComponent } from '../../shared/components/skeleton/skeleton.component';
 
 /**
  * Shows one conversation: its whole thread and the composer for follow-up
@@ -22,9 +22,9 @@ import { ChatThreadComponent } from '../../features/response/components/chat-thr
   selector: 'app-response-view',
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
-    AnswerPendingComponent,
     ChatThreadComponent,
     QuestionInputComponent,
+    SkeletonComponent,
     ViewHeaderComponent,
   ],
   host: { class: 'flex min-h-0 flex-1 flex-col' },
@@ -35,21 +35,41 @@ import { ChatThreadComponent } from '../../features/response/components/chat-thr
 
     @if (chat.isResolving()) {
       <!--
-        A conversation is on its way. One card saying so, rather than a skeleton of a
-        question above a skeleton of an answer: nothing here is being read or worked
-        out, so the card says the true thing instead of imitating work.
-
-        The wording is overridden because this wait is a fetch, not a question being
-        answered, and "Thinking" would claim work that is not happening.
+        A conversation is on its way. Skeleton cards in the shape of the thread,
+        not a spinner: this is a stored thread being read back, and it arrives as
+        cards, so the placeholders are cards. Nothing here is being thought up,
+        so thinking bubbles would claim work that is not happening.
       -->
-      <div class="mx-auto w-full max-w-thread flex-1 px-4 py-6 sm:px-6 lg:px-8">
-        <div class="max-w-[520px]">
-          <app-answer-pending
-            label="Loading conversation"
-            announcement="Loading this conversation."
-          />
+      <div class="mx-auto w-full max-w-thread flex-1 px-4 py-6 sm:px-6 lg:px-8" aria-hidden="true">
+        <div class="flex flex-col gap-5">
+          <div class="flex justify-end">
+            <app-skeleton class="h-10 w-44 rounded-2xl sm:w-56" />
+          </div>
+
+          <div class="rounded-lg border border-border bg-card p-4">
+            <app-skeleton class="h-3.5 w-40" />
+            <app-skeleton class="mt-2.5 h-2.5 w-full" />
+            <app-skeleton class="mt-1.5 h-2.5 w-11/12" />
+            <app-skeleton class="mt-1.5 h-2.5 w-3/5" />
+            <div class="mt-3 flex gap-1.5">
+              <app-skeleton class="h-5 w-20 rounded-full" />
+              <app-skeleton class="h-5 w-24 rounded-full" />
+            </div>
+          </div>
+
+          <div class="flex justify-end">
+            <app-skeleton class="h-10 w-32 rounded-2xl sm:w-44" />
+          </div>
+
+          <div class="rounded-lg border border-border bg-card p-4">
+            <app-skeleton class="h-3.5 w-32" />
+            <app-skeleton class="mt-2.5 h-2.5 w-full" />
+            <app-skeleton class="mt-1.5 h-2.5 w-2/3" />
+          </div>
         </div>
       </div>
+
+      <span class="sr-only" role="status">Loading this conversation.</span>
     } @else if (chat.isMissing()) {
       <!-- A link to a conversation that is gone: deleted, or belonging to another
            client. Said plainly, rather than as an empty thread, which would read
