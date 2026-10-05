@@ -274,6 +274,21 @@ export class LoginViewComponent {
       },
       error: (error: unknown) => {
         this.isSubmitting.set(false);
+
+        // This backend refuses a correct sign-in for an unapproved account exactly
+        // like a wrong password, so a request made in this browser is the only
+        // thing that can tell the two apart. A remembered request earns the waiting
+        // screen rather than an error that claims the password is wrong; anything
+        // else keeps the generic refusal, which discloses nothing about who asked.
+        const remembered = this.auth.pendingRequestFor(this.form.controls.email.value);
+
+        if ((error as { status?: number } | null)?.status === 401 && remembered !== null) {
+          this.auth.notePendingAccess(remembered.name, remembered.role);
+          void this.router.navigate(['/pending-approval']);
+
+          return;
+        }
+
         this.notice.set(readSignInFailure(error));
       },
     });

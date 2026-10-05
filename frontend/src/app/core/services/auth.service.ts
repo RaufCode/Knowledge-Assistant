@@ -310,6 +310,8 @@ export class AuthService {
             if (this.isBrowser) {
               document.cookie = `ika_pending=; path=/; max-age=0; samesite=lax`;
             }
+            // Approved since the request was made: nothing left to wait on.
+            this.forgetAccessRequest(user.email);
             this.setUser(user);
             // Sign-in rotates the CSRF cookie server-side, so the one held here is no
             // longer the one the server expects.
@@ -364,7 +366,96 @@ export class AuthService {
    */
   readonly lastPending = this.pendingState.asReadonly();
 
-  /** `GET /api/auth/invite/{token}`. Used to pre-fill the accept screen. */
+  /** Local store for access requests made in this browser. */
+  private static readonly PENDING_REQUEST_KEY = 'ika_pending_request';
+
+  /** Remembers an access request made here, so a later sign-in can explain a refusal.
+   *
+   * The backend answers a correct sign-in for an unapproved account exactly as it
+   * answers a wrong password, so without this memory there is no telling the two
+   * apart. What is stored is only what the person typed moments ago on this same
+   * browser — never anything the server confirmed — which bounds what it can say.
+   */
+  private rememberAccessRequest(name: string, email: string, role: Role): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    try {
+      localStorage.setItem(
+        AuthService.PENDING_REQUEST_KEY,
+        JSON.stringify({ name: name.trim(), email: email.trim().toLowerCase(), role }),
+      );
+    } catch {
+      // Remembering is a courtesy. A browser that refuses storage still gets the
+      // generic refusal rather than a second failure about remembering.
+    }
+  }
+
+  /** The access request remembered for this address, if it was made here. */
+  pendingRequestFor(email: string): { name: string; role: Role } | null {
+    if (!this.isBrowser) {
+      return null;
+    }
+
+    try {
+      const raw = localStorage.getItem(AuthService.PENDING_REQUEST_KEY);
+
+      if (!raw) {
+        return null;
+      }
+
+      const stored = JSON.parse(raw) as { name?: unknown; email?: unknown; role?: unknown };
+
+      if (typeof stored.email !== 'string' || stored.email !== email.trim().toLowerCase()) {
+        return null;
+      }
+
+      return {
+        name: typeof stored.name === 'string' ? stored.name : '',
+        role: stored.role === 'admin' ? 'admin' : 'employee',
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Forgets the remembered request, once its account signs in. */
+  private forgetAccessRequest(email: string): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    try {
+      const raw = localStorage.getItem(AuthService.PENDING_REQUEST_KEY);
+
+      if (raw) {
+        const stored = JSON.parse(raw) as { email?: unknown };
+
+        if (stored.email === email.trim().toLowerCase()) {
+          localStorage.removeItem(AuthService.PENDING_REQUEST_KEY);
+        }
+      }
+    } catch {
+      // Best effort, as above.
+    }
+  }
+
+  /**
+   * Shows the waiting screen for a request remembered from this browser.
+   *
+   * For a backend that distinguishes "right password, not approved" with its own
+   * answer, this never runs — that answer carries the person's verified details.
+   * Here the details are what was typed at registration, which is all there is.
+   */
+  notePendingAccess(name: string, role: Role | null): void {
+    const dto: PendingApprovalDto = { status: 'pending', name, requested_role: role };
+    this.pendingState.set(dto);
+
+    if (this.isBrowser) {
+      document.cookie = `ika_pending=${btoa(JSON.stringify(dto))}; path=/; samesite=lax; max-age=86400`;
+    }
+  }
   previewInvite(token: string): Observable<InvitePreviewDto> {
     return this.http.get<InvitePreviewDto>(
       `${this.baseUrl}/api/auth/invite/${encodeURIComponent(token)}`,
@@ -418,6 +509,8 @@ export class AuthService {
       `${this.baseUrl}/api/auth/request-access`,
       body,
       this.credentials(),
+    ).pipe(
+      tap(() => this.rememberAccessRequest(name, email, role)),
     );
   }
 

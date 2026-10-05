@@ -43,8 +43,14 @@ import { IconComponent } from '../../../../shared/components/icon/icon.component
         </h1>
 
         <p class="max-w-sm text-sm leading-relaxed text-muted-foreground">
-          Thanks {{ firstName() }} — your request has been received and an administrator
-          has to approve it before you can use the assistant.
+          @if (firstName()) {
+            Thanks {{ firstName() }} — your request has been received and an administrator
+            has to approve it before you can use the assistant.
+          } @else {
+            Your request has been received and an administrator has to approve it
+            before you can use the assistant. Try signing in again once you have
+            heard back.
+          }
         </p>
 
         @if (pending()?.requested_role; as asked) {
