@@ -21,7 +21,6 @@ import {
   SourceReference,
   toKnownAnswerStatus,
 } from '../models/message.model';
-import { greetingReply, isGreeting } from '../../shared/utils/greeting.util';
 import { ApiError, ApiService, STREAM_INCOMPLETE_MESSAGE } from './api.service';
 import { ConversationService } from './conversation.service';
 import { IdentityService } from './identity.service';
@@ -156,15 +155,6 @@ export class ChatService {
       return;
     }
 
-    // Small talk is answered on the spot: no retrieval, no model call, nothing
-    // stored. The backend knows policies, not pleasantries, and sending "hello"
-    // there only ever comes back as a gap in the corpus.
-    if (isGreeting(trimmed)) {
-      this.answerGreeting(trimmed);
-
-      return;
-    }
-
     this.conversations
       .ready()
       .pipe(
@@ -271,23 +261,9 @@ export class ChatService {
     }
 
     const question = this.questionFor(messageId);
-
-    if (question === null) {
-      return;
-    }
-
-    // A greeting never went to the backend, so asking it "again" must not start
-    // now: it is answered the same local way it was the first time.
-    if (isGreeting(question)) {
-      this.conversations.removeExchange(messageId);
-      this.answerGreeting(question);
-
-      return;
-    }
-
     const conversationId = this.conversations.activeId();
 
-    if (!conversationId) {
+    if (question === null || !conversationId) {
       return;
     }
 
@@ -298,24 +274,6 @@ export class ChatService {
     this.dispatch(conversationId, exchange.assistantId, question)
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe();
-  }
-
-  /**
-   * Writes a greeting and its warm answer straight into the open thread.
-   *
-   * No conversation is created and nothing is sent: small talk is not something
-   * to keep, and a thread nobody has asked anything in yet is not one either.
-   * The next real question opens the conversation as usual.
-   */
-  private answerGreeting(question: string): void {
-    const exchange = this.conversations.appendExchange(question);
-
-    this.conversations.resolveMessage(exchange.assistantId, {
-      text: greetingReply(),
-      status: 'greeting',
-      sources: [],
-      confidence: null,
-    });
   }
 
   /**

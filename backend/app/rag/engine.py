@@ -7,7 +7,7 @@ from llama_index.core.schema import MetadataMode
 from openai import APIConnectionError, APIStatusError, OpenAI, OpenAIError
 
 from app.config import settings
-from app.rag.guard import is_personal_question
+from app.rag.guard import is_greeting, is_personal_question
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,31 @@ TITLE_MAX_CHARS = 50
 # budget of a few dozen was consumed by the thinking and the call came back with
 # no content at all, so every title silently fell back to truncation.
 TITLE_MAX_TOKENS = 256
+
+# Output budget for a greeting. Generous for two sentences, because the
+# configured model is a reasoning model that spends tokens thinking before it
+# writes anything: a budget of a few dozen was consumed by the thinking and the
+# call came back with no content at all.
+GREETING_MAX_TOKENS = 256
+
+# How a greeting is answered when the model itself cannot be reached. Static
+# rather than absent: an outage should not turn "hello" into a lecture about
+# the corpus.
+GREETING_FALLBACK = (
+    "Hello! I'm the Internal Knowledge Assistant for Acme Technologies. "
+    "I answer questions from our company policies — ask me about leave, "
+    "working hours, benefits, IT setup, or conduct."
+)
+
+# A greeting gets no retrieval and no policy context: there is nothing to look
+# up, and handing the policies over would only invite quoting them at small
+# talk. The model is told to be brief and to point at what it is for.
+GREETING_SYSTEM_PROMPT = (
+    "You are the Internal Knowledge Assistant for Acme Technologies, greeting "
+    "somebody who just said hello. Reply warmly in one or two short sentences: "
+    "greet them back, say you answer questions from the company policies, and "
+    "invite one. Name no policy and quote no document."
+)
 
 
 def truncate_title(text: str, max_chars: int = TITLE_MAX_CHARS) -> str:
@@ -281,6 +306,22 @@ class Assistant:
         authority on everything: it decides what the answer was and which sources
         belong to it, and a client renders the citation block only once it arrives.
         """
+        # Small talk first: a greeting answered from retrieval is a "not found in
+        # the documents", which reads as a confused assistant rather than an
+        # honest one. No retrieval, no context — there is nothing to look up.
+        if is_greeting(question):
+            yield {"type": "status", "stage": "writing"}
+            answer = self.greet(question)
+            yield {"type": "delta", "text": answer}
+            yield {
+                "type": "done",
+                "answer": answer,
+                "answered": True,
+                "status": "greeting",
+                "sources": [],
+            }
+            return
+
         if is_personal_question(question):
             yield {"type": "done", "answer": PERSONAL_MSG, "answered": False, "sources": []}
             return
@@ -330,6 +371,10 @@ class Assistant:
             yield {"type": "done", "answer": text, "answered": True, "sources": sources}
 
     def ask(self, question: str) -> dict:
+        if is_greeting(question):
+            answer = self.greet(question)
+            return {"answer": answer, "answered": True, "status": "greeting", "sources": []}
+
         if is_personal_question(question):
             return {"answer": PERSONAL_MSG, "answered": False, "sources": []}
 
@@ -361,6 +406,26 @@ class Assistant:
             for n in nodes
         ]
         return {"answer": text, "answered": True, "sources": sources}
+
+    def greet(self, question: str) -> str:
+        """A polite reply to small talk, from the model and nothing else.
+
+        No retrieval and no policy context: there is nothing to ground it in,
+        and the model is told to keep it to a greeting. Falls back to a static
+        reply when the model cannot be reached, so an outage does not turn
+        "hello" into an error.
+        """
+        try:
+            raw = self._complete(
+                question,
+                system_prompt=GREETING_SYSTEM_PROMPT,
+                max_tokens=GREETING_MAX_TOKENS,
+            )
+        except LlmUnavailable as exc:
+            logger.warning("greeting answered statically: %s", exc.reason)
+            return GREETING_FALLBACK
+
+        return raw.strip() or GREETING_FALLBACK
 
     def _retrieve(self, question: str) -> list:
         """The retrieved chunks worth answering from, or none at all.

@@ -353,6 +353,9 @@ def send_message(
                             role="assistant",
                             content=event["answer"],
                             sources=event["sources"] or None,
+                            # Recorded so a reloaded conversation renders this turn the
+                            # same way it did as it streamed.
+                            status=event.get("status"),
                         )
                     )
                     touch(db, conversation)

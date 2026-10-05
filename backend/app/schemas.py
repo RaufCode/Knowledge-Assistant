@@ -55,6 +55,10 @@ class MessageDto(BaseModel):
     content: str
     sources: list[Source] | None = None
     created_at: datetime
+    # How the assistant answered, or null on a question and on any message stored
+    # before this field existed. Null is read downstream as "worked it out from the
+    # citations", which is what those older rows can still support.
+    status: str | None = None
 
 
 ConversationDetailResponse.model_rebuild()

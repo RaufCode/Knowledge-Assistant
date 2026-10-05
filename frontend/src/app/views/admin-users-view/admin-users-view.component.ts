@@ -114,7 +114,7 @@ interface HandedOver {
           }
 
           <div class="overflow-hidden rounded-lg border border-border bg-card">
-            @if (isLoading()) {
+            @if (isLoading() && users().length === 0) {
               <p class="px-4 py-8 text-center text-sm text-muted-foreground">Loading accounts…</p>
             } @else if (visibleUsers().length === 0) {
               <div class="px-4 py-12 text-center">
@@ -457,11 +457,16 @@ export class AdminUsersViewComponent {
   protected readonly users = signal<UserSummaryDto[]>([]);
   protected readonly total = signal(0);
   protected readonly page = signal(1);
-  protected readonly pages = signal(1);
+  protected readonly perPage = signal(10);
   protected readonly isLoading = signal(false);
   protected readonly isBusy = signal(false);
   protected readonly notice = signal('');
   protected readonly search = signal('');
+
+  /** Page count, derived here so a delete updates it without refetching. */
+  protected readonly pages = computed(() =>
+    Math.max(1, Math.ceil(this.total() / this.perPage())),
+  );
 
   /**
    * The accounts on this page matching the search.
@@ -634,7 +639,7 @@ export class AdminUsersViewComponent {
         this.users.set(result.users);
         this.total.set(result.total);
         this.page.set(result.page);
-        this.pages.set(result.pages);
+        this.perPage.set(result.per_page);
         this.isLoading.set(false);
       },
       error: (error: unknown) => {
@@ -705,10 +710,15 @@ export class AdminUsersViewComponent {
     this.notice.set('');
 
     this.auth.updateUser(target.id, { role: this.chosenRole() }).subscribe({
-      next: () => {
+      next: (updated) => {
         this.isBusy.set(false);
         this.roleTarget.set(null);
-        this.load(this.page());
+        // Written onto the row in place: the server answered with the corrected
+        // account, so there is nothing a refetch could add and the rest of the
+        // page never flickers.
+        this.users.update((rows) =>
+          rows.map((user) => (user.id === target.id ? updated : user)),
+        );
       },
       error: (error: unknown) => {
         this.isBusy.set(false);
@@ -754,7 +764,7 @@ export class AdminUsersViewComponent {
     this.deleteTarget.set(user);
   }
 
-  /** Deletes the confirmed account, stepping back a page if its last row went. */
+  /** Deletes the confirmed account, lifting its row out without touching the rest. */
   protected deleteUser(): void {
     const target = this.deleteTarget();
     this.deleteTarget.set(null);
@@ -769,8 +779,15 @@ export class AdminUsersViewComponent {
     this.auth.deleteUser(target.id).subscribe({
       next: () => {
         this.isBusy.set(false);
-        const remaining = this.users().length - 1;
-        this.load(remaining === 0 && this.page() > 1 ? this.page() - 1 : this.page());
+        this.users.update((rows) => rows.filter((user) => user.id !== target.id));
+        this.total.update((total) => Math.max(0, total - 1));
+
+        // The page emptied out from under the pager: step back to the previous
+        // one, which is the only case that still needs the server. Anything
+        // else stays exactly as it was.
+        if (this.users().length === 0 && this.page() > 1) {
+          this.load(this.page() - 1);
+        }
       },
       error: (error: unknown) => {
         this.isBusy.set(false);

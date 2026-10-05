@@ -69,6 +69,12 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(16))
     content: Mapped[str] = mapped_column(Text)
     sources: Mapped[list | None] = mapped_column(JSON, nullable=True, default=None)
+    # How the assistant's turn was answered, on an assistant message and null on
+    # a question. Recorded so a reloaded thread renders the same card it did as
+    # it streamed: a greeting cites nothing, and without this it is
+    # indistinguishable from a genuine gap in the corpus. Added to live tables by
+    # `_ensure_missing_columns` on startup.
+    status: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
