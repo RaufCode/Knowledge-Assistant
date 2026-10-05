@@ -110,16 +110,15 @@ def _bearer_cookie_kwargs(max_age: int) -> dict:
 
     `httponly` keeps the value out of reach of JavaScript, which is the single most
     important line here. `secure` stops the browser sending it over plain http, and
-    production forces it on regardless of the setting. `samesite="lax"` rather than
-    `strict` because the invitation is followed from a mail client: `strict` would
-    withhold the cookies on that first top-level navigation, and `lax` still
-    withholds them from every cross-site sub-request, which is the exposure that
-    matters.
+    production forces it on regardless of the setting. `samesite` is `"none"` in
+    production (cross-subdomain frontend/backend on `*.onrender.com` are cross-site,
+    so `lax` withholds the cookies from every `fetch` and sign-in never sticks)
+    and `"lax"` for local http, where `none` without `secure` would be rejected.
     """
     return {
         "httponly": True,
         "secure": settings.cookies_are_secure,
-        "samesite": "lax",
+        "samesite": "none" if settings.cookies_are_secure else "lax",
         "path": "/",
         "max_age": max_age,
     }
@@ -166,7 +165,7 @@ def set_session_cookies(
         "1",
         httponly=False,
         secure=settings.cookies_are_secure,
-        samesite="lax",
+        samesite="none" if settings.cookies_are_secure else "lax",
         path="/",
         max_age=settings.refresh_token_ttl_seconds,
     )
@@ -203,7 +202,7 @@ def set_csrf_cookie(response: Response, token: str | None = None) -> str:
         # Readable by script on purpose; see above.
         httponly=False,
         secure=settings.cookies_are_secure,
-        samesite="lax",
+        samesite="none" if settings.cookies_are_secure else "lax",
         path="/",
         # A session, not a week: it is reissued on every sign-in and every refresh.
         max_age=settings.refresh_token_ttl_seconds,

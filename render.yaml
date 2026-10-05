@@ -73,13 +73,22 @@ services:
       - key: MIN_SCORE
         value: "0.40"
 
-      # The frontend is served from its own origin, not localhost, so the
-      # previous value locked the deployed app out of the API. A wildcard is safe
-      # while the API only serves public document data and requires no cookie
-      # session. If a cookie session is added, this becomes the frontend's exact
-      # origin, which is the hostname Render generated for the service below.
+      # The deployed Angular frontend. Listed explicitly (no wildcard) so
+      # credentialed CORS responses carry a concrete `Access-Control-Allow-Origin`
+      # and the CSRF origin check has something real to compare against.
       - key: ALLOWED_ORIGINS
-        value: "*"
+        value: "https://knowledge-assistant-chatbot-app.onrender.com"
+
+      # Must match the browser's exact origin (`https`, host, no trailing slash).
+      # `localhost` and `127.0.0.1` are different origins; a mismatch shows up as
+      # a 403 on state-changing calls, not as a CORS error.
+      - key: CSRF_TRUSTED_ORIGINS
+        value: "https://knowledge-assistant-chatbot-app.onrender.com"
+
+      # Where invitation links point. The backend default is localhost, which is
+      # useless once deployed.
+      - key: FRONTEND_BASE_URL
+        value: "https://knowledge-assistant-chatbot-app.onrender.com"
 
       # Neon, set in the Render dashboard. This service no longer provisions a
       # database of its own, so local and deployed run against the same Neon

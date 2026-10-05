@@ -22,10 +22,11 @@
  * only permits `127.0.0.1` by default, so a `localhost` page is refused with a 400
  * before any of this matters.
  */
-// The deployed backend on Render. Both services are `*.onrender.com`, so they are
-// the same site and the `SameSite=Lax` session cookies are attached; the backend
-// reflects the origin because `ALLOWED_ORIGINS` is `*`, which is what makes a
-// credentialed cross-origin response acceptable to the browser.
+// The deployed backend on Render. The backend lists this app's exact origin in
+// `ALLOWED_ORIGINS`/`CSRF_TRUSTED_ORIGINS`, which is what makes a credentialed
+// cross-origin response acceptable to the browser. Session cookies are
+// `SameSite=None; Secure` in production so the browser attaches them to these
+// cross-subdomain `fetch` calls (`withCredentials` in `ApiService`).
 export const API_BASE_URL = 'https://knowledge-assistant-chatbot.onrender.com';
 
 // Local development. The backend runs from `backend/` with
