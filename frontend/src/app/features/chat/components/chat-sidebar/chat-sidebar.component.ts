@@ -26,9 +26,9 @@ import { ButtonComponent } from '../../../../shared/components/button/button.com
 import { ConfirmDialogComponent } from '../../../../shared/components/confirm-dialog/confirm-dialog.component';
 import { IconComponent, type IconName } from '../../../../shared/components/icon/icon.component';
 import { FormFieldComponent } from '../../../../shared/components/form-field/form-field.component';
-import { InputComponent } from '../../../../shared/components/input/input.component';
 import { ModalComponent } from '../../../../shared/components/modal/modal.component';
 import { ConversationItemComponent } from '../../../conversations/components/conversation-item/conversation-item.component';
+import { ConversationSearchComponent } from '../../../conversations/components/conversation-search/conversation-search.component';
 import { BrandLogoComponent } from '../brand-logo/brand-logo.component';
 import { readRefusalOr } from '../../../auth/utils/read-backend-refusal';
 
@@ -101,9 +101,9 @@ const ADMIN_NAV: AdminNavItem[] = [
     ButtonComponent,
     ConfirmDialogComponent,
     ConversationItemComponent,
+    ConversationSearchComponent,
     IconComponent,
     FormFieldComponent,
-    InputComponent,
     ModalComponent,
     NgClass,
     RouterLink,
@@ -296,11 +296,9 @@ const ADMIN_NAV: AdminNavItem[] = [
           -->
           @if (conversations.hasConversations()) {
             <div class="mt-3">
-              <app-input
+              <app-conversation-search
                 [value]="conversations.searchTerm()"
                 (valueChange)="conversations.setSearchTerm($event)"
-                placeholder="Search conversations"
-                ariaLabel="Search conversations"
               />
             </div>
           }

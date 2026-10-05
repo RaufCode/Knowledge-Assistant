@@ -5,8 +5,8 @@ import { ConversationService } from '../../core/services/conversation.service';
 import { LayoutService } from '../../core/services/layout.service';
 import { ViewHeaderComponent } from '../../features/chat/components/view-header/view-header.component';
 import { ConversationListComponent } from '../../features/conversations/components/conversation-list/conversation-list.component';
+import { ConversationSearchComponent } from '../../features/conversations/components/conversation-search/conversation-search.component';
 import { ConfirmDialogComponent } from '../../shared/components/confirm-dialog/confirm-dialog.component';
-import { InputComponent } from '../../shared/components/input/input.component';
 
 /**
  * Every conversation this account has, searchable and grouped by date. Opening a row
@@ -27,7 +27,7 @@ import { InputComponent } from '../../shared/components/input/input.component';
   imports: [
     ConfirmDialogComponent,
     ConversationListComponent,
-    InputComponent,
+    ConversationSearchComponent,
     ViewHeaderComponent,
   ],
   host: { class: 'flex min-h-0 flex-1 flex-col' },
@@ -37,11 +37,9 @@ import { InputComponent } from '../../shared/components/input/input.component';
     <div class="scrollbar-thin min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:px-8">
       <div class="mx-auto w-full max-w-3xl">
         <div class="mb-4 max-w-md">
-          <app-input
+          <app-conversation-search
             [value]="conversations.searchTerm()"
             (valueChange)="conversations.setSearchTerm($event)"
-            placeholder="Search conversations"
-            ariaLabel="Search conversations"
           />
         </div>
 
