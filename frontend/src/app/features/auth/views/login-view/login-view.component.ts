@@ -294,9 +294,20 @@ export class LoginViewComponent {
             }
 
             this.auth.clear();
+
+            // Named for what it usually is, because "allow cookies" is the right
+            // advice for a browser refusing to store them and useless for every
+            // other way of arriving here — and the reader cannot tell which they
+            // are looking at. The address is called out because it is the one cause
+            // nobody suspects: a `Secure` cookie is dropped without a word by a
+            // browser on a plain-http page, which is what running the app locally
+            // against a production backend amounts to.
             this.notice.set(
-              'You signed in, but this browser did not keep the session. ' +
-                'Allow cookies for this site and try again.',
+              'You signed in, but this browser did not keep the session. This is ' +
+                'usually cookies being blocked — check that cookies are allowed for ' +
+                'this site — and it also happens if this page was opened over http ' +
+                'rather than https, because the session cookie is only stored on a ' +
+                'secure connection. Sign in again once that is sorted.',
             );
           },
           error: () => {

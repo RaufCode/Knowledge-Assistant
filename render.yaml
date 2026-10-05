@@ -124,10 +124,17 @@ services:
       - key: NODE_VERSION
         value: "24"
 
-      # Optional. Only needed to serve the API from this process instead of letting
-      # the browser call it directly, which is what `frontend/public/config.json`
-      # does by default. Leave it unset unless you have set that file to "" as
-      # well; a value here with an absolute URL there just means the proxy is
-      # started and never used.
+      # Where the API is. This server answers `/api` itself, forwarding to the
+      # backend named here — which is what `config.json` (set to "") asks for.
+      #
+      # It is what makes sign-in work on a phone as well as on a laptop, and the
+      # reason is a cookie rather than a line of code. The session is two `httpOnly`
+      # cookies, and the browser decides whether to attach them from the site the
+      # request goes to. Have the browser call the backend on its own origin and
+      # those cookies are third-party, so Safari and Chrome apply their
+      # third-party cookie policies to them — per browser, per device, with nothing
+      # in the app to account for the difference. Routed through this server, the
+      # API is on the same origin as the page and the cookies are first-party by
+      # construction, so there is no longer a browser decision to get wrong.
       - key: API_ORIGIN
-        sync: false
+        value: "https://knowledge-assistant-chatbot.onrender.com"
