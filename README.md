@@ -128,26 +128,31 @@ CSRF_TRUSTED_ORIGINS=http://localhost:4200,http://192.168.1.20:4200
 A refusal names the origin it did not recognise, so a mistyped address is a 403
 that tells you what to fix rather than one that looks like a broken interceptor.
 
-### Why the app serves the API itself
+### Where the API is, and why the phone was different
 
-The app serves `/api` from its own origin — through the dev-server proxy in
-development, and through a reverse proxy in `src/server.ts` in production. That is
-deliberate, and it is the reason sign-in works on a phone as well as on a laptop.
+`frontend/public/config.json` names the backend the browser calls directly. The
+deployed one is `https://knowledge-assistant-chatbot.onrender.com`.
 
-The session is two `httpOnly` cookies. Whether a browser attaches them to an API
-call is decided from the *site* that call goes to, and it is not something the app
-can influence. Call the API from its own origin and the cookies are first-party by
-construction, so no third-party cookie policy and no `SameSite` attribute can
-withhold them. Call it from another origin and each browser applies its own rules —
-Safari and Chrome block or partition third-party cookies, and `SameSite=Lax`
-withholds the cookies from any cross-site `fetch`.
+The session is two `httpOnly` cookies, and in production the backend marks them
+`Secure`. A browser will not store a `Secure` cookie for a page served over plain
+http, and it drops it without a word — sign-in still answers `200`, and the next
+call answers `401`. So **running the app locally over http against the deployed
+backend cannot keep a session, on any device.** Use the deployed app for the
+deployed backend, or run the backend locally too, which serves its cookies without
+`Secure`.
 
-The failure is indistinguishable from a wrong password: the sign-in request answers
-`200`, the cookies are stored, and the very next call answers `401`. It appears and
-disappears with the browser and the device rather than with the code, which is why
-it reported as "you signed in, but this browser did not keep the session" on a
-phone while the same build worked on a laptop. Serving the API through the app
-removes the decision from the browser entirely.
+Cookies are also attached based on the *site* a request goes to, not the origin,
+and ports are irrelevant. `localhost` and `127.0.0.1` are different sites;
+`knowledge-assistant-chatbot.onrender.com` and any other `*.onrender.com` are the
+same one. Same-site is what lets `SameSite=Lax` work, and `Lax` is what keeps the
+cookies first-party rather than third-party — which is what Safari and Chrome are
+increasingly unwilling to send.
+
+There is a second way to run it, which avoids the browser's decision entirely: the
+app can serve `/api` from its own origin (`src/server.ts`, or the dev-server proxy
+in `proxy.conf.json`). Set `config.json` to `""` and `API_ORIGIN` to the backend,
+and every request is same-site by construction. The backend trusts its own origin,
+so nothing has to be added to an allow-list.
 
 ## Environment Variables
 
@@ -565,16 +570,18 @@ FastAPI backend and the Angular app, server-rendered by its own Express server.
 3. Create the first administrator with `python -m app.bootstrap_admin`, then remove
    `AUTH_BOOTSTRAP_KEY`
 
-The blueprint sets `API_ORIGIN` on the app so its `/api` proxy knows where the
-backend is, which is what keeps the session cookies first-party in production. If
-you deploy the two services yourself, set it on whatever serves the app. Leaving it
-unset points the proxy at `http://127.0.0.1:8099`, which is correct locally and
-nowhere else.
+By default the browser calls the backend on its own origin, so `config.json` and the
+backend have to agree:
 
-`ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS` and `FRONTEND_BASE_URL` all have to name
-the app's real origin. Note that `render.yaml` leaves the app's own name to Render
-to generate, so read the URL off the service page after the first deploy rather
-than assuming it — and keep the three settings in step with it.
+- `ALLOWED_ORIGINS` and `CSRF_TRUSTED_ORIGINS` on the backend must contain the
+  app's exact origin. A mismatch is a 403 on the first write, and the refusal names
+  the origin it did not recognise.
+- `FRONTEND_BASE_URL` is where invitation links point.
+
+`render.yaml` leaves the app's own hostname to Render to generate, so read it off
+the service page after the first deploy and set those three to match. Serving the
+API from the app instead (`API_ORIGIN` plus `config.json` of `""`) removes the
+allow-list from the equation entirely.
 
 ## API Docs
 

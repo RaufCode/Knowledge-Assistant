@@ -6,36 +6,36 @@ import { ConfigService } from './config.service';
  * Single source for the backend origin. Every HTTP call is built from this, so
  * pointing the app at a different deployment is a one-line change.
  *
- * Empty, which means "the origin this page was served from". The API is reached
- * through the server that serves the app — the dev-server proxy in development
- * and the Express reverse proxy in production — so the browser is only ever making
- * same-origin requests.
+ * Empty, which means "the origin this page was served from" — so the API is
+ * reached through the server that serves the app. That is right for a deployment
+ * that can serve its own API, and it is not what this one does: the browser calls
+ * the backend on its own origin, which `public/config.json` names.
  *
- * THAT IS THE POINT, and it is worth understanding before changing it.
+ * WHY THAT MATTERS, because it is the cause of a failure that looks like a wrong
+ * password.
  *
- * The session is two `httpOnly` cookies. Whether the browser attaches them to an
- * API call is decided by the browser, from the *site* the call goes to, and not by
- * anything this app does. Call the API from its own origin and every browser
- * treats the cookies as first-party, with no third-party cookie policy and no
- * `SameSite` attribute able to withhold them. Call it from another origin and each
- * browser applies its own rules: Safari and Chrome block or partition third-party
- * cookies, and `SameSite=Lax` withholds the cookies from every cross-site `fetch`.
+ * The session is two `httpOnly` cookies, and the backend marks them `Secure` in
+ * production. A browser will not store a `Secure` cookie for a page served over
+ * plain http, and it drops it without a word — the sign-in request still answers
+ * `200`, and the next call answers `401`. So running this app locally over http
+ * against a production backend cannot keep a session, on any device. Use the
+ * deployed app for the deployed backend, or run the backend locally too, which
+ * serves its cookies without `Secure`.
  *
- * The failure is indistinguishable from a broken password. The sign-in request
- * returns 200, the cookies are stored, and the very next call answers 401 — so the
- * app reports "you signed in, but this browser did not keep the session". It comes
- * and goes with the browser and the device rather than with the code: working on a
- * laptop, failing on a phone, working in one browser and not the next, and
- * changing if you type `localhost` where you meant `127.0.0.1`, because those are
- * different sites.
+ * The other half of it is `SameSite`. Cookies are attached based on the *site* a
+ * request goes to, not the origin, and the ports are irrelevant — which is why
+ * `localhost` and `127.0.0.1` are different sites but
+ * `knowledge-assistant-chatbot.onrender.com` and any other `*.onrender.com` are
+ * the same one. Same site is what lets `SameSite=Lax` work, and `Lax` is what
+ * keeps the cookies first-party instead of third-party, which is what Safari and
+ * Chrome are increasingly unwilling to send.
  *
- * Setting this to an absolute URL puts that back. Do it only for a deployment that
- * genuinely cannot serve the API itself, and then the cookies need
- * `SameSite=None; Secure` (`AUTH_COOKIE_SAMESITE=none` on the backend) or sign-in
- * will not stick at all.
+ * Set this to an absolute URL only when the API really is elsewhere, and check
+ * that it is the same *site* — same registrable domain — or the cookies will not
+ * survive it on a phone.
  *
- * `ConfigService` can override this at runtime from `config.json`, for a build that
- * has to point somewhere else without being rebuilt.
+ * `ConfigService` overrides it at runtime from `config.json`, which is how the
+ * deployed build names its backend without being rebuilt.
  */
 export const API_BASE_URL = '';
 

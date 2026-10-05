@@ -505,6 +505,76 @@ class TokenAndCookieTest(AuthTestCase):
             settings.auth_cookie_samesite = original_samesite
             settings.auth_cookie_secure = original_secure
 
+    def test_this_services_own_origin_is_always_allowed(self) -> None:
+        """A request from our own origin needs no allow-list entry.
+
+        The frontend serves its own `/api` reverse proxy and presents each request
+        to us as same-origin, so that is what every proxied call looks like from
+        here. Requiring it to be listed as well meant each deployment had to name
+        an address it already was — the deployed hostname, a LAN address for a
+        phone, a new one each time a host generated a service name — and a wrong
+        one produced a 403 on the first write with nothing pointing at the setting
+        that was wrong.
+        """
+        client = self.new_client()
+        self.invite_and_accept(client, f"ama@{COMPANY}")
+
+        # The origin this test client is talking to.
+        own_origin = str(client.base_url).rstrip("/")
+
+        response = client.post(
+            "/api/conversations",
+            json={"client_id": "1" * 12},
+            headers={"Origin": own_origin, **self.csrf_headers(client)},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_our_own_origin_is_matched_by_host_not_by_scheme(self) -> None:
+        """A provider terminating TLS in front of the container still counts as us.
+
+        Render — and most hosts — accept TLS on a proxy and forward to the container
+        over plain http, so the scheme this process sees is `http` while the browser
+        sent `https`. Comparing whole origins rejected every proxied write on
+        exactly the deployments the app's own `/api` proxy exists to fix, and the
+        refusal named an origin that looked correct.
+
+        The `Secure` cookie flag and HSTS are what keep a session off plain http.
+        The host is what identifies "this is us".
+        """
+        client = self.new_client()
+        self.invite_and_accept(client, f"ama@{COMPANY}")
+
+        # `TestClient` addresses itself as `testserver`, which is what the `Host`
+        # header carries too.
+        response = client.post(
+            "/api/conversations",
+            json={"client_id": "1" * 12},
+            headers={
+                # Same host as the request, opposite scheme.
+                "Origin": "http://testserver",
+                **self.csrf_headers(client),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_someone_elses_host_is_still_refused(self) -> None:
+        """The leniency above is about our own host, not about schemes generally."""
+        client = self.new_client()
+        self.invite_and_accept(client, f"ama@{COMPANY}")
+
+        response = client.post(
+            "/api/conversations",
+            json={"client_id": "1" * 12},
+            headers={
+                "Origin": f"http://evil.example",
+                **self.csrf_headers(client),
+            },
+        )
+
+        self.assertEqual(response.status_code, 403, response.text)
+
     def test_a_refused_origin_is_named_in_the_refusal(self) -> None:
         """A 403 about the wrong origin has to say which origin it was.
 

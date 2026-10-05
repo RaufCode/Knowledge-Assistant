@@ -14,6 +14,7 @@ instead of by grepping for a role comparison.
 import hmac
 import logging
 from collections.abc import Iterator
+from urllib.parse import urlsplit
 
 from fastapi import Depends, HTTPException, Request, status
 from jose import JWTError
@@ -154,6 +155,32 @@ def _origin_is_allowed(request: Request) -> bool:
         # be ridden by a victim's ambient cookies in the first place.
         return True
 
+    # This service's own origin is always allowed, and it is not a convenience.
+    #
+    # The frontend can serve its own `/api` reverse proxy and present each request
+    # to us as same-origin, which is what keeps the session cookies first-party. So
+    # a request arriving with our own origin is one the app's own server made on
+    # behalf of a page it rendered, and requiring it to also appear in a
+    # hand-maintained list meant every deployment had to spell out an address it
+    # already is — the deployed hostname locally, a LAN address for a phone, and a
+    # different one each time a hosting provider generated a new service name. Any
+    # one of them being wrong produced a 403 on the first write, which looks
+    # nothing like a missing setting.
+    #
+    # Compared by host rather than by full origin, deliberately. Hosting providers
+    # terminate TLS in front of the container and forward over plain http, so the
+    # scheme this process sees is not the scheme the browser used, and comparing
+    # the whole origin rejected every proxied write on exactly the deployments the
+    # proxy exists to fix. The scheme is not what this check is for: the `Secure`
+    # cookie flag and HSTS are what keep a session off plain http, and the host is
+    # what identifies "this is us".
+    #
+    # Nothing is loosened by it. A page on another site still cannot get here with
+    # a usable CSRF token, and the check below still applies to every origin that
+    # is not this one.
+    if _origin_host_is_ours(origin, request):
+        return True
+
     trusted = settings.csrf_origins_list
 
     if not trusted:
@@ -162,6 +189,17 @@ def _origin_is_allowed(request: Request) -> bool:
         return True
 
     return origin.rstrip("/") in trusted
+
+
+def _origin_host_is_ours(origin: str, request: Request) -> bool:
+    """Whether `origin` names the host this request was sent to."""
+    try:
+        origin_host = urlsplit(origin).netloc.lower()
+    except ValueError:
+        return False
+
+    return bool(origin_host) and origin_host == request.headers.get("host", "").lower()
+
 
 
 def require_csrf(request: Request) -> None:

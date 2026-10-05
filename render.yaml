@@ -124,16 +124,10 @@ services:
       - key: NODE_VERSION
         value: "24"
 
-      # Where the API is. This server answers `/api` itself, forwarding to the
-      # backend named here.
-      #
-      # It is what makes sign-in work on a phone as well as on a laptop, and the
-      # reason is a cookie rather than a line of code: the session is two `httpOnly`
-      # cookies, and the browser decides whether to attach them from the site the
-      # request goes to. Served through this server, every API call is same-site by
-      # construction, so no browser's third-party cookie policy can withhold them.
-      # The browser calling the backend's own host directly tends to work in a
-      # desktop browser and fail in a mobile one, with nothing in the app changed
-      # to explain the difference.
+      # Optional. Only needed to serve the API from this process instead of letting
+      # the browser call it directly, which is what `frontend/public/config.json`
+      # does by default. Leave it unset unless you have set that file to "" as
+      # well; a value here with an absolute URL there just means the proxy is
+      # started and never used.
       - key: API_ORIGIN
-        value: "https://knowledge-assistant-backend.onrender.com"
+        sync: false

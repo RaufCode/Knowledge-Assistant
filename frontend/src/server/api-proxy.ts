@@ -61,12 +61,34 @@ const HOP_BY_HOP = new Set([
  */
 const UPSTREAM_TIMEOUT_MS = 95_000;
 
+/**
+ * Where the backend is, when nothing says otherwise.
+ *
+ * Port 8000, because that is what the rest of the project uses — the README, every
+ * curl example and the backend's own Dockerfile. It used to say 8099, which was
+ * what the frontend had hardcoded before the API moved behind this proxy; nothing
+ * ever listened there, so the proxy pointed at a closed port and every call in the
+ * app failed with nothing in particular to show for it.
+ */
+const DEFAULT_API_ORIGIN = 'http://127.0.0.1:8000';
+
 /** Reads the API origin from the environment, with a sensible local default. */
 export function apiOrigin(env: NodeJS.ProcessEnv = process.env): URL {
   const configured = env['API_ORIGIN']?.trim();
 
   if (!configured) {
-    return new URL('http://127.0.0.1:8099');
+    // Silently falling back to localhost is how a deployment ends up proxying to
+    // itself and reporting every API call as a network error, with nothing in the
+    // logs to connect the two. Said out loud, it is a one-line fix.
+    if (env['NODE_ENV'] === 'production') {
+      throw new Error(
+        'API_ORIGIN is not set. This server serves /api itself, so it has to be told ' +
+          'where the backend is — without it every request in the app fails. Set it to ' +
+          "the backend's origin, e.g. https://your-backend.onrender.com",
+      );
+    }
+
+    return new URL(DEFAULT_API_ORIGIN);
   }
 
   let parsed: URL;
@@ -77,7 +99,7 @@ export function apiOrigin(env: NodeJS.ProcessEnv = process.env): URL {
     throw new Error(
       `API_ORIGIN is not a URL: ${JSON.stringify(configured)}. ` +
         'It has to be the backend origin, including the scheme, e.g. ' +
-        'https://knowledge-assistant-backend.onrender.com',
+        'https://your-backend.onrender.com',
     );
   }
 
@@ -121,6 +143,26 @@ export function apiProxy(prefix: string, origin: URL): RequestHandler {
 
       headers[name] = value;
     }
+
+    // The browser's `Origin` is rewritten to the API's own, because a request that
+    // arrived through this server is same-origin by construction — it came from a
+    // page this server rendered.
+    //
+    // Forwarding it instead meant the backend's origin allow-list had to name every
+    // address the app is ever opened at: the deployed hostname, `localhost`,
+    // `127.0.0.1`, and a LAN address for a phone. Each one had to be spelled
+    // exactly right, and any that was not produced a 403 on the first write, which
+    // looks nothing like a missing setting. That is the same class of failure as
+    // the cookie problem this proxy exists to solve, so it is solved the same way:
+    // by not depending on it.
+    //
+    // What this does not weaken: the check that stops a forged request is the
+    // double-submit CSRF token, and it does not depend on `Origin` at all. A page on
+    // another site can make the browser send this request, but cannot read the
+    // `ika_csrf` cookie to copy into a header — the cookies are `SameSite=Lax`, so
+    // they are not attached to a cross-site write in the first place. The `Origin`
+    // check remains in place for anything reaching the backend directly.
+    headers['origin'] = origin.origin;
 
     const upstream = send(
       {

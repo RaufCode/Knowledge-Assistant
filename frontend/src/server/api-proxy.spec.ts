@@ -22,6 +22,7 @@ describe('apiProxy', () => {
   let upstream: Server;
   let front: Server;
   let base: string;
+  let upstreamOrigin = '';
 
   /** What the backend saw, so the forwarded request can be asserted on. */
   let seen: { method?: string; url?: string; headers: Record<string, unknown> };
@@ -51,10 +52,10 @@ describe('apiProxy', () => {
 
     await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
 
+    upstreamOrigin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+
     const app = express();
-    app.use(
-      apiProxy('/api', new URL(`http://127.0.0.1:${(upstream.address() as AddressInfo).port}`)),
-    );
+    app.use(apiProxy('/api', new URL(upstreamOrigin)));
     app.get('/login', (_req, res) => res.sendStatus(200));
 
     front = createServer(app);
@@ -133,12 +134,25 @@ describe('apiProxy', () => {
     expect(cookies[1]).toContain('ika_csrf=csrf-value');
   });
 
-  it("forwards the browser's Origin, so the backend's own check still applies", async () => {
-    // Rewriting this would quietly disable the CSRF origin check rather than
-    // satisfy it.
+  it('presents the request to the API as same-origin', async () => {
+    // Rewritten on purpose: see the proxy. Forwarding the browser's own `Origin`
+    // meant the backend's allow-list had to name every address the app is ever
+    // opened at, and one that was missing produced a 403 on the first write with
+    // nothing to point at the setting that was wrong.
     await login();
 
-    expect(seen.headers['origin']).toBe(base);
+    // The API's own origin, port and all — which the backend trusts as itself.
+    expect(seen.headers['origin']).toBe(upstreamOrigin);
+    expect(seen.headers['origin']).not.toBe(base);
+  });
+
+  it('says so even when the browser sent no Origin at all', async () => {
+    // A same-origin GET carries none. The backend treats an absent origin as a
+    // non-browser client rather than a forged one, and a rewritten one keeps that
+    // reading consistent either way.
+    await get('/api/auth/me');
+
+    expect(seen.headers['origin']).toBe(upstreamOrigin);
   });
 
   it('carries the request body through', async () => {
@@ -151,8 +165,24 @@ describe('apiProxy', () => {
 });
 
 describe('apiOrigin', () => {
-  it('defaults to the local backend when nothing is configured', () => {
-    expect(apiOrigin({}).href).toBe('http://127.0.0.1:8099/');
+  it('defaults to the port the rest of the project runs the backend on', () => {
+    // 8000: the README, every curl example and the backend's Dockerfile. This said
+    // 8099 for a while, which was what the frontend had hardcoded before the API
+    // moved behind this proxy — so nothing was listening on it and every call in
+    // the app failed.
+    expect(apiOrigin({}).href).toBe('http://127.0.0.1:8000/');
+  });
+
+  it('refuses to start in production without being told where the backend is', () => {
+    // The failure this prevents is the whole app reporting every request as a
+    // network error, because the proxy was quietly talking to itself.
+    expect(() => apiOrigin({ NODE_ENV: 'production' })).toThrow(/API_ORIGIN is not set/);
+  });
+
+  it('is explicit rather than guessing when production has been told', () => {
+    const env = { NODE_ENV: 'production', API_ORIGIN: 'https://backend.example' };
+
+    expect(apiOrigin(env).href).toBe('https://backend.example/');
   });
 
   it('reads the backend origin from the environment', () => {
@@ -163,8 +193,8 @@ describe('apiOrigin', () => {
 
   it('ignores an empty or blank setting rather than failing', () => {
     // Render sets every variable it knows about, including an empty one.
-    expect(apiOrigin({ API_ORIGIN: '' }).href).toBe('http://127.0.0.1:8099/');
-    expect(apiOrigin({ API_ORIGIN: '   ' }).href).toBe('http://127.0.0.1:8099/');
+    expect(apiOrigin({ API_ORIGIN: '' }).href).toBe('http://127.0.0.1:8000/');
+    expect(apiOrigin({ API_ORIGIN: '   ' }).href).toBe('http://127.0.0.1:8000/');
   });
 
   it('refuses a value that is not a URL, and says what it wanted', () => {
