@@ -11,11 +11,7 @@ import {
   AccessRequestListDto,
   AccessRequestSubmittedDto,
   CreateAccountRequestDto,
-  PasswordResetRequestDto,
   PendingApprovalDto,
-  UserListDto,
-  UserSummaryDto,
-  UserUpdateRequestDto,
 } from '../models/access-request.model';
 import {
   AcceptInviteRequestDto,
@@ -458,57 +454,6 @@ export class AuthService {
     return this.http
       .post<UserResponseDto>(`${this.baseUrl}/api/auth/accounts`, body, this.credentials())
       .pipe(map((response) => response.user));
-  }
-
-  /**
-   * `GET /api/auth/users`. Administrators only.
-   *
-   * A page at a time, with the page count alongside, so the pager cannot disagree
-   * with the server about how many accounts there are.
-   */
-  listUsers(page: number): Observable<UserListDto> {
-    return this.http.get<UserListDto>(
-      `${this.baseUrl}/api/auth/users?page=${page}`,
-      this.credentials(),
-    );
-  }
-
-  /** `PATCH /api/auth/users/{id}`. Corrects an account. Administrators only. */
-  updateUser(
-    userId: string,
-    changes: UserUpdateRequestDto,
-  ): Observable<UserSummaryDto> {
-    return this.http.patch<UserSummaryDto>(
-      `${this.baseUrl}/api/auth/users/${encodeURIComponent(userId)}`,
-      changes,
-      this.credentials(),
-    );
-  }
-
-  /** `DELETE /api/auth/users/{id}`. Administrators only. */
-  deleteUser(userId: string): Observable<void> {
-    return this.http
-      .delete<void>(
-        `${this.baseUrl}/api/auth/users/${encodeURIComponent(userId)}`,
-        this.credentials(),
-      )
-      .pipe(map(() => undefined));
-  }
-
-  /**
-   * `POST /api/auth/users/{id}/password`. Administrators only.
-   *
-   * Returns nothing: the password is not echoed back, so the only copy is the one the
-   * administrator typed.
-   */
-  resetPassword(userId: string, password: string): Observable<void> {
-    return this.http
-      .post<void>(
-        `${this.baseUrl}/api/auth/users/${encodeURIComponent(userId)}/password`,
-        { password } satisfies PasswordResetRequestDto,
-        this.credentials(),
-      )
-      .pipe(map(() => undefined));
   }
 
   /** `GET /api/auth/requests`. Administrators only. */

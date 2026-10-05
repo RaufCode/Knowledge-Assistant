@@ -7,17 +7,17 @@ import { API_BASE_URL } from '../../core/api.config';
 import { AuthService } from '../../core/services/auth.service';
 import { AdminUsersViewComponent } from './admin-users-view.component';
 
-const USERS_URL = `${API_BASE_URL}/api/auth/users?page=1`;
+const REQUESTS_URL = `${API_BASE_URL}/api/auth/requests`;
 
-/** One account, as the backend lists it. */
-const USERS = [
+/** One request, as the backend lists it. */
+const ROWS = [
   {
-    id: 'u1',
+    id: 'r1',
     name: 'Ama Konadu',
     email: 'ama@acmetech.example',
-    role: 'employee',
-    is_active: true,
-    created_at: '2026-10-01T09:00:00',
+    status: 'pending',
+    requested_at: '2026-10-01T09:00:00',
+    decided_at: null,
   },
 ];
 
@@ -32,10 +32,10 @@ describe('AdminUsersViewComponent', () => {
     await fixture.whenStable();
   };
 
-  /** The button whose label is exactly this. */
+  /** The button whose label contains this text. */
   const button = (label: string): HTMLButtonElement =>
     Array.from(element().querySelectorAll<HTMLButtonElement>('button')).find(
-      (candidate) => candidate.textContent?.trim() === label,
+      (candidate) => candidate.textContent?.trim().includes(label),
     ) as HTMLButtonElement;
 
   const signedInAs = async (role: 'employee' | 'admin'): Promise<void> => {
@@ -67,110 +67,38 @@ describe('AdminUsersViewComponent', () => {
   describe('as an administrator', () => {
     beforeEach(async () => {
       await signedInAs('admin');
-    });
-
-    it('asks for the first page on load', async () => {
-      const request = http.expectOne(USERS_URL);
-
-      expect(request.request.method).toBe('GET');
-      request.flush({ users: USERS, total: 1, page: 1, page_size: 10, pages: 1 });
+      http.expectOne(REQUESTS_URL).flush({ requests: ROWS });
       await render();
     });
 
-    it('puts both actions above the list, not below it', async () => {
-      http.expectOne(USERS_URL).flush({
-        users: USERS,
-        total: 1,
-        page: 1,
-        page_size: 10,
-        pages: 1,
-      });
-      await render();
+    it('reads people from the access-requests endpoint, since there is no accounts list', async () => {
+      expect(element().textContent).toContain('ama@acmetech.example');
+    });
 
-      const add = button('Add a user');
-      const requests = element().querySelector('a[href="/admin/access"]');
-
-      expect(add).toBeTruthy();
-      expect(requests).not.toBeNull();
-
-      // Above: both must come before the first account in document order. A button
-      // underneath the list is one a person has to scroll to find, which is the whole
-      // reason they were moved.
-      const firstAccount = Array.from(element().querySelectorAll('p')).find((node) =>
-        node.textContent?.includes('ama@acmetech.example'),
-      ) as HTMLElement;
-
-      expect(firstAccount).toBeTruthy();
-
-      const precedes = (node: Element): boolean =>
-        (node.compareDocumentPosition(firstAccount) &
-          Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
-
-      expect(precedes(add)).toBe(true);
-      expect(precedes(requests as Element)).toBe(true);
+    it('offers adding, inviting and the queue above the list', async () => {
+      expect(button('Add a user')).toBeTruthy();
+      expect(button('Invite by link')).toBeTruthy();
+      expect(element().querySelector('a[href="/admin/access"]')).not.toBeNull();
     });
 
     it('opens adding a user in a dialog, not in the page', async () => {
-      http.expectOne(USERS_URL).flush({
-        users: USERS,
-        total: 1,
-        page: 1,
-        page_size: 10,
-        pages: 1,
-      });
-      await render();
-
-      // Closed to begin with: no form anywhere in the page.
       expect(element().querySelector('input#name, input[name="name"]')).toBeNull();
 
       button('Add a user').click();
       await render();
 
-      // The distinction that matters, and the one that can be checked here: a form
-      // written into the page is a descendant of the page's own scroll container,
-      // while a form in a dialog is inside a <dialog> element the browser has lifted
-      // into the top layer. `showModal` is absent from Karma's browser, so `open`
-      // cannot be asserted — but containment can, and containment is what decides
-      // whether this renders at the top of the page or over it.
       const scroll = element().querySelector('.scrollbar-thin') as HTMLElement;
       const form = element().querySelector('form') as HTMLFormElement;
 
       expect(form).not.toBeNull();
       expect(scroll.contains(form)).toBe(false);
-
-      const dialog = form.closest('dialog');
-      expect(dialog).not.toBeNull();
-      expect(dialog?.textContent).toContain('Add a user');
-
-      // And the page has not grown an add form of its own.
-      expect(scroll.textContent).not.toContain('They can sign in as soon as');
+      expect(form.closest('dialog')?.textContent).toContain('Add a user');
     });
 
-    it('offers a way back out of the add-user dialog', async () => {
-      http.expectOne(USERS_URL).flush({
-        users: USERS,
-        total: 1,
-        page: 1,
-        page_size: 10,
-        pages: 1,
-      });
-      await render();
-
+    it('creates the account and shows the password once', async () => {
       button('Add a user').click();
       await render();
 
-      const dialog = (element().querySelector('form') as HTMLFormElement).closest(
-        'dialog',
-      ) as HTMLDialogElement;
-      const back = Array.from(dialog.querySelectorAll('button')).find((candidate) =>
-        candidate.textContent?.trim().includes('Go back'),
-      ) as HTMLButtonElement;
-
-      expect(back).toBeTruthy();
-
-      // Typed into first, so the form is dirty and reopening it afterwards proves
-      // something: a dialog that only hid kept its contents, which is how a
-      // half-typed password ends up waiting for the next person to open it.
       const type = (index: number, value: string): void => {
         const field = element().querySelectorAll<HTMLInputElement>(
           'app-form-field input',
@@ -180,109 +108,105 @@ describe('AdminUsersViewComponent', () => {
         fixture.detectChanges();
       };
 
-      type(0, 'Half typed');
+      type(0, 'Ama Konadu');
+      type(1, 'ama@acmetech.example');
+      type(2, 'correct-horse-1!');
 
-      back.click();
+      const create = Array.from(element().querySelectorAll('button')).find(
+        (candidate) => candidate.textContent?.trim() === 'Create account',
+      ) as HTMLButtonElement;
+      create.click();
+
+      const request = http.expectOne(`${API_BASE_URL}/api/auth/accounts`);
+
+      expect(request.request.method).toBe('POST');
+      expect(request.request.body).toEqual({
+        name: 'Ama Konadu',
+        email: 'ama@acmetech.example',
+        role: 'employee',
+        password: 'correct-horse-1!',
+      });
+      request.flush({ user: { id: 'u1', name: 'Ama Konadu', email: 'ama@acmetech.example', role: 'employee' } });
+      http.expectOne(REQUESTS_URL).flush({ requests: ROWS });
       await render();
 
-      button('Add a user').click();
-      await render();
-
-      const reopened = (
-        (element().querySelector('form') as HTMLFormElement).closest('dialog') as HTMLDialogElement
-      ).querySelector('input') as HTMLInputElement;
-
-      expect(reopened.value).toBe('');
+      expect(element().textContent).toContain('can sign in now');
     });
 
-    it('runs the full width of the page, like the bar above it', async () => {
-      http.expectOne(USERS_URL).flush({
-        users: USERS,
-        total: 1,
-        page: 1,
-        page_size: 10,
-        pages: 1,
+    it('mints an invite link and shows it once', async () => {
+      button('Invite by link').click();
+      await render();
+
+      const fields = element().querySelectorAll<HTMLInputElement>('app-form-field input');
+
+      fields[0].value = 'Ama Konadu';
+      fields[0].dispatchEvent(new Event('input'));
+      fields[1].value = 'ama@acmetech.example';
+      fields[1].dispatchEvent(new Event('input'));
+      fixture.detectChanges();
+
+      const invite = Array.from(element().querySelectorAll('button')).find(
+        (candidate) => candidate.textContent?.trim() === 'Create invite link',
+      ) as HTMLButtonElement;
+      invite.click();
+
+      const request = http.expectOne(`${API_BASE_URL}/api/auth/invite`);
+
+      expect(request.request.method).toBe('POST');
+      expect(request.request.body).toEqual({
+        name: 'Ama Konadu',
+        email: 'ama@acmetech.example',
+        role: 'employee',
+      });
+      request.flush({
+        invite_link: 'http://app/accept-invite?token=abc',
+        token: 'abc',
+        expires_at: '2026-10-04T09:00:00',
+        user: { id: 'u1', name: 'Ama Konadu', email: 'ama@acmetech.example', role: 'employee' },
+      });
+      http.expectOne(REQUESTS_URL).flush({ requests: ROWS });
+      await render();
+
+      expect(element().textContent).toContain('Invite ready');
+    });
+
+    it('approves a waiting request in place', async () => {
+      button('Approve').click();
+
+      const request = http.expectOne(`${API_BASE_URL}/api/auth/requests/r1/approve`);
+
+      expect(request.request.body).toEqual({ role: 'employee' });
+      request.flush({
+        request: { ...ROWS[0], status: 'approved', decided_at: '2026-10-02T09:00:00' },
+        invite_link: '',
+        token: '',
+        expires_at: '',
       });
       await render();
 
-      const scroll = element().querySelector('.scrollbar-thin') as HTMLElement;
-
-      expect(scroll).not.toBeNull();
-      expect(scroll.querySelector('.max-w-4xl')).toBeNull();
-      expect(scroll.querySelector('.max-w-5xl')).toBeNull();
+      expect(element().textContent).toContain('Approved');
     });
 
-    it('searches the page it is showing, and says that is all it searched', async () => {
-      http.expectOne(USERS_URL).flush({
-        users: USERS,
-        total: 1,
-        page: 1,
-        page_size: 10,
-        pages: 1,
-      });
-      await render();
-
+    it('searches the people it is showing', async () => {
       const field = element().querySelector('app-input input') as HTMLInputElement;
 
       field.value = 'nobody here';
       field.dispatchEvent(new Event('input'));
       await render();
 
-      // The list is paged ten at a time by the backend, so this sees one page. Saying
-      // so is the difference between a search and a filter that looks like one.
-      expect(element().textContent).toContain('Search the database to look further');
+      expect(element().textContent).toContain('Nobody matches that search');
       expect(element().textContent).not.toContain('ama@acmetech.example');
-    });
-
-    it('finds somebody by name or by address, in any case', async () => {
-      http.expectOne(USERS_URL).flush({
-        users: USERS,
-        total: 1,
-        page: 1,
-        page_size: 10,
-        pages: 1,
-      });
-      await render();
-
-      const type = (value: string): void => {
-        const field = element().querySelector('app-input input') as HTMLInputElement;
-        field.value = value;
-        field.dispatchEvent(new Event('input'));
-        fixture.detectChanges();
-      };
-
-      type('ama');
-      expect(element().textContent).toContain('ama@acmetech.example');
-
-      type('KONADU');
-      expect(element().textContent).toContain('ama@acmetech.example');
-    });
-
-    it('states an empty list plainly rather than as a failure', async () => {
-      http.expectOne(USERS_URL).flush({
-        users: [],
-        total: 0,
-        page: 1,
-        page_size: 10,
-        pages: 0,
-      });
-      await render();
-
-      // "Could not load" is what a failure says. Saying it because nobody has an
-      // account would tell an administrator the opposite of what is true.
-      expect(element().textContent).toContain('There is no account yet');
-      expect(element().textContent).not.toContain('Could not load the accounts');
     });
   });
 
   describe('as an employee', () => {
     beforeEach(async () => {
       await signedInAs('employee');
+      await render();
     });
 
-    it('does not ask for the accounts', async () => {
-      http.expectNone(USERS_URL);
-      await render();
+    it('asks for nothing and shows the gate', async () => {
+      http.expectNone(REQUESTS_URL);
 
       expect(element().textContent).toContain('administrator');
     });

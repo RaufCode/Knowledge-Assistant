@@ -19,15 +19,12 @@ import { ChatService } from '../../../../core/services/chat.service';
 import { ConversationService } from '../../../../core/services/conversation.service';
 import { LayoutService } from '../../../../core/services/layout.service';
 import { SectionService } from '../../../../core/services/section.service';
-import { MIN_PASSWORD_LENGTH } from '../../../../core/models/auth.model';
 import { toInitials } from '../../../../shared/utils/initials.util';
 import { AvatarComponent } from '../../../../shared/components/avatar/avatar.component';
 import { ButtonComponent } from '../../../../shared/components/button/button.component';
 import { ConfirmDialogComponent } from '../../../../shared/components/confirm-dialog/confirm-dialog.component';
 import { IconComponent, type IconName } from '../../../../shared/components/icon/icon.component';
-import { FormFieldComponent } from '../../../../shared/components/form-field/form-field.component';
 import { InputComponent } from '../../../../shared/components/input/input.component';
-import { ModalComponent } from '../../../../shared/components/modal/modal.component';
 import { ConversationItemComponent } from '../../../conversations/components/conversation-item/conversation-item.component';
 import { BrandLogoComponent } from '../brand-logo/brand-logo.component';
 
@@ -101,9 +98,7 @@ const ADMIN_NAV: AdminNavItem[] = [
     ConfirmDialogComponent,
     ConversationItemComponent,
     IconComponent,
-    FormFieldComponent,
     InputComponent,
-    ModalComponent,
     NgClass,
     RouterLink,
   ],
@@ -448,21 +443,6 @@ const ADMIN_NAV: AdminNavItem[] = [
 
                 <div class="border-t border-border"></div>
 
-                @if (canChangeOwnPassword()) {
-                  <button
-                    app-button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    class="w-full justify-start rounded-none text-left"
-                    role="menuitem"
-                    (click)="askToChangeOwnPassword()"
-                  >
-                    <app-icon name="key-round" [size]="15" />
-                    <span>Change password</span>
-                  </button>
-                }
-
                 <button
                   app-button
                   type="button"
@@ -480,34 +460,6 @@ const ADMIN_NAV: AdminNavItem[] = [
           </div>
         </div>
       </div>
-
-      <app-modal
-        [(isOpen)]="isOwnPasswordOpen"
-        icon="key-round"
-        title="Change your password"
-        message="You will be signed out everywhere, including here. Sign in again with the new one."
-        (closed)="closeOwnPassword()"
-      >
-        <app-form-field
-          label="New password"
-          type="password"
-          icon="lock"
-          autocomplete="new-password"
-          placeholder="Something you have not used here"
-          [required]="true"
-          [(value)]="ownPassword"
-          [error]="ownPasswordError()"
-        />
-
-        <div modalFooter class="flex justify-between gap-2">
-          <button app-button type="button" variant="ghost" (click)="closeOwnPassword()">
-            Go back
-          </button>
-          <button app-button type="button" [disabled]="isBusy()" (click)="saveOwnPassword()">
-            Change password
-          </button>
-        </div>
-      </app-modal>
 
       <app-confirm-dialog
         [isOpen]="isSignOutOpen()"
@@ -712,70 +664,6 @@ export class ChatSidebarComponent {
 
   private readonly accountTrigger = viewChild<ElementRef<HTMLButtonElement>>('accountTrigger');
   private readonly accountCard = viewChild<ElementRef<HTMLElement>>('accountCard');
-
-  /**
-   * Whether this person can change their own password from here.
-   *
-   * An administrator can, and this is the only route that does not require them to
-   * find themselves in a list of other people first — which is where a password
-   * change otherwise went to be done, by an administrator, about themselves.
-   */
-  protected readonly canChangeOwnPassword = computed(() => this.auth.isAdmin());
-
-  protected readonly isOwnPasswordOpen = signal(false);
-  protected readonly ownPassword = signal('');
-  protected readonly isBusy = signal(false);
-
-  protected readonly ownPasswordError = computed(() => {
-    const value = this.ownPassword();
-
-    if (value === '') {
-      return '';
-    }
-
-    return value.length >= MIN_PASSWORD_LENGTH ? '' : `Use at least ${MIN_PASSWORD_LENGTH} characters`;
-  });
-
-  /** Opens the dialog, discarding whatever the last attempt left behind. */
-  protected askToChangeOwnPassword(): void {
-    this.closeAccount();
-    this.ownPassword.set('');
-    this.isOwnPasswordOpen.set(true);
-  }
-
-  protected closeOwnPassword(): void {
-    this.isOwnPasswordOpen.set(false);
-    this.ownPassword.set('');
-  }
-
-  /**
-   * Sets the new password, then signs out.
-   *
-   * The sign-out is not a flourish. The server revokes every session for the account,
-   * so staying put would leave a page that looks signed in and fails on the next
-   * action — going through the sign-in screen is the honest sequence.
-   */
-  protected saveOwnPassword(): void {
-    const me = this.auth.user();
-
-    if (me === null || this.ownPassword().length < MIN_PASSWORD_LENGTH || this.isBusy()) {
-      return;
-    }
-
-    this.isBusy.set(true);
-
-    this.auth.resetPassword(me.id, this.ownPassword()).subscribe({
-      next: () => {
-        this.isBusy.set(false);
-        this.closeOwnPassword();
-        this.signOut();
-      },
-      error: () => {
-        this.isBusy.set(false);
-        this.closeOwnPassword();
-      },
-    });
-  }
 
   /** Closes the account card without acting on anything in it. */
   protected closeAccount(): void {
