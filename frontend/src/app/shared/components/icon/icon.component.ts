@@ -2,6 +2,7 @@ import { ChangeDetectionStrategy, Component, computed, input } from '@angular/co
 
 /** Every icon the shell uses, so `name` stays a closed, typo-proof set. */
 export type IconName =
+  | 'arrow-left'
   | 'arrow-up-right'
   | 'bot'
   | 'check'
@@ -9,6 +10,7 @@ export type IconName =
   | 'clock'
   | 'copy'
   | 'file-text'
+  | 'gauge'
   | 'info'
   | 'loader-2'
   | 'menu'
@@ -121,6 +123,12 @@ const OPTICAL_STROKE = 48;
             <path d="M14 2v5a1 1 0 0 0 1 1h5M10 9H8m8 4H8m8 4H8" />
           </g>
         }
+        @case ('gauge') {
+          <g>
+            <path d="m12 14 4-4" />
+            <path d="M3.34 19a10 10 0 1 1 17.32 0" />
+          </g>
+        }
         @case ('info') {
           <g>
             <circle cx="12" cy="12" r="10" />
@@ -149,6 +157,12 @@ const OPTICAL_STROKE = 48;
           <g>
             <rect width="18" height="18" x="3" y="3" rx="2" />
             <path d="M9 3v18" />
+          </g>
+        }
+        @case ('arrow-left') {
+          <g>
+            <path d="M19 12H5" />
+            <path d="m12 19-7-7 7-7" />
           </g>
         }
         @case ('paperclip') {

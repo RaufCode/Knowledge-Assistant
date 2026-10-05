@@ -18,6 +18,7 @@ import {
 import { scan, startWith } from 'rxjs';
 
 import { ChatSidebarComponent } from './features/chat/components/chat-sidebar/chat-sidebar.component';
+import { AuthService } from './core/services/auth.service';
 import { LayoutService } from './core/services/layout.service';
 
 /** Elements that can hold focus, used by the drawer's focus trap. */
@@ -68,7 +69,37 @@ const FOCUSABLE_SELECTOR =
       Skip to content
     </a>
 
-    <div class="flex h-dvh overflow-hidden bg-background">
+    <!--
+      Until the app knows who is signed in, nothing that depends on knowing is drawn.
+
+      A refresh starts with no user and no answer, and every question the shell asks
+      about the role is answered "no" in the meantime. That is what put a
+      non-administrator's sidebar on screen for a frame before the dashboard
+      appeared: the navigation was right, and everything inside it was drawn from a
+      role that had not arrived yet.
+
+      A loading card rather than a wrong screen. It is the only state here that is
+      true — somebody is signed in, and the answer is on its way.
+    -->
+    @if (resolving()) {
+      <div class="flex h-dvh items-center justify-center bg-background px-6" role="status">
+        <div
+          class="flex w-full max-w-sm flex-col gap-3 rounded-lg border border-border bg-card p-6"
+        >
+          <div class="flex items-center gap-3">
+            <div class="size-9 shrink-0 rounded-full bg-muted"></div>
+            <div class="flex-1">
+              <div class="h-3.5 w-32 rounded bg-muted"></div>
+              <div class="mt-2 h-2.5 w-48 rounded bg-muted"></div>
+            </div>
+          </div>
+          <div class="h-2.5 w-full rounded bg-muted"></div>
+          <div class="h-2.5 w-2/3 rounded bg-muted"></div>
+          <span class="sr-only">Loading your account.</span>
+        </div>
+      </div>
+    } @else {
+      <div class="flex h-dvh overflow-hidden bg-background">
       <!--
         Neither the backdrop nor the sidebar is rendered on a signed-out screen.
 
@@ -122,6 +153,7 @@ const FOCUSABLE_SELECTOR =
         <router-outlet />
       </main>
     </div>
+    }
   `,
 })
 export class AppComponent {
@@ -129,6 +161,19 @@ export class AppComponent {
   protected readonly layout = inject(LayoutService);
 
   private readonly router = inject(Router);
+
+  /** Who is signed in, which is not known until the first answer arrives. */
+  private readonly auth = inject(AuthService);
+
+  /**
+   * Whether the answer about the signed-in person is still on its way.
+   *
+   * Only for the browser. A server render has nobody to ask and no cookie to read, so
+   * waiting there would hold the whole page on a card nobody will ever replace.
+   */
+  protected readonly resolving = computed(
+    () => this.auth.isBrowserOnly() && this.auth.status() === 'unknown' && !this.isPlain(),
+  );
 
   /**
    * Whether the routed view stands on its own, with "not known yet" counted as yes.

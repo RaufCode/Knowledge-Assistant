@@ -89,6 +89,11 @@ describe('QuestionLogDetailComponent', () => {
     await render();
 
     expect(element().textContent).toContain('Closest passages');
+
+    // Each passage names its own document here, because this list has no group
+    // heading above it. Turning that off — as the answer card does, where the heading
+    // carries the document — would leave an administrator unable to tell which policy
+    // a passage came from.
     expect(element().textContent).toContain('Employee Handbook 2026');
   });
 

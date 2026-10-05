@@ -1,4 +1,11 @@
-import { ChangeDetectionStrategy, Component, input, output, signal } from '@angular/core';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  input,
+  output,
+  signal,
+} from '@angular/core';
 
 import {
   DOCUMENT_STATUS_LABELS,
@@ -7,6 +14,7 @@ import {
 import { BadgeComponent } from '../../../../shared/components/badge/badge.component';
 import { ButtonComponent } from '../../../../shared/components/button/button.component';
 import { IconComponent } from '../../../../shared/components/icon/icon.component';
+import { ModalComponent } from '../../../../shared/components/modal/modal.component';
 import { formatAbsoluteDate, formatRelativeTime } from '../../../../shared/utils/relative-time.util';
 
 /**
@@ -16,14 +24,16 @@ import { formatAbsoluteDate, formatRelativeTime } from '../../../../shared/utils
  * running ingest reads as running; one that failed keeps its failure visible and
  * offers a retry, because that is the row an administrator is looking for.
  *
- * Each row can be renamed in place. That is real rather than decorative: the
- * title is editable, committed on Enter or on losing focus, and abandoned on
- * Escape.
+ * Each row can be renamed, in a dialog rather than in the row. That is real rather
+ * than decorative: the name is what the assistant cites the document as, so it is
+ * editable and saved. It used to be an inline field in the row, which meant the
+ * document's own name disappeared from the screen at the moment it was being
+ * changed, along with the category and section count next to it.
  */
 @Component({
   selector: 'app-document-table',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [BadgeComponent, ButtonComponent, IconComponent],
+  imports: [BadgeComponent, ButtonComponent, IconComponent, ModalComponent],
   host: { class: 'block' },
   template: `
     <div class="overflow-hidden rounded-lg border border-border bg-card">
@@ -38,22 +48,9 @@ import { formatAbsoluteDate, formatRelativeTime } from '../../../../shared/utils
 
           <div class="flex min-w-0 flex-1 flex-col gap-1">
             <div class="flex min-w-0 flex-wrap items-center gap-2">
-              @if (renamingId() === document.id) {
-                <input
-                  type="text"
-                  class="w-full min-w-0 rounded-md border border-primary bg-card px-2 py-1
-                    text-sm text-foreground outline-none"
-                  [value]="document.title"
-                  [attr.aria-label]="'Rename ' + document.title"
-                  (keydown.enter)="commitRename(document, $event)"
-                  (keydown.escape)="cancelRename()"
-                  (blur)="commitRename(document, $event)"
-                />
-              } @else {
-                <span class="truncate text-sm font-medium text-foreground">{{
-                  document.title
-                }}</span>
-              }
+              <span class="truncate text-sm font-medium text-foreground">{{
+                document.title
+              }}</span>
 
               @switch (document.status) {
                 @case ('processing') {
@@ -109,18 +106,11 @@ import { formatAbsoluteDate, formatRelativeTime } from '../../../../shared/utils
               variant="ghost"
               tone="light"
               size="icon-sm"
-              [class.text-muted-foreground]="renamingId() !== document.id"
-              [class.hover:text-danger]="renamingId() !== document.id"
-              [class.text-primary]="renamingId() === document.id"
-              [attr.aria-label]="
-                renamingId() === document.id ? 'Cancel renaming' : 'Rename ' + document.title
-              "
-              (click)="toggleRename(document)"
+              class="text-muted-foreground hover:text-primary"
+              [attr.aria-label]="'Rename ' + document.title"
+              (click)="openRename(document)"
             >
-              <app-icon
-                [name]="renamingId() === document.id ? 'x' : 'pencil'"
-                [size]="15"
-              />
+              <app-icon name="pencil" [size]="15" />
             </button>
 
             <button
@@ -139,6 +129,60 @@ import { formatAbsoluteDate, formatRelativeTime } from '../../../../shared/utils
         </div>
       }
     </div>
+
+    <!--
+      The rename dialog.
+
+      A modal rather than an inline field in the row, for one reason that inline
+      renaming gets wrong: the title is the thing that identifies a document, and
+      replacing it with a text box removes the document's own name from the screen
+      while it is being changed. Everything needed to check the edit — the category,
+      the section count, who last touched it — is on the row behind, and a dialog
+      leaves all of it visible while the new title is typed.
+
+      It also matches the credentials dialog, so "a modal" means one thing in this
+      app rather than being a different shape on every screen that edits something.
+    -->
+    <app-modal
+      [isOpen]="renamingId() !== null"
+      [title]="'Rename document'"
+      [message]="
+        renamingId() !== null
+          ? 'The new name is what the assistant cites this document as.'
+          : ''
+      "
+      icon="pencil"
+      (closed)="closeRename()"
+    >
+      <label class="block text-sm font-medium text-foreground" [attr.for]="renameFieldId">
+        Document name
+      </label>
+
+      <input
+        #renameField
+        [id]="renameFieldId"
+        type="text"
+        class="mt-1.5 w-full rounded-md border border-border bg-background px-3 py-2 text-sm
+          text-foreground outline-none focus:border-primary"
+        [value]="renameDraft()"
+        maxlength="120"
+        (input)="onDraft($event)"
+        (keydown.enter)="commitRename()"
+      />
+
+      @if (draftTooLong()) {
+        <p class="mt-1.5 text-xs text-danger">
+          Use at most {{ MAX_DOCUMENT_TITLE_LENGTH }} characters.
+        </p>
+      }
+
+      <div modalFooter class="flex justify-end gap-2">
+        <button app-button type="button" variant="ghost" (click)="closeRename()">Cancel</button>
+        <button app-button type="button" [disabled]="!canSave()" (click)="commitRename()">
+          Save name
+        </button>
+      </div>
+    </app-modal>
   `,
 })
 export class DocumentTableComponent {
@@ -154,8 +198,35 @@ export class DocumentTableComponent {
   /** Emits a document under a new title. */
   readonly renamed = output<{ document: PolicyDocument; title: string }>();
 
-  /** The row whose title is being edited, or null when none is. */
+  /** The row whose title is being edited, or null when the dialog is closed. */
   protected readonly renamingId = signal<string | null>(null);
+
+  /** The name being typed, which starts as the document's own. */
+  protected readonly renameDraft = signal('');
+
+  /** The longest name the backend will store, mirrored so the field refuses it first. */
+  protected readonly MAX_DOCUMENT_TITLE_LENGTH = 120;
+
+  /** Unique per table, so the label points at this field and no other. */
+  protected readonly renameFieldId = `document-rename-${nextId()}`;
+
+  /** Over the limit the backend would refuse. */
+  protected readonly draftTooLong = computed(
+    () => this.renameDraft().trim().length > this.MAX_DOCUMENT_TITLE_LENGTH,
+  );
+
+  /** Whether there is anything worth saving. */
+  protected readonly canSave = computed(() => {
+    const title = this.renameDraft().trim();
+    const current = this.documentBeingRenamed()?.title ?? '';
+
+    return title !== '' && title !== current && !this.draftTooLong();
+  });
+
+  /** The document the dialog is open for, or null. */
+  private readonly documentBeingRenamed = computed(
+    () => this.documents().find((document) => document.id === this.renamingId()) ?? null,
+  );
 
   /** Labels for each ingestion state. */
   protected readonly statusLabels = DOCUMENT_STATUS_LABELS;
@@ -170,46 +241,55 @@ export class DocumentTableComponent {
     return formatAbsoluteDate(isoDate);
   }
 
-  /** Starts editing a title, or abandons the one being edited. */
-  protected toggleRename(document: PolicyDocument): void {
-    this.renamingId.update((current) => (current === document.id ? null : document.id));
+  /**
+   * Opens the dialog for one document, starting from its current name.
+   *
+   * One at a time, deliberately: two open dialogs would be two stacks, and the
+   * second would be on top of the first with no way to tell which document each is
+   * renaming.
+   */
+  protected openRename(document: PolicyDocument): void {
+    this.renameDraft.set(document.title);
+    this.renamingId.set(document.id);
   }
 
-  /** Abandons the edit without changing anything. */
-  protected cancelRename(): void {
-    this.cancellingRename = true;
+  /** Closes the dialog without changing anything. */
+  protected closeRename(): void {
     this.renamingId.set(null);
+    this.renameDraft.set('');
+  }
+
+  protected onDraft(event: Event): void {
+    this.renameDraft.set((event.target as HTMLInputElement).value);
   }
 
   /**
-   * Accepts the edited title, ignoring an empty one.
+   * Accepts the new name, and refuses the two edits that are not changes.
    *
-   * Bound to both Enter and blur, so committing does not depend on the keyboard.
-   * Escape is handled by `cancelRename` on keydown, and blur follows it, which
-   * would commit a rename the user just cancelled; the flag set here stops the
-   * blur from undoing the escape.
+   * An empty name would leave a document the assistant cannot cite by anything, and
+   * re-saving the name it already has is a no-op that should not look like a change.
+   * Both close the dialog without emitting, so the dialog is never a trap.
    */
-  protected commitRename(document: PolicyDocument, event: Event): void {
-    if (event instanceof KeyboardEvent && event.key !== 'Enter') {
+  protected commitRename(): void {
+    const document = this.documentBeingRenamed();
+
+    if (document === null || !this.canSave()) {
+      this.closeRename();
+
       return;
     }
 
-    if (this.cancellingRename) {
-      this.cancellingRename = false;
-      return;
-    }
-
-    const input = event.target as HTMLInputElement;
-    const title = input.value.trim();
-    this.renamingId.set(null);
-
-    if (title === '' || title === document.title) {
-      return;
-    }
-
+    const title = this.renameDraft().trim();
+    this.closeRename();
     this.renamed.emit({ document, title });
   }
+}
 
-  /** Set while an edit is being abandoned, so the following blur does not commit. */
-  private cancellingRename = false;
+/** A counter behind the generated ids, so two tables on a page do not collide. */
+let idCounter = 0;
+
+function nextId(): number {
+  idCounter += 1;
+
+  return idCounter;
 }

@@ -27,6 +27,8 @@ import { ConversationItemComponent } from '../conversation-item/conversation-ite
                   [conversation]="conversation"
                   [isSelected]="conversation.id === selectedId()"
                   (selected)="selected.emit($event)"
+                  (renamed)="renamed.emit($event)"
+                  (removed)="removed.emit($event)"
                 />
               </li>
             }
@@ -55,4 +57,10 @@ export class ConversationListComponent {
 
   /** Emits the conversation id when a row is activated. */
   readonly selected = output<string>();
+
+  /** Emits the id and the new name when a conversation is renamed. */
+  readonly renamed = output<{ id: string; title: string }>();
+
+  /** Emits the id of a conversation to delete. The parent confirms it first. */
+  readonly removed = output<string>();
 }

@@ -1,6 +1,6 @@
 import { Routes } from '@angular/router';
 
-import { adminGuard, authGuard, guestGuard } from './core/guards/auth.guard';
+import { adminGuard, authGuard, guestGuard, landingGuard } from './core/guards/auth.guard';
 
 /**
  * Each view is lazily loaded, so the initial bundle only carries the shell.
@@ -61,20 +61,44 @@ export const routes: Routes = [
       ),
   },
   {
+    // Where a correct sign-in for an unapproved account lands. Not behind
+    // `authGuard`: the account is switched off, so there is no session and the guard
+    // would bounce the person straight back to sign in with nothing said.
+    path: 'pending-approval',
+    pathMatch: 'full',
+    title: 'Waiting for approval · Internal Knowledge Assistant',
+    data: { plain: true },
+    loadComponent: () =>
+      import('./features/auth/views/pending-approval-view/pending-approval-view.component').then(
+        (module) => module.PendingApprovalViewComponent,
+      ),
+  },
+  {
     path: '',
     pathMatch: 'full',
     title: 'Internal Knowledge Assistant',
-    canActivate: [authGuard],
+    // `landingGuard` sends an administrator to the dashboard. The root is the app's
+    // front door rather than the only way to the assistant: `/ask` below is that,
+    // which is what lets the sidebar's "Ask" link keep working for an administrator
+    // instead of bouncing them straight back here.
+    canActivate: [authGuard, landingGuard],
     loadComponent: () =>
       import('./views/dashboard-view/dashboard-view.component').then(
         (module) => module.DashboardViewComponent,
       ),
   },
   {
+    // The assistant, deliberately reached. A real route rather than a redirect onto
+    // the root, because the root now turns administrators away and this is where
+    // they are sent when they choose to ask something instead.
     path: 'ask',
     pathMatch: 'full',
     title: 'Ask a question · Internal Knowledge Assistant',
-    redirectTo: '',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./views/dashboard-view/dashboard-view.component').then(
+        (module) => module.DashboardViewComponent,
+      ),
   },
   {
     path: 'response',
@@ -132,13 +156,19 @@ export const routes: Routes = [
       ),
   },
   {
-    path: 'admin/invite',
-    title: 'Invite someone · Internal Knowledge Assistant',
+    path: 'admin/users',
+    title: 'Users · Internal Knowledge Assistant',
     canActivate: [authGuard, adminGuard],
     loadComponent: () =>
-      import('./views/admin-invite-view/admin-invite-view.component').then(
-        (module) => module.AdminInviteViewComponent,
+      import('./views/admin-users-view/admin-users-view.component').then(
+        (module) => module.AdminUsersViewComponent,
       ),
+  },
+  {
+    // The old address, kept working rather than 404ing: it is in bookmarks and in
+    // anything somebody was sent before the screen was renamed.
+    path: 'admin/invite',
+    redirectTo: 'admin/users',
   },
   {
     path: 'admin/access',

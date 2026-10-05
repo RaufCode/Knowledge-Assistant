@@ -603,10 +603,10 @@ const main = async () => {
 
     const newcomerFields = () => newcomer.$$('app-form-field input');
 
-    const askForAccess = async (name, email, password = 'correct-horse-1!') => {
+    const askForAccess = async (name, email) => {
       const inputs = await newcomerFields();
 
-      for (const [index, value] of [name, email, password, password].entries()) {
+      for (const [index, value] of [name, email].entries()) {
         await inputs[index].click({ clickCount: 3 });
         await newcomer.keyboard.down('Control');
         await newcomer.keyboard.press('KeyA');
@@ -642,17 +642,15 @@ const main = async () => {
       (await newcomer.content()).includes(`@acmetech.example`),
     );
 
-    const newcomerEmail = `kofi.${Date.now().toString(36)}@acmetech.example`;
-    const newcomerPassword = 'correct-horse-1!';
-    await askForAccess('Kofi Mensah', newcomerEmail, newcomerPassword);
+    await askForAccess('Kofi Mensah', `kofi.${Date.now().toString(36)}@acmetech.example`);
     await newcomer.waitForFunction(
-      () => document.body.innerText.includes('with an administrator now'),
+      () => document.body.innerText.includes('an administrator will review'),
       { timeout: 15000 },
     );
 
     truthy(
       'asking says an administrator decides, not that the account now exists',
-      (await newcomer.content()).includes('once they approve'),
+      (await newcomer.content()).includes('an administrator will review'),
     );
     falsy(
       'and nothing claims to have signed anybody in',
@@ -681,41 +679,15 @@ const main = async () => {
       }
     }
 
-    await adminPage.waitForFunction(() => document.body.innerText.includes('Approved'), {
+    await adminPage.waitForFunction(() => document.body.innerText.includes('Send this link'), {
       timeout: 15000,
     });
 
     truthy(
-      'approving activates the account with the chosen password, so no link is needed',
-      (await adminPage.content()).includes('Approved'),
+      'approving hands back a link, because there is no mail service to send one with',
+      (await adminPage.content()).includes('/accept-invite?token='),
     );
-
-    // The person they just approved signs in with the password they chose.
-    await newcomer.goto(`${APP}/login`, { waitUntil: 'networkidle2' });
-    await newcomer.waitForSelector('app-form-field input');
-    const signInInputs = await newcomerFields();
-    for (const [index, value] of [newcomerEmail, newcomerPassword].entries()) {
-      await signInInputs[index].click({ clickCount: 3 });
-      await newcomer.keyboard.down('Control');
-      await newcomer.keyboard.press('KeyA');
-      await newcomer.keyboard.up('Control');
-      await newcomer.keyboard.press('Backspace');
-      await signInInputs[index].type(value);
-    }
-    for (const button of await newcomer.$$('button')) {
-      if ((await newcomer.evaluate((node) => node.textContent?.trim(), button)) === 'Sign in') {
-        await button.click();
-        break;
-      }
-    }
-    await newcomer.waitForFunction(() => window.__sidebarAppeared === true, {
-      timeout: 15000,
-    });
-    truthy(
-      'and the approved newcomer signs in with that password',
-      await newcomer.evaluate(() => window.__sidebarAppeared),
-      true,
-    );
+    truthy('and says it works once', (await adminPage.content()).includes('works once'));
 
     // Direct invitation, the other way in.
     await adminPage.goto(`${APP}/admin/invite`, { waitUntil: 'networkidle2' });

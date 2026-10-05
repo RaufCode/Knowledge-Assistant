@@ -6,12 +6,14 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { provideRouter, Router } from '@angular/router';
 
 import { API_BASE_URL } from '../../../../core/api.config';
+import { AuthService } from '../../../../core/services/auth.service';
 import { LoginViewComponent } from './login-view.component';
 
 describe('LoginViewComponent', () => {
   let fixture: ComponentFixture<LoginViewComponent>;
   let http: HttpTestingController;
   let router: Router;
+  let auth: AuthService;
 
   const element = (): HTMLElement => fixture.nativeElement as HTMLElement;
   const fields = (): HTMLInputElement[] =>
@@ -51,7 +53,13 @@ describe('LoginViewComponent', () => {
     await TestBed.configureTestingModule({
       imports: [LoginViewComponent],
       providers: [
-        provideRouter([{ path: 'login', children: [] }]),
+        provideRouter([
+          { path: 'login', children: [] },
+          { path: 'pending-approval', children: [] },
+          { path: 'register', children: [] },
+          { path: 'accept-invite', children: [] },
+          { path: '**', children: [] },
+        ]),
         provideHttpClient(),
         provideHttpClientTesting(),
       ],
@@ -60,6 +68,7 @@ describe('LoginViewComponent', () => {
     fixture = TestBed.createComponent(LoginViewComponent);
     http = TestBed.inject(HttpTestingController);
     router = TestBed.inject(Router);
+    auth = TestBed.inject(AuthService);
     await render();
   });
 
@@ -83,8 +92,37 @@ describe('LoginViewComponent', () => {
     expect(element().textContent).not.toContain('Forgot password?');
   });
 
-  it('offers a way to request access, so the form cannot dead-end', async () => {
-    expect(element().querySelector('a[href="/register"]')).not.toBeNull();
+  it('centres the question and the answer together, on one row', () => {
+    const register = element().querySelector('a[href="/register"]') as HTMLElement;
+    const row = register.parentElement as HTMLElement;
+
+    // Centred by the box rather than by `text-align`, which only works while both
+    // halves happen to be inline — and drifts them to opposite edges the moment they
+    // are not.
+    expect(row.className).toContain('justify-center');
+    expect(row.className).toContain('flex-wrap');
+    // The two halves separately, because Angular drops the whitespace between
+    // elements and the gap between them is a flex gap rather than a character.
+    expect(row.querySelector('span')?.textContent?.trim()).toBe(
+      "Don't have an account?",
+    );
+    expect(register.textContent?.trim()).toBe('Create an account');
+  });
+
+  it('offers a way to register, so the form does not dead-end', async () => {
+    // Sign-in is the screen everybody reaches first, including somebody who has no
+    // account yet. Without this the only way to find registration is to already know
+    // it exists, which is the same as not having it.
+    const register = element().querySelector('a[href="/register"]');
+
+    expect(register).not.toBeNull();
+    expect(register?.textContent).toContain('Create an account');
+  });
+
+  it('does not offer the invitation route, which was told to them already', () => {
+    // Somebody who was invited knows they were: it reached them by a link an
+    // administrator sent. Sitting it beside "no account yet" asked a second question
+    // of the person who had just been given the answer.
     expect(element().querySelector('a[href="/accept-invite"]')).toBeNull();
   });
 
@@ -154,7 +192,7 @@ describe('LoginViewComponent', () => {
 
   it('goes to the dashboard once the backend accepts the credentials', async () => {
     // Spied before the form is sent, so the navigation is caught either side of it.
-    const navigate = vi.spyOn(router, 'navigateByUrl');
+    const navigate = vi.spyOn(router, 'navigate');
     await signIn();
 
     http
@@ -162,11 +200,11 @@ describe('LoginViewComponent', () => {
       .flush({ user: { id: 'u1', name: 'Ama Mensah', email: 'a@b.test', role: 'employee' } });
     await render();
 
-    expect(navigate).toHaveBeenCalledWith('/');
+    expect(navigate).toHaveBeenCalledWith(['/']);
   });
 
   it('lands an administrator on the dashboard, and an employee on the assistant', async () => {
-    const navigate = vi.spyOn(router, 'navigateByUrl');
+    const navigate = vi.spyOn(router, 'navigate');
     await signIn();
 
     http
@@ -177,7 +215,42 @@ describe('LoginViewComponent', () => {
     // An administrator's job starts on the dashboard. Sending them to the assistant
     // instead means the first thing they see after signing in is a chat screen they
     // have to navigate out of.
-    expect(navigate).toHaveBeenCalledWith('/admin');
+    expect(navigate).toHaveBeenCalledWith(['/admin']);
+  });
+
+  it('shows the waiting screen when the account is not approved yet', async () => {
+    const navigate = vi.spyOn(router, 'navigate');
+    await signIn();
+
+    // The server's 202, which it sends only when the password was right. Nothing is
+    // wrong: the account exists and an administrator has not got to it yet.
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush(
+        { status: 'pending', name: 'Kofi Mensah', requested_role: 'employee' },
+        { status: 202, statusText: 'Accepted' },
+      );
+    await render();
+
+    // A separate screen rather than a 401, which would tell somebody to reset a
+    // password that is perfectly fine.
+    expect(navigate).toHaveBeenCalledWith(['/pending-approval']);
+  });
+
+  it('stores nothing when the answer is "still pending"', async () => {
+    await signIn();
+
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush(
+        { status: 'pending', name: 'Kofi Mensah', requested_role: 'admin' },
+        { status: 202, statusText: 'Accepted' },
+      );
+    await render();
+
+    // No user, no session hint: a pending account must not be mistakable for a
+    // signed-in one anywhere else in the app.
+    expect(auth.user()).toBeNull();
   });
 
   it('returns to where the guard interrupted, when it was asked to', async () => {

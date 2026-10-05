@@ -263,6 +263,63 @@ describe('AdminAccessRequestsViewComponent', () => {
     });
   });
 
+  describe('going back', () => {
+    beforeEach(async () => {
+      await signedInAs('admin');
+      http.expectOne(REQUESTS_URL).flush({ requests: [] });
+      await render();
+    });
+
+    it('offers a way back to Users, which is where the queue is reached from', () => {
+      // A queue of people who cannot get in, with no way out of it, is the one outcome
+      // worth avoiding. The fallback route matters as much as the button: somebody who
+      // typed this address has not been anywhere to go back to.
+      const back = element().querySelector('button[aria-label="Back to users"]');
+
+      expect(back).not.toBeNull();
+      expect(back?.textContent).toContain('Back to users');
+    });
+  });
+
+  describe('a decided request', () => {
+    beforeEach(async () => {
+      await signedInAs('admin');
+      http.expectOne(REQUESTS_URL).flush({
+        requests: [
+          {
+            id: 'req-9',
+            name: 'Ama Konadu',
+            email: 'ama@acmetech.example',
+            status: 'declined',
+            requested_at: '2026-10-01T09:00:00',
+            decided_at: '2026-10-03T11:30:00',
+          },
+        ],
+      });
+      await render();
+    });
+
+    it('says when it was decided when the badge is hovered', () => {
+      // The badge said only "Declined", so the one question about a closed request —
+      // how long has this been sitting here — needed the row opened to answer.
+      const badge = element().querySelector('app-badge') as HTMLElement;
+
+      expect(badge).not.toBeNull();
+      expect(badge.getAttribute('title')).toContain('Declined');
+    });
+
+    it('runs the full width of the page, like the pages beside it', () => {
+      // A centred column held this at 64rem while the bar above ran the full width of
+      // the window, and the users page used a third width, so moving between the two
+      // moved the content sideways.
+      const scroll = element().querySelector('.scrollbar-thin') as HTMLElement;
+
+      expect(scroll).not.toBeNull();
+      expect(scroll.querySelector('.max-w-5xl')).toBeNull();
+      expect(scroll.querySelector('.max-w-4xl')).toBeNull();
+    });
+  });
+
   describe('as an employee', () => {
     beforeEach(async () => {
       await signedInAs('employee');

@@ -5,7 +5,7 @@ import { CanActivateFn, Router, UrlTree, provideRouter } from '@angular/router';
 
 import { API_BASE_URL } from '../api.config';
 import { AuthService } from '../services/auth.service';
-import { adminGuard, authGuard, guestGuard } from './auth.guard';
+import { adminGuard, authGuard, guestGuard, landingGuard } from './auth.guard';
 
 /** A stand-in route, which is all a `CanActivateFn` is given. */
 const route = {} as never;
@@ -194,6 +194,13 @@ describe('auth guards', () => {
         .expectOne(`${API_BASE_URL}/api/auth/me`)
         .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
 
+      // And the refresh that follows, refused. A 401 on `/me` is not on its own the
+      // end of a session: the access cookie is short-lived and the refresh cookie
+      // outlives it, so one refresh is tried before the answer is signed out.
+      http
+        .expectOne(`${API_BASE_URL}/api/auth/refresh`)
+        .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
+
       expect(await result).toBe(true);
     });
 
@@ -237,6 +244,36 @@ describe('auth guards', () => {
     });
   });
 
+  describe('landingGuard', () => {
+    it('sends an administrator arriving at the front door to the dashboard', async () => {
+      withSessionHint();
+      const result = run(landingGuard);
+      answerSession('admin');
+
+      // The dashboard is where an administrator's work is, and the chat screen is
+      // not what they came for.
+      expect(redirectedTo(await result)).toBe('/admin');
+    });
+
+    it('lets an employee through to the assistant', async () => {
+      withSessionHint();
+      const result = run(landingGuard);
+      answerSession('employee');
+
+      // Only administrators are redirected. An employee has nothing else to land on.
+      expect(await result).toBe(true);
+    });
+
+    it('sends a signed-out visitor to the sign-in screen, not to the dashboard', async () => {
+      // The session check is taken from the shared decision, so somebody signed out
+      // is not bounced to the dashboard first and arrives at the sign-in screen a
+      // moment later.
+      const result = run(landingGuard);
+
+      expect(redirectedTo(await result)).toContain('/login');
+    });
+  });
+
   describe('during a server render', () => {
     /**
      * Re-registers the service as one that says it is not in a browser.
@@ -264,6 +301,15 @@ describe('auth guards', () => {
       asServerRender();
 
       expect(await run(authGuard)).toBe(true);
+      http.expectNone(`${API_BASE_URL}/api/auth/me`);
+    });
+
+    it('lets the front door through rather than guessing the role', async () => {
+      asServerRender();
+
+      // A render knows nobody's role. Redirecting here would send every
+      // administrator to the dashboard before the client had taken over at all.
+      expect(await run(landingGuard)).toBe(true);
       http.expectNone(`${API_BASE_URL}/api/auth/me`);
     });
 

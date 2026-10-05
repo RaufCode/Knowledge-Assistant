@@ -21,7 +21,13 @@ const angularApp = new AngularNodeAppEngine({
  * the sign-in screen rather than with the page. `/register` is here because it is a
  * redirect to `/accept-invite` and answering it directly saves a hop.
  */
-const SIGNED_OUT_ROUTES = new Set(['/login', '/accept-invite', '/register']);
+const SIGNED_OUT_ROUTES = new Set([
+  '/login',
+  '/accept-invite',
+  '/register',
+  '/pending-approval',
+]);
+
 /**
  * Serve static files from /browser
  *

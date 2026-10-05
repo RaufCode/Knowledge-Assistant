@@ -76,7 +76,19 @@ import { IconComponent, type IconName } from '../icon/icon.component';
           </button>
         </div>
 
-        <div class="scrollbar-thin min-h-0 flex-1 overflow-y-auto px-6">
+        <!--
+          Vertical padding on a scroll container, which normally would not want any.
+
+          A focused field draws its ring with an outline that sits two pixels outside
+          the field, and this element clips: anything past its padding box is cut off.
+          With no vertical padding the first and last fields sat against the edges of
+          the scroll area, so the ring on the field nearest an edge lost the part that
+          made it visible — the border stopped short and looked like a rendering fault
+          rather than a focus.
+
+          A focused control must be visibly focused, so this is not decoration.
+        -->
+        <div class="scrollbar-thin min-h-0 flex-1 overflow-y-auto px-6 py-1">
           <ng-content />
         </div>
 

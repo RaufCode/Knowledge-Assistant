@@ -73,6 +73,16 @@ export interface MessageDto {
   /** Citations on an answered message. Null on a question, which cites nothing. */
   sources: SourceDto[] | null;
   created_at: string;
+  /**
+   * How the assistant answered. Null on a question, and on any message stored
+   * before this field existed.
+   */
+  status: string | null;
+  /**
+   * A 1-10 figure derived from the citation scores above, so it never disagrees
+   * with them. Null when the message cites nothing.
+   */
+  confidence: number | null;
 }
 
 /** `GET /api/conversations/{id}` response: one conversation, oldest message first. */
@@ -101,8 +111,22 @@ export type ChatStreamEventDto =
   | { type: 'status'; stage: 'writing' }
   /** A piece of the answer, in order. */
   | { type: 'delta'; text: string }
-  /** The final answer, and the citations that go with it. Exactly one. */
-  | { type: 'done'; answer: string; answered: boolean; sources: SourceDto[] }
+  /**
+   * The final answer, the citations that go with it, and how well those citations
+   * matched. Exactly one.
+   *
+   * `confidence` rides here rather than on a delta of its own for the same reason
+   * the citations do: it describes the finished answer, and a number appearing
+   * mid-stream would be a claim about text that has not been written yet.
+   */
+  | {
+      type: 'done';
+      answer: string;
+      answered: boolean;
+      status: string;
+      confidence: number | null;
+      sources: SourceDto[];
+    }
   /**
    * The conversation's name, sent once, after the first exchange is answered.
    *

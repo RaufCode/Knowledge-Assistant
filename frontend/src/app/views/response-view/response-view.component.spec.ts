@@ -16,6 +16,7 @@ const MESSAGES: Message[] = [
     status: 'answered',
     sources: [],
     documentCount: 0,
+    confidence: null,
     createdAt: '2026-09-30T09:00:00Z',
   },
   {
@@ -25,6 +26,7 @@ const MESSAGES: Message[] = [
     status: 'answered',
     sources: [],
     documentCount: 0,
+    confidence: null,
     createdAt: '2026-09-30T09:00:01Z',
   },
 ];
@@ -200,19 +202,15 @@ describe('ResponseViewComponent', () => {
       expect(element().querySelector('app-chat-thread')).toBeNull();
     });
 
-    it('shapes the placeholder like the conversation it stands in for', () => {
-      // A skeleton is only worth having if it is the shape of what replaces it. The
-      // question bubble and the answer card are both measured here against the real
-      // components, because a placeholder with the wrong corner or a bar the real card
-      // does not have makes the page visibly correct itself on arrival.
-      const bubble = element().querySelector('.rounded-br-sm');
-      const answer = element().querySelector('app-answer-pending .rounded-tl-sm');
+    it('says it is loading rather than imitating work', () => {
+      // Nothing is being read or worked out while a saved conversation is fetched, so
+      // the card says the true thing. Imitating an answer in progress is what made the
+      // old placeholder sit there pulsing for a wait it was not part of.
+      const card = element().querySelector('app-answer-pending');
 
-      expect(bubble).not.toBeNull();
-      expect(answer).not.toBeNull();
-      // The real answer card has no heading bar above its prose, and the placeholder
-      // must not invent one or the citations jump when the answer lands.
-      expect(element().querySelectorAll('app-answer-pending app-skeleton').length).toBeGreaterThan(4);
+      expect(card).not.toBeNull();
+      expect(card?.textContent).toContain('Loading conversation');
+      expect(card?.querySelectorAll('app-skeleton').length).toBe(0);
     });
 
     it('hides the placeholder from assistive technology, saying it once instead', () => {

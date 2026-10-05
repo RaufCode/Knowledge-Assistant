@@ -48,6 +48,50 @@ describe('authInterceptor', () => {
     client = TestBed.inject(HttpClient);
   });
 
+  it('refreshes a rotated token and sends the request once more', async () => {
+    // The cookie is replaced server-side whenever the session changes, so a token read
+    // before signing in is stale and the browser pairs a new cookie with an old header.
+    // The server cannot tell that from a forged request, so the tab recovers: refresh,
+    // wait for the new cookie, try again. Once.
+    setCsrfCookie('stale-token');
+    client.post(`${API_BASE_URL}/api/conversations`, {}).subscribe();
+
+    const first = http.expectOne(`${API_BASE_URL}/api/conversations`);
+    expect(first.request.headers.get('X-CSRF-Token')).toBe('stale-token');
+
+    // The browser's cookie is replaced when the refresh lands.
+    first.flush(
+      { detail: 'This request is missing a valid CSRF token.' },
+      { status: 403, statusText: 'Forbidden' },
+    );
+
+    // The browser stores the new cookie as the refresh lands. Set before flushing,
+    // because that is the moment it happens, and the retry reads it on the far side.
+    setCsrfCookie('fresh-token');
+    http.expectOne(`${API_BASE_URL}/api/auth/csrf`).flush({ csrf_token: 'fresh-token' });
+
+    const retry = http.expectOne(`${API_BASE_URL}/api/conversations`);
+
+    // The new value, which is only knowable after the refresh completed. Reading the
+    // cookie as soon as the refresh was fired gets the one that was just refused.
+    expect(retry.request.headers.get('X-CSRF-Token')).toBe('fresh-token');
+    retry.flush({ id: 'c1' });
+  });
+
+  it('does not retry a 403 that is about permission rather than the token', () => {
+    // An employee reaching an administrator's route must get one refusal, not two
+    // attempts — and a request with a side effect must never be repeated on a
+    // refusal that has nothing to do with the token.
+    setCsrfCookie('token-from-the-cookie');
+    client.post(`${API_BASE_URL}/api/auth/users`, {}).subscribe({ error: () => undefined });
+
+    const request = http.expectOne(`${API_BASE_URL}/api/auth/users`);
+    request.flush({ detail: 'Not an administrator.' }, { status: 403, statusText: 'Forbidden' });
+
+    http.expectNone(`${API_BASE_URL}/api/auth/csrf`);
+    http.expectNone(`${API_BASE_URL}/api/auth/users`);
+  });
+
   it('puts the CSRF token on a state-changing request', () => {
     setCsrfCookie('token-from-the-cookie');
     client.post(`${API_BASE_URL}/api/conversations`, {}).subscribe();
@@ -237,3 +281,4 @@ describe('authInterceptor', () => {
     http.expectNone(`${API_BASE_URL}/api/auth/refresh`);
   });
 });
+

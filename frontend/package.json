@@ -3,11 +3,12 @@
   "version": "0.0.0",
   "scripts": {
     "ng": "ng",
-    "start": "node dist/frontend/server/server.mjs",
-    "start:dev": "ng serve",
+    "start": "ng serve",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
     "test": "ng test",
+    "typecheck": "ngc -p tsconfig.app.json --noEmit",
+    "verify": "npm run typecheck && npm run test -- --watch=false && npm run build",
     "serve:ssr:frontend": "node dist/frontend/server/server.mjs"
   },
   "private": true,

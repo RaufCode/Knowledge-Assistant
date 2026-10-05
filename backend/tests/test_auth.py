@@ -37,6 +37,7 @@ from app.config import settings
 from app.database import AccessRequest, Base, Invite, RefreshSession, User
 from app.dependencies import ACCESS_COOKIE, CSRF_COOKIE, SESSION_HINT_COOKIE
 from app.security import REFRESH_TOKEN_TYPE, create_access_token, decode_token, hash_password
+from app.schemas_auth import MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH
 
 COMPANY = "acmetech.example"
 PASSWORD = "correct-horse-1!"
@@ -357,7 +358,7 @@ class PasswordTest(AuthTestCase):
         self.assertTrue(stored.startswith("$2b$"), stored)
         self.assertNotIn(PASSWORD, stored)
 
-    def test_short_passwords_are_refused_and_six_chars_needs_no_mix(self) -> None:
+    def test_the_policy_is_length_and_nothing_else(self) -> None:
         admin = self.signed_in_admin()
         token = admin.post(
             "/api/auth/invite",
@@ -365,27 +366,55 @@ class PasswordTest(AuthTestCase):
             headers=self.csrf_headers(admin),
         ).json()["token"]
 
-        # Anything under 6 characters is refused.
-        for weak in ["a", "ab12", "abcde"]:
-            with self.subTest(password=weak):
+        # Accepted. Every one of these fails a composition rule — no letter, no digit,
+        # no symbol — and all of them are eight characters or more. The policy asks
+        # for length because length is what matters; refusing these only teaches
+        # people to write `Passw0rd!`.
+        for acceptable in ["12345678", "!!!!!!!!", "aaaaaaaa", "correcthorse"]:
+            with self.subTest(password=acceptable):
+                self.invite_and_accept(self.new_client(), f"{acceptable}@{COMPANY}", password=acceptable)
+
+    def test_passwords_under_the_floor_are_refused_with_the_policy_spelled_out(self) -> None:
+        admin = self.signed_in_admin()
+
+        for index, short in enumerate(["short1!", "1234567", "abc"]):
+            with self.subTest(password=short):
+                token = admin.post(
+                    "/api/auth/invite",
+                    json={
+                        "name": f"Person {index}",
+                        "email": f"person{index}@{COMPANY}",
+                        "role": "employee",
+                    },
+                    headers=self.csrf_headers(admin),
+                ).json()["token"]
+
                 response = self.new_client().post(
-                    "/api/auth/accept-invite", json={"token": token, "password": weak}
+                    "/api/auth/accept-invite", json={"token": token, "password": short}
                 )
                 self.assertEqual(response.status_code, 422, response.text)
+                self.assertIn(str(MIN_PASSWORD_LENGTH), str(response.json()))
 
-        # And the invite survives a rejected attempt, so a rejected password does not
-        # burn the invitation.
-        self.assertEqual(
-            self.new_client().get(f"/api/auth/invite/{token}").status_code,
-            200,
+                # And the invite survives a rejected attempt, so a rejected password
+                # does not burn the invitation.
+                self.assertEqual(
+                    self.new_client().get(f"/api/auth/invite/{token}").status_code, 200
+                )
+
+    def test_a_password_over_the_ceiling_is_refused(self) -> None:
+        admin = self.signed_in_admin()
+        token = admin.post(
+            "/api/auth/invite",
+            json={"name": "Ama Konadu", "email": f"ama@{COMPANY}", "role": "employee"},
+            headers=self.csrf_headers(admin),
+        ).json()["token"]
+
+        response = self.new_client().post(
+            "/api/auth/accept-invite",
+            json={"token": token, "password": "a" * (MAX_PASSWORD_LENGTH + 1)},
         )
 
-        # Six characters with no digit or symbol is accepted: length is the
-        # whole policy.
-        accepted = self.new_client().post(
-            "/api/auth/accept-invite", json={"token": token, "password": "abcdef"}
-        )
-        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(response.status_code, 422, response.text)
 
     def test_login_compares_against_the_hash(self) -> None:
         self.invite_and_accept(self.new_client(), f"ama@{COMPANY}")
@@ -892,16 +921,23 @@ class RateLimitTest(AuthTestCase):
 class AccessRequestTest(AuthTestCase):
     """Asking for an account, and an administrator answering.
 
-    The property being protected is specific: a request must not be able to become an
-    account, and must not be able to say what role it would get. Everything else — the
-    queue, the invitation, the idempotence — is in service of that.
+    The property being protected is specific: a registration must grant nothing before
+    an administrator decides, and the role that ends up on the account must be the one
+    the approval carried rather than the one the registration asked for. Everything
+    else — the queue, the invitation, the idempotence — is in service of that.
     """
 
-    def asks_for(self, client: TestClient, email: str = f"newcomer@{COMPANY}", password: str = PASSWORD):
-        """Posts a request the way the frontend does, CSRF header and all."""
+    def asks_for(
+        self,
+        client: TestClient,
+        email: str = f"newcomer@{COMPANY}",
+        role: str = "employee",
+        password: str = "their-own-pass1",
+    ):
+        """Registers the way the frontend does, CSRF header and all."""
         return client.post(
             "/api/auth/request-access",
-            json={"name": "Kofi Mensah", "email": email, "password": password},
+            json={"name": "Kofi Mensah", "email": email, "role": role, "password": password},
             headers=self.csrf_headers(client),
         )
 
@@ -931,40 +967,102 @@ class AccessRequestTest(AuthTestCase):
             headers=self.csrf_headers(admin),
         )
 
-    def test_a_request_creates_no_account(self) -> None:
+    def test_a_registration_creates_an_account_that_grants_nothing(self) -> None:
         response = self.asks_for(self.new_client())
 
         self.assertEqual(response.status_code, 202, response.text)
 
-        # The whole point: a request is a request. There is no user row to sign in to,
-        # so nothing here can be logged into even by somebody who guessed the address.
-        self.assertIsNone(self.stored_user(f"newcomer@{COMPANY}"))
+        # A row exists so the person can sign in and be told they are waiting, and it
+        # is switched off. Inactive is refused by every route that matters, so this is
+        # a place to record a password rather than a way in.
+        stored = self.stored_user(f"newcomer@{COMPANY}")
+        self.assertIsNotNone(stored)
+        self.assertFalse(stored.is_active)
         self.assertEqual(self.count_requests(), 1)
 
-    def test_a_request_cannot_name_its_own_role(self) -> None:
+    def test_a_pending_registration_cannot_sign_in_yet(self) -> None:
         self.asks_for(self.new_client())
 
-        # The field is not on the model, so there is nowhere for it to be stored even
-        # if a client sends one: Pydantic drops it and the column does not exist.
-        self.assertNotIn("role", AccessRequest.__table__.columns)
+        # Correct password, unapproved account: answered with "still waiting" rather
+        # than refused, because nothing is wrong and retrying will not help.
+        pending = self.new_client()
+        pending.post("/api/auth/csrf")
+        response = pending.post(
+            "/api/auth/login",
+            json={"email": f"newcomer@{COMPANY}", "password": "their-own-pass1"},
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()["status"], "pending")
+        self.assertEqual(response.json()["requested_role"], "employee")
+
+        # And no session came with it, so there is nothing to use.
+        self.assertIsNone(pending.cookies.get(ACCESS_COOKIE))
+
+    def test_a_pending_answer_needs_the_right_password(self) -> None:
+        self.asks_for(self.new_client())
+
+        # Otherwise this endpoint is a way to ask which addresses are registered and
+        # what state they are in. A wrong password gets the one generic answer.
+        wrong = self.new_client()
+        wrong.post("/api/auth/csrf")
+        response = wrong.post(
+            "/api/auth/login",
+            json={"email": f"newcomer@{COMPANY}", "password": "not-their-password"},
+        )
+
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertNotIn("pending", response.text)
+
+    def test_the_asked_for_role_is_recorded_but_does_not_survive_approval(self) -> None:
+        # Asking for admin is a sentence in an administrator's queue. The role that
+        # lands on the account is the one the approval carried, and the approval
+        # defaults to the least privileged one.
+        self.asks_for(self.new_client(), role="admin")
+
+        self.assertIn("requested_role", AccessRequest.__table__.columns)
+
+        # Not on the account. An unapproved stranger holding the administrator role
+        # is inert only for as long as every reader of `role` also checks
+        # `is_active`, and the ask is recorded on the request row where the
+        # administrator will actually read it.
+        self.assertEqual(self.stored_user(f"newcomer@{COMPANY}").role, "employee")
+        self.assertFalse(self.stored_user(f"newcomer@{COMPANY}").is_active)
 
         admin = self.signed_in_admin()
         approved = self.approve(admin, self.request_id_for(f"newcomer@{COMPANY}"))
 
         self.assertEqual(approved.status_code, 200, approved.text)
-        self.assertEqual(approved.json()["request"]["status"], "approved")
+        self.assertEqual(approved.json()["request"]["requested_role"], "admin")
 
-        # And approving defaults to the least privileged role.
+        # Asked for admin, approved as the default, and that is what is on the account.
         self.assertEqual(self.stored_user(f"newcomer@{COMPANY}").role, "employee")
 
     def test_an_admin_role_needs_an_admin_to_grant_it(self) -> None:
-        self.asks_for(self.new_client())
+        self.asks_for(self.new_client(), role="admin")
         admin = self.signed_in_admin()
 
         self.approve(admin, self.request_id_for(f"newcomer@{COMPANY}"), role="admin")
 
-        # An administrator may grant it. Nobody else can, and the requester never could.
+        # Only because the approval said so.
         self.assertEqual(self.stored_user(f"newcomer@{COMPANY}").role, "admin")
+
+    def test_an_approved_registration_can_sign_in(self) -> None:
+        self.asks_for(self.new_client())
+        admin = self.signed_in_admin()
+        self.approve(admin, self.request_id_for(f"newcomer@{COMPANY}"))
+
+        client = self.new_client()
+        client.post("/api/auth/csrf")
+        response = client.post(
+            "/api/auth/login",
+            json={"email": f"newcomer@{COMPANY}", "password": "their-own-pass1"},
+        )
+
+        # No invitation and no second password: approval switches on the account they
+        # already had a password for.
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["user"]["role"], "employee")
 
     def test_a_non_company_address_is_refused(self) -> None:
         response = self.asks_for(self.new_client(), "someone@gmail.com")
@@ -1026,66 +1124,53 @@ class AccessRequestTest(AuthTestCase):
         self.assertIsNone(self.stored_user(f"newcomer@{COMPANY}"))
         self.assertEqual(self.db.query(Invite).count(), 0)
 
-    def test_approving_activates_the_account_with_the_chosen_password(self) -> None:
-        client = self.new_client()
-        self.assertEqual(self.asks_for(client).status_code, 202)
+    def test_approving_switches_on_the_account_they_registered(self) -> None:
+        self.asks_for(self.new_client())
         admin = self.signed_in_admin()
 
         response = self.approve(admin, self.request_id_for(f"newcomer@{COMPANY}"))
 
         self.assertEqual(response.status_code, 200, response.text)
-        # No invitation needed: the password was chosen at registration.
+
+        # They chose their own password at registration, so there is nothing left to
+        # invite them to and no second credential for the administrator to hold.
         self.assertEqual(response.json()["invite_link"], "")
-        self.assertEqual(response.json()["token"], "")
+        self.assertTrue(self.stored_user(f"newcomer@{COMPANY}").is_active)
 
-        # The account is active with that password, so sign-in works at once.
-        user = self.stored_user(f"newcomer@{COMPANY}")
-        self.assertTrue(user.is_active)
-        self.assertNotIn(PASSWORD, user.password_hash)
-
-        signed_in = self.new_client().post(
-            "/api/auth/login", json={"email": f"newcomer@{COMPANY}", "password": PASSWORD}
+        client = self.new_client()
+        client.post("/api/auth/csrf")
+        signed_in = client.post(
+            "/api/auth/login",
+            json={"email": f"newcomer@{COMPANY}", "password": "their-own-pass1"},
         )
+
         self.assertEqual(signed_in.status_code, 200, signed_in.text)
+        self.assertEqual(signed_in.json()["user"]["role"], "employee")
 
-    def test_nothing_can_sign_in_before_approval(self) -> None:
-        self.assertEqual(self.asks_for(self.new_client()).status_code, 202)
-
-        response = self.new_client().post(
-            "/api/auth/login", json={"email": f"newcomer@{COMPANY}", "password": PASSWORD}
-        )
-
-        # No user row exists until approval, so this answers like a wrong password.
-        self.assertEqual(response.status_code, 401)
-        self.assertIsNone(self.stored_user(f"newcomer@{COMPANY}"))
-
-    def test_a_weak_password_is_refused(self) -> None:
-        response = self.asks_for(self.new_client(), password="abc")
-
-        self.assertEqual(response.status_code, 422, response.text)
-        self.assertEqual(self.count_requests(), 0)
-
-    def test_a_request_from_before_passwords_still_gets_an_invite(self) -> None:
-        """Old queue rows carry no hash and fall back to the invitation flow."""
+    def test_approving_a_request_with_no_account_still_mints_an_invitation(self) -> None:
+        # The shape that predates registration setting a password: a bare request with
+        # nothing behind it still has to be able to become an account.
         self.db.add(
             AccessRequest(
-                id="legacy-request-id",
+                id="legacy-request",
                 name="Kofi Mensah",
                 email=f"newcomer@{COMPANY}",
                 status="pending",
-                password_hash=None,
+                requested_role="employee",
             )
         )
         self.db.commit()
-        admin = self.signed_in_admin()
 
-        response = self.approve(admin, "legacy-request-id")
+        admin = self.signed_in_admin()
+        response = self.approve(admin, "legacy-request")
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("/accept-invite?token=", response.json()["invite_link"])
 
         invited = self.new_client().get(f"/api/auth/invite/{response.json()['token']}")
+
         self.assertEqual(invited.status_code, 200, invited.text)
+        self.assertEqual(invited.json()["name"], "Kofi Mensah")
 
     def test_the_invite_link_only_reaches_the_administrator(self) -> None:
         """The person who asked never sees the token.
@@ -1161,9 +1246,12 @@ class AccessRequestTest(AuthTestCase):
 
         row = admin.get("/api/auth/requests").json()["requests"][0]
 
-        # A queue is names and addresses and nothing else. No role, no password field,
-        # no id that could be used against another route.
-        self.assertEqual(set(row), {"id", "name", "email", "status", "requested_at", "decided_at"})
+        # A queue is names, addresses and what they asked for. No password field, no
+        # session, nothing else that could be used against another route.
+        self.assertEqual(
+            set(row),
+            {"id", "name", "email", "status", "requested_role", "requested_at", "decided_at"},
+        )
 
     def test_deciding_twice_is_refused_rather_than_silently_ignored(self) -> None:
         self.asks_for(self.new_client())
@@ -1222,7 +1310,7 @@ class AccessRequestTest(AuthTestCase):
     def test_a_request_without_a_csrf_header_is_refused(self) -> None:
         response = self.new_client().post(
             "/api/auth/request-access",
-            json={"name": "Kofi Mensah", "email": f"newcomer@{COMPANY}", "password": PASSWORD},
+            json={"name": "Kofi Mensah", "email": f"newcomer@{COMPANY}"},
         )
 
         # Not exempt, unlike signing in. There is nothing here that needs an
@@ -1232,12 +1320,12 @@ class AccessRequestTest(AuthTestCase):
         self.assertEqual(response.status_code, 403, response.text)
         self.assertEqual(self.count_requests(), 0)
 
-    def test_it_is_still_not_registration(self) -> None:
+    def test_it_is_still_not_open_registration(self) -> None:
         """The route that would be the hole does not exist.
 
-        `request-access` is not registration, and the difference is checkable: no user
-        row is written, and the only route that writes one from an invitation still
-        needs an administrator.
+        There is no public route that hands out a working session, and the row a
+        registration leaves behind is switched off — so it is a place to record a
+        password, not an account. Both halves are checkable rather than asserted.
         """
         paths = set(main.app.openapi()["paths"])
 
@@ -1245,7 +1333,274 @@ class AccessRequestTest(AuthTestCase):
         self.assertNotIn("/api/auth/register", paths)
 
         self.asks_for(self.new_client())
-        self.assertIsNone(self.stored_user(f"newcomer@{COMPANY}"))
+
+        stored = self.stored_user(f"newcomer@{COMPANY}")
+        self.assertIsNotNone(stored)
+        self.assertFalse(stored.is_active)
+
+        # And the row grants nothing: the one route that would let it in answers with
+        # "still pending", not a session.
+        client = self.new_client()
+        client.post("/api/auth/csrf")
+        response = client.post(
+            "/api/auth/login",
+            json={"email": f"newcomer@{COMPANY}", "password": "their-own-pass1"},
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertIsNone(client.cookies.get(ACCESS_COOKIE))
+
+
+class UserAdministrationTest(AuthTestCase):
+    """An administrator managing the accounts that exist.
+
+    Three things are being protected here rather than merely provided. An employee
+    must not reach any of it. An administrator must not be able to lock the system by
+    acting on their own account. And a correction must not be able to produce two
+    accounts on one address, which would make sign-in ambiguous and let the second
+    person in be the first.
+    """
+
+    def as_admin(self) -> TestClient:
+        return self.signed_in_admin()
+
+    def make_user(self, email: str, role: str = "employee", name: str = "Someone"):
+        """An active account, written straight to the database."""
+        user = User(
+            id=f"u-{email}",
+            email=email,
+            name=name,
+            role=role,
+            password_hash=hash_password("their-pass1"),
+            is_active=True,
+        )
+        self.db.add(user)
+        self.db.commit()
+        return user
+
+    def test_the_list_is_paginated_ten_at_a_time(self) -> None:
+        admin = self.as_admin()
+        for index in range(24):
+            self.make_user(f"person{index}@{COMPANY}")
+
+        first = admin.get("/api/auth/users", headers=self.csrf_headers(admin))
+        self.assertEqual(first.status_code, 200, first.text)
+
+        body = first.json()
+        self.assertEqual(len(body["users"]), 10)
+        self.assertEqual(body["total"], 25)
+        self.assertEqual(body["per_page"], 10)
+        self.assertEqual(body["pages"], 3)
+
+        # And the last page is short rather than empty, so the pager can tell it is
+        # the last one.
+        last = admin.get("/api/auth/users?page=3", headers=self.csrf_headers(admin))
+        self.assertEqual(len(last.json()["users"]), 5)
+
+    def test_the_list_carries_names_emails_and_roles_only(self) -> None:
+        admin = self.as_admin()
+        self.make_user(f"kwame@{COMPANY}", role="admin", name="Kwame Osei")
+
+        row = admin.get("/api/auth/users", headers=self.csrf_headers(admin)).json()["users"][0]
+
+        # A people list is not the place to carry anything not about the person.
+        self.assertEqual(set(row), {"id", "name", "email", "role", "is_active", "created_at"})
+        self.assertEqual(row["email"], f"kwame@{COMPANY}")
+
+    def test_an_employee_cannot_reach_any_of_it(self) -> None:
+        employee = self.new_client()
+        self.invite_and_accept(employee, f"ama@{COMPANY}")
+        target = self.make_user(f"kwame@{COMPANY}")
+
+        for method, path, payload in [
+            ("GET", "/api/auth/users", None),
+            ("PATCH", f"/api/auth/users/{target.id}", {"role": "admin"}),
+            ("DELETE", f"/api/auth/users/{target.id}", None),
+            ("POST", f"/api/auth/users/{target.id}/password", {"password": "new-one-1"}),
+        ]:
+            with self.subTest(path=path):
+                response = employee.request(
+                    method, path, json=payload, headers=self.csrf_headers(employee)
+                )
+                self.assertEqual(response.status_code, 403, response.text)
+
+        # And nothing it asked for took effect.
+        self.assertEqual(self.db.get(User, target.id).role, "employee")
+
+    def test_an_administrator_can_change_a_role(self) -> None:
+        admin = self.as_admin()
+        target = self.make_user(f"kwame@{COMPANY}")
+
+        response = admin.patch(
+            f"/api/auth/users/{target.id}", json={"role": "admin"},
+            headers=self.csrf_headers(admin),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["role"], "admin")
+        self.assertEqual(self.db.get(User, target.id).role, "admin")
+
+    def test_changing_a_role_does_not_require_resending_the_rest(self) -> None:
+        admin = self.as_admin()
+        target = self.make_user(f"kwame@{COMPANY}", name="Kwame Osei")
+
+        admin.patch(
+            f"/api/auth/users/{target.id}", json={"role": "admin"},
+            headers=self.csrf_headers(admin),
+        )
+
+        # A field that was not sent is left alone, rather than blanked.
+        row = self.db.get(User, target.id)
+        self.assertEqual(row.name, "Kwame Osei")
+        self.assertEqual(row.email, f"kwame@{COMPANY}")
+
+    def test_an_administrator_can_change_an_address(self) -> None:
+        admin = self.as_admin()
+        target = self.make_user(f"old@{COMPANY}")
+
+        response = admin.patch(
+            f"/api/auth/users/{target.id}", json={"email": f"new@{COMPANY}"},
+            headers=self.csrf_headers(admin),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.db.get(User, target.id).email, f"new@{COMPANY}")
+
+    def test_an_address_outside_the_company_is_refused(self) -> None:
+        admin = self.as_admin()
+        target = self.make_user(f"kwame@{COMPANY}")
+
+        response = admin.patch(
+            f"/api/auth/users/{target.id}", json={"email": "someone@gmail.com"},
+            headers=self.csrf_headers(admin),
+        )
+
+        # The value of the list is that the addresses in it are real and belong here.
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_two_accounts_cannot_end_up_on_one_address(self) -> None:
+        admin = self.as_admin()
+        first = self.make_user(f"first@{COMPANY}")
+        second = self.make_user(f"second@{COMPANY}")
+
+        response = admin.patch(
+            f"/api/auth/users/{second.id}", json={"email": f"first@{COMPANY}"},
+            headers=self.csrf_headers(admin),
+        )
+
+        # Otherwise the second person to sign in at that address is let into the
+        # first person's account.
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_an_administrator_can_delete_an_account(self) -> None:
+        admin = self.as_admin()
+        target = self.make_user(f"kwame@{COMPANY}")
+
+        response = admin.delete(
+            f"/api/auth/users/{target.id}", headers=self.csrf_headers(admin)
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(self.db.get(User, target.id))
+
+    def test_deleting_an_account_takes_its_sessions_with_it(self) -> None:
+        admin = self.as_admin()
+        target = self.make_user(f"kwame@{COMPANY}")
+        self.db.add(
+            RefreshSession(
+                id="r1",
+                user_id=target.id,
+                family_id="f1",
+                expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+            )
+        )
+        self.db.commit()
+
+        admin.delete(f"/api/auth/users/{target.id}", headers=self.csrf_headers(admin))
+
+        # Deleting somebody must not leave them signed in on a phone that already had
+        # the cookies, and a session row for an account that no longer exists answers
+        # no question.
+        self.assertIsNone(self.db.get(RefreshSession, "r1"))
+
+    def test_an_administrator_cannot_delete_or_demote_themselves(self) -> None:
+        admin = self.as_admin()
+        me = self.db.query(User).filter(User.role == "admin").one()
+
+        for method, path, payload in [
+            ("DELETE", f"/api/auth/users/{me.id}", None),
+            ("PATCH", f"/api/auth/users/{me.id}", {"role": "employee"}),
+            ("PATCH", f"/api/auth/users/{me.id}", {"is_active": False}),
+        ]:
+            with self.subTest(path=f"{method} {path}"):
+                response = admin.request(
+                    method, path, json=payload, headers=self.csrf_headers(admin)
+                )
+                # Survivable on somebody else's account and fatal on your own, and the
+                # only way back is the bootstrap route — which is closed once any
+                # administrator exists.
+                self.assertEqual(response.status_code, 409, response.text)
+
+        self.assertEqual(self.db.get(User, me.id).role, "admin")
+        self.assertTrue(self.db.get(User, me.id).is_active)
+
+    def test_a_password_reset_switches_the_account_on_and_ends_its_sessions(self) -> None:
+        admin = self.as_admin()
+        target = self.make_user(f"kwame@{COMPANY}")
+        self.db.add(
+            RefreshSession(
+                id="r2",
+                user_id=target.id,
+                family_id="f2",
+                expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+            )
+        )
+        self.db.commit()
+
+        response = admin.post(
+            f"/api/auth/users/{target.id}/password", json={"password": "brand-new-1"},
+            headers=self.csrf_headers(admin),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        # A reset that leaves the old sessions running resets nothing: whoever
+        # prompted it is still signed in.
+        self.assertIsNotNone(self.db.get(RefreshSession, "r2").revoked_at)
+
+        client = self.new_client()
+        client.post("/api/auth/csrf")
+        signed_in = client.post(
+            "/api/auth/login",
+            json={"email": f"kwame@{COMPANY}", "password": "brand-new-1"},
+        )
+        self.assertEqual(signed_in.status_code, 200, signed_in.text)
+
+    def test_a_reset_still_obeys_the_password_policy(self) -> None:
+        admin = self.as_admin()
+        target = self.make_user(f"kwame@{COMPANY}")
+
+        response = admin.post(
+            f"/api/auth/users/{target.id}/password", json={"password": "short"},
+            headers=self.csrf_headers(admin),
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_an_account_that_does_not_exist_is_a_404(self) -> None:
+        admin = self.as_admin()
+
+        self.assertEqual(
+            admin.get("/api/auth/users", headers=self.csrf_headers(admin)).status_code, 200
+        )
+        self.assertEqual(
+            admin.patch("/api/auth/users/nope", json={"role": "admin"},
+                        headers=self.csrf_headers(admin)).status_code,
+            404,
+        )
+        self.assertEqual(
+            admin.delete("/api/auth/users/nope", headers=self.csrf_headers(admin)).status_code,
+            404,
+        )
 
 
 class ConversationProtectionTest(AuthTestCase):

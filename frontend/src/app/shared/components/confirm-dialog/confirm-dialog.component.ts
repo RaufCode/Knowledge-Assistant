@@ -18,10 +18,11 @@ export type ConfirmTone = 'primary' | 'danger';
 
 /**
  * The application's confirmation modal, used before an action that cannot be
- * undone, such as signing out or deleting a document.
+ * undone, such as signing out or deleting a document or a conversation.
  *
  * It is a native `<dialog>` so the browser supplies the focus trap and the
- * Escape key; the component only mirrors the open state in both directions.
+ * Escape key; the component only mirrors the open state in both directions and adds
+ * the one dismissal the native element does not give: a click on the backdrop.
  */
 @Component({
   selector: 'app-confirm-dialog',
@@ -35,6 +36,7 @@ export type ConfirmTone = 'primary' | 'danger';
       aria-labelledby="confirm-dialog-title"
       (cancel)="onCancel($event)"
       (close)="onClose()"
+      (click)="onBackdrop($event)"
     >
       <div class="flex flex-col gap-5 p-6">
         <div class="flex items-start gap-3">
@@ -132,6 +134,27 @@ export class ConfirmDialogComponent {
   protected cancel(): void {
     this.isOpen.set(false);
     this.cancelled.emit();
+  }
+
+  /**
+   * Closes on a click anywhere outside the dialog.
+   *
+   * The browser gives Escape and nothing else, so dismissing this needed either the
+   * mouse to find Cancel or Escape to be guessed. A native modal's backdrop is not a
+   * separate element to listen on: a click on it lands on the `<dialog>` itself,
+   * while a click on the content lands on a child. Comparing the target against the
+   * dialog is therefore what distinguishes "outside" from "inside", and it means a
+   * click on the heading, the message or the padding around the buttons is not
+   * mistaken for one.
+   *
+   * Dismissing rather than confirming: a click outside a confirmation is a change of
+   * mind, and confirming because somebody clicked the wrong thing is how a
+   * destructive action happens by accident.
+   */
+  protected onBackdrop(event: MouseEvent): void {
+    if (event.target === this.dialog()?.nativeElement) {
+      this.cancel();
+    }
   }
 
   /** Intercepts Escape so the model stays in step with the dialog. */

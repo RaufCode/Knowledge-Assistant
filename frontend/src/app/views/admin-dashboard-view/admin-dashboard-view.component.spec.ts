@@ -22,6 +22,7 @@ describe('AdminDashboardViewComponent', () => {
     name: 'Ama Konadu',
     email: 'ama@acmetech.example',
     status: 'pending',
+    requested_role: null,
     requested_at: '2026-10-01T09:00:00',
     decided_at: null,
     ...over,
@@ -47,7 +48,7 @@ describe('AdminDashboardViewComponent', () => {
     }
 
     http
-      .expectOne((request) => request.url.startsWith(`${API_BASE_URL}/api/conversations?`))
+      .expectOne((request) => request.url.startsWith(`${API_BASE_URL}/api/conversations`))
       .flush({ conversations: options?.conversations ?? [] });
   };
 

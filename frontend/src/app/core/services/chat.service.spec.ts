@@ -59,7 +59,7 @@ describe('ChatService', () => {
   let closeStream: () => void = () => undefined;
 
   /** The URL the list is fetched from, which names the client. */
-  const listUrl = (): string => `${API_BASE_URL}/api/conversations?client_id=${clientId}`;
+  const listUrl = (): string => `${API_BASE_URL}/api/conversations`;
 
   /** The list a restored browser has, reused where a refresh is served. */
   const RESTORED_LIST: ConversationListPayload = {
@@ -135,7 +135,7 @@ describe('ChatService', () => {
   const givenRestoredConversations = (): void => {
     http.expectOne(listUrl()).flush(RESTORED_LIST);
 
-    http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${clientId}`).flush({
+    http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
       id: 'conv-1',
       title: 'Annual leave',
       messages: [
@@ -183,11 +183,15 @@ describe('ChatService', () => {
     answer: string,
     answered = true,
     sources: unknown[] = [],
+    status = answered ? 'answered' : 'not-found',
+    confidence: number | null = null,
   ): Promise<void> => {
     pushEvent({
       type: 'done',
       answer,
       answered,
+      status,
+      confidence,
       sources: sources as never,
     });
     closeStream();
@@ -432,14 +436,21 @@ describe('ChatService', () => {
       http.expectOne(listUrl()).flush({
         conversations: [{ id: 'conv-1', title: null, updated_at: '2026-09-30T09:00:00' }],
       });
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${clientId}`).flush({
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
         id: 'conv-1',
         title: null,
         messages: [],
       });
 
       chat.ask('How much annual leave do I have?');
-      pushEvent({ type: 'done', answer: 'Twenty days.', answered: true, sources: [] });
+      pushEvent({
+        type: 'done',
+        answer: 'Twenty days.',
+        answered: true,
+        status: 'answered',
+        confidence: null,
+        sources: [],
+      });
       pushEvent({ type: 'title', title: 'Annual leave allowance' });
       closeStream();
       await settle();
@@ -553,7 +564,7 @@ describe('ChatService', () => {
       http.expectOne(listUrl()).flush({
         conversations: [{ id: 'conv-1', title: 'Leave', updated_at: '2026-09-30T09:00:00' }],
       });
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${clientId}`).flush({
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
         id: 'conv-1',
         title: 'Leave',
         messages: [
@@ -595,6 +606,59 @@ describe('ChatService', () => {
       expect(streamRequests.map((request) => request.body.content)).toEqual(['Second?']);
     });
   });
+
+  describe('confidence', () => {
+    it('carries the figure from the closing event onto the answer', async () => {
+      givenRestoredConversations();
+
+      chat.ask('How much annual leave do I get?');
+      await streamAnswer('1.75 days per month.', true, [], 'answered', 5);
+      flushSummaryRefresh();
+
+      // The field exists so a reader can see how well the question matched the
+      // documents. If it is dropped anywhere between the stream and the card it is
+      // null in the answer and nothing says why.
+      expect(messages().at(-1)?.confidence).toBe(5);
+    });
+
+    it('leaves it null for a reply that was not built from passages', async () => {
+      givenRestoredConversations();
+
+      chat.ask('hello');
+      await streamAnswer("Hello! I'm the assistant.", true, [], 'greeting', null);
+      flushSummaryRefresh();
+
+      // Not zero. A greeting cites nothing, so there is nothing to have been
+      // confident about and a low number would read as a poor answer.
+      expect(messages().at(-1)?.confidence).toBeNull();
+    });
+
+    it('reads it back off a reloaded thread, so both paths agree', async () => {
+      givenRestoredConversations();
+
+      chat.openConversation('conv-1');
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+        id: 'conv-1',
+        title: 'Leave',
+        messages: [
+          {
+            id: 'm2',
+            role: 'assistant',
+            content: 'Twenty days.',
+            sources: [{ document: 'Leave Policy', section: 'S', snippet: 'x', score: 0.5 }],
+            status: 'answered',
+            confidence: 5,
+            created_at: '2026-09-30T09:00:01',
+          },
+        ],
+      });
+
+      // A conversation reopened tomorrow must show the same figure as the one
+      // watched being answered, or the number is only ever true once.
+      expect(messages().at(-1)?.confidence).toBe(5);
+    });
+  });
+
 
   describe('starting and opening conversations', () => {
     it('creates nothing when a new conversation is started, only empties the thread', () => {
@@ -650,7 +714,7 @@ describe('ChatService', () => {
 
       conversations.openConversation('conv-2');
       http
-        .expectOne(`${API_BASE_URL}/api/conversations/conv-2?client_id=${clientId}`)
+        .expectOne(`${API_BASE_URL}/api/conversations/conv-2`)
         .flush({
           id: 'conv-2',
           title: 'VPN setup',
@@ -687,7 +751,7 @@ describe('ChatService', () => {
       chat.openConversation('conv-2');
 
       const request = http.expectOne(
-        `${API_BASE_URL}/api/conversations/conv-2?client_id=${clientId}`,
+        `${API_BASE_URL}/api/conversations/conv-2`,
       );
 
       expect(request.request.method).toBe('GET');
@@ -723,7 +787,7 @@ describe('ChatService', () => {
       // conversation and would read as the refresh having lost the thread.
       chat.openConversation('conv-2');
 
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-2?client_id=${clientId}`).flush({
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-2`).flush({
         id: 'conv-2',
         title: 'Expenses',
         messages: [
@@ -748,7 +812,7 @@ describe('ChatService', () => {
 
       chat.openConversation('gone');
       http
-        .expectOne(`${API_BASE_URL}/api/conversations/gone?client_id=${clientId}`)
+        .expectOne(`${API_BASE_URL}/api/conversations/gone`)
         .flush({ detail: 'Not Found' }, { status: 404, statusText: 'Not Found' });
 
       // It leaves the list, which is the list's own recovery, and the open
@@ -762,12 +826,12 @@ describe('ChatService', () => {
       givenRestoredConversations();
 
       chat.openConversation('conv-2');
-      const slow = http.expectOne(`${API_BASE_URL}/api/conversations/conv-2?client_id=${clientId}`);
+      const slow = http.expectOne(`${API_BASE_URL}/api/conversations/conv-2`);
 
       // Switched again before the thread arrived, so this one now belongs to a
       // conversation the user has already left.
       chat.openConversation('conv-1');
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${clientId}`).flush({
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
         id: 'conv-1',
         title: 'Annual leave',
         messages: [

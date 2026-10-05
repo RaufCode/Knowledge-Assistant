@@ -3,14 +3,19 @@ import { HttpClient } from '@angular/common/http';
 import { Injectable, PLATFORM_ID, computed, inject, signal } from '@angular/core';
 import { Observable, catchError, firstValueFrom, map, of, tap } from 'rxjs';
 
-import { API_BASE_URL } from '../api.config';
+import { ConfigService } from '../config.service';
 import {
   AccessRequestDecisionDto,
-  CreateAccountRequestDto,
   AccessRequestDecisionRequestDto,
   AccessRequestDto,
   AccessRequestListDto,
   AccessRequestSubmittedDto,
+  CreateAccountRequestDto,
+  PasswordResetRequestDto,
+  PendingApprovalDto,
+  UserListDto,
+  UserSummaryDto,
+  UserUpdateRequestDto,
 } from '../models/access-request.model';
 import {
   AcceptInviteRequestDto,
@@ -68,9 +73,14 @@ export type AuthStatus = 'unknown' | 'authenticated' | 'anonymous';
 export class AuthService {
   private readonly http = inject(HttpClient);
   private readonly isBrowser = isPlatformBrowser(inject(PLATFORM_ID));
+  private readonly config = inject(ConfigService);
 
   private readonly userState = signal<UserDto | null>(null);
   private readonly statusState = signal<AuthStatus>('unknown');
+
+  private get baseUrl(): string {
+    return this.config.getApiBaseUrl();
+  }
 
   /** The signed-in person, or null. */
   readonly user = this.userState.asReadonly();
@@ -96,6 +106,18 @@ export class AuthService {
    * to be dropped into a chat screen instead.
    */
   readonly landingPath = computed(() => (this.isAdmin() ? '/admin' : '/'));
+
+  /**
+   * Where to reach the assistant deliberately.
+   *
+   * A separate path from `landingPath`, and only because the front door now turns
+   * administrators away: `/` is where an administrator is redirected *from*, so a
+   * link to the assistant cannot point there or it would bounce straight back. An
+   * employee has no such redirect, but they are given this path too rather than a
+   * bare `/` so that one link works for both roles and there is a single place that
+   * knows which route reaches the assistant.
+   */
+  readonly assistantPath = computed(() => (this.isAdmin() ? '/ask' : '/'));
 
   /**
    * The one `GET /api/auth/me` per app load, however many callers ask for it.
@@ -190,14 +212,18 @@ export class AuthService {
     }
 
     this.bootstrapPromise = firstValueFrom(
-      this.http.get<UserDto>(`${API_BASE_URL}/api/auth/me`, this.credentials()).pipe(
+      this.http.get<UserDto>(`${this.baseUrl}/api/auth/me`, this.credentials()).pipe(
         tap((user) => this.setUser(user)),
-        // A 401 here means the cookie was absent or has expired, which is a
-        // signed-out browser rather than a broken one.
-        catchError(() => {
-          this.setUser(null);
-          return of(null);
-        }),
+        // A 401 here means the access cookie has expired, not necessarily that the
+        // session is over: the access token is deliberately short-lived and the
+        // refresh cookie outlives it. So one refresh is tried before concluding
+        // anything.
+        //
+        // Without this the browser sat in a loop it could not leave. The hint cookie
+        // said "worth asking", `/me` said 401, and the hint survived — so every
+        // reload asked again and got the same answer, for as long as the hint cookie
+        // lived. Clearing it is what stops the asking.
+        catchError(() => this.recoverFromExpiredAccess()),
       ),
     ).then((user) => {
       // The CSRF token is fetched whether or not anybody is signed in: the sign-in
@@ -212,27 +238,140 @@ export class AuthService {
     return this.bootstrapPromise;
   }
 
-  /** `POST /api/auth/login`. */
-  login(email: string, password: string): Observable<UserDto> {
+  /**
+   * Trades an expired access cookie for a new one, and gives up cleanly if it cannot.
+   *
+   * Returns the user on success and null when the session really is over, in which
+   * case the hint cookie is cleared so the next load does not ask again.
+   */
+  private async recoverFromExpiredAccess(): Promise<UserDto | null> {
+    const user = await this.refresh();
+
+    if (user === null) {
+      this.forgetSessionHint();
+    }
+
+    return user;
+  }
+
+  /**
+   * Removes the readable hint, so a signed-out browser stops looking signed in.
+   *
+   * The hint is only ever a hint — it decides whether asking is worth it and is never
+   * sent as proof of anything — so deleting it here cannot sign anybody out. It only
+   * stops the app asking a question whose answer it already has.
+   *
+   * The attributes have to match the ones the server set it with, or the browser
+   * treats it as a different cookie and leaves the original in place.
+   */
+  private forgetSessionHint(): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    document.cookie = `${SESSION_HINT_COOKIE}=; path=/; max-age=0; samesite=lax`;
+  }
+
+  /**
+   * `POST /api/auth/login`.
+   *
+   * Emits `null` for an account that exists but is not switched on, which is a real
+   * answer and not a failure: the password was right, the account is simply waiting on
+   * an administrator. The caller shows the pending screen from it.
+   *
+   * Nothing is stored on that answer. No session cookie came with it and no user is
+   * set, so a pending account cannot be mistaken for a signed-in one anywhere else in
+   * the app.
+   */
+  login(email: string, password: string): Observable<UserDto | null> {
     const body: LoginRequestDto = { email: email.trim(), password };
 
     return this.http
-      .post<UserResponseDto>(`${API_BASE_URL}/api/auth/login`, body, this.credentials())
+      .post<UserResponseDto | PendingApprovalDto>(
+        `${this.baseUrl}/api/auth/login`,
+        body,
+        this.credentials(),
+      )
       .pipe(
-        map((response) => response.user),
+        map((response) => {
+          if ('user' in response) {
+            return response.user;
+          }
+
+          this.pendingState.set(response);
+
+          if (this.isBrowser) {
+            document.cookie = `ika_pending=${btoa(
+              JSON.stringify(response),
+            )}; path=/; samesite=lax; max-age=86400`;
+          }
+
+          return null;
+        }),
         tap((user) => {
-          this.setUser(user);
-          // Sign-in rotates the CSRF cookie server-side, so the one held here is no
-          // longer the one the server expects.
-          this.loadCsrfToken();
+          if (user) {
+            this.pendingState.set(null);
+            if (this.isBrowser) {
+              document.cookie = `ika_pending=; path=/; max-age=0; samesite=lax`;
+            }
+            this.setUser(user);
+            // Sign-in rotates the CSRF cookie server-side, so the one held here is no
+            // longer the one the server expects.
+            this.loadCsrfToken();
+          }
         }),
       );
   }
 
+  private readonly pendingFromCookie = (): PendingApprovalDto | null => {
+    if (!this.isBrowser) {
+      return null;
+    }
+
+    const match = document.cookie.match(
+      /(^|;\s*)ika_pending=([^;]*)/,
+    );
+
+    if (!match) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(atob(match[2]));
+    } catch {
+      return null;
+    }
+  };
+
+  private readonly pendingState = signal<PendingApprovalDto | null>(
+    this.isBrowser ? this.pendingFromCookie() : null,
+  );
+
+  /** Re-reads the pending cookie and updates the signal if the cookie exists. */
+  refreshPendingFromCookie(): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    const data = this.pendingFromCookie();
+    if (data) {
+      this.pendingState.set(data);
+    }
+  }
+
+  /**
+   * What the last sign-in said about a request still waiting.
+   *
+   * Held on the service rather than in the navigation, so a refresh on the pending
+   * screen reads the same answer instead of arriving blank. Nothing about it is ever
+   * put in the URL: none of it belongs in an address bar.
+   */
+  readonly lastPending = this.pendingState.asReadonly();
+
   /** `GET /api/auth/invite/{token}`. Used to pre-fill the accept screen. */
   previewInvite(token: string): Observable<InvitePreviewDto> {
     return this.http.get<InvitePreviewDto>(
-      `${API_BASE_URL}/api/auth/invite/${encodeURIComponent(token)}`,
+      `${this.baseUrl}/api/auth/invite/${encodeURIComponent(token)}`,
       this.credentials(),
     );
   }
@@ -242,7 +381,7 @@ export class AuthService {
     const body: AcceptInviteRequestDto = { token, password };
 
     return this.http
-      .post<UserResponseDto>(`${API_BASE_URL}/api/auth/accept-invite`, body, this.credentials())
+      .post<UserResponseDto>(`${this.baseUrl}/api/auth/accept-invite`, body, this.credentials())
       .pipe(
         map((response) => response.user),
         tap((user) => {
@@ -253,24 +392,34 @@ export class AuthService {
   }
 
   /**
-   * `POST /api/auth/request-access`. Registers with a password, pending approval.
+  /**
+   * `POST /api/auth/request-access`. Asks an administrator for an account.
    *
    * Creates a request and nothing else: no account exists until somebody approves
-   * one, so nothing here can sign in yet. Approval moves the password onto the
-   * new account and activates it. That is what makes this safe to leave open,
-   * where a plain registration form would let anyone who could type a colleague's
-   * address claim it.
+   * one. That is what makes this safe to leave open, where a plain registration form
+   * would let anyone who could type a colleague's address claim it.
    *
    * A CSRF header is attached to it by the interceptor, unlike signing in. There is
    * nothing here that needs an exemption — the token comes from a public endpoint and
    * the frontend has one before this screen is reachable — so requiring it costs
    * nothing and closes a way to fill an administrator's queue from another site.
    */
-  requestAccess(name: string, email: string, password: string): Observable<AccessRequestSubmittedDto> {
-    const body: AccessRequestDto = { name: name.trim(), email: email.trim(), password };
+  /**
+   * `POST /api/auth/request-access`. Registers, and asks for access in one step.
+   *
+   * The role is what the person is asking for and nothing more; the role they are
+   * given is decided by whoever approves the request.
+   */
+  requestAccess(
+    name: string,
+    email: string,
+    role: Role,
+    password: string,
+  ): Observable<AccessRequestSubmittedDto> {
+    const body: AccessRequestDto = { name: name.trim(), email: email.trim(), role, password };
 
     return this.http.post<AccessRequestSubmittedDto>(
-      `${API_BASE_URL}/api/auth/request-access`,
+      `${this.baseUrl}/api/auth/request-access`,
       body,
       this.credentials(),
     );
@@ -287,7 +436,7 @@ export class AuthService {
     const body: InviteRequestDto = { name: name.trim(), email: email.trim(), role };
 
     return this.http.post<InviteResponseDto>(
-      `${API_BASE_URL}/api/auth/invite`,
+      `${this.baseUrl}/api/auth/invite`,
       body,
       this.credentials(),
     );
@@ -307,14 +456,65 @@ export class AuthService {
     const body: CreateAccountRequestDto = { name: name.trim(), email: email.trim(), role, password };
 
     return this.http
-      .post<UserResponseDto>(`${API_BASE_URL}/api/auth/accounts`, body, this.credentials())
+      .post<UserResponseDto>(`${this.baseUrl}/api/auth/accounts`, body, this.credentials())
       .pipe(map((response) => response.user));
+  }
+
+  /**
+   * `GET /api/auth/users`. Administrators only.
+   *
+   * A page at a time, with the page count alongside, so the pager cannot disagree
+   * with the server about how many accounts there are.
+   */
+  listUsers(page: number): Observable<UserListDto> {
+    return this.http.get<UserListDto>(
+      `${this.baseUrl}/api/auth/users?page=${page}`,
+      this.credentials(),
+    );
+  }
+
+  /** `PATCH /api/auth/users/{id}`. Corrects an account. Administrators only. */
+  updateUser(
+    userId: string,
+    changes: UserUpdateRequestDto,
+  ): Observable<UserSummaryDto> {
+    return this.http.patch<UserSummaryDto>(
+      `${this.baseUrl}/api/auth/users/${encodeURIComponent(userId)}`,
+      changes,
+      this.credentials(),
+    );
+  }
+
+  /** `DELETE /api/auth/users/{id}`. Administrators only. */
+  deleteUser(userId: string): Observable<void> {
+    return this.http
+      .delete<void>(
+        `${this.baseUrl}/api/auth/users/${encodeURIComponent(userId)}`,
+        this.credentials(),
+      )
+      .pipe(map(() => undefined));
+  }
+
+  /**
+   * `POST /api/auth/users/{id}/password`. Administrators only.
+   *
+   * Returns nothing: the password is not echoed back, so the only copy is the one the
+   * administrator typed.
+   */
+  resetPassword(userId: string, password: string): Observable<void> {
+    return this.http
+      .post<void>(
+        `${this.baseUrl}/api/auth/users/${encodeURIComponent(userId)}/password`,
+        { password } satisfies PasswordResetRequestDto,
+        this.credentials(),
+      )
+      .pipe(map(() => undefined));
   }
 
   /** `GET /api/auth/requests`. Administrators only. */
   listAccessRequests(): Observable<AccessRequestListDto> {
     return this.http.get<AccessRequestListDto>(
-      `${API_BASE_URL}/api/auth/requests`,
+      `${this.baseUrl}/api/auth/requests`,
       this.credentials(),
     );
   }
@@ -329,7 +529,7 @@ export class AuthService {
     const body: AccessRequestDecisionRequestDto = { role };
 
     return this.http.post<AccessRequestDecisionDto>(
-      `${API_BASE_URL}/api/auth/requests/${encodeURIComponent(requestId)}/approve`,
+      `${this.baseUrl}/api/auth/requests/${encodeURIComponent(requestId)}/approve`,
       body,
       this.credentials(),
     );
@@ -338,7 +538,7 @@ export class AuthService {
   /** `POST /api/auth/requests/{id}/decline`. Administrators only. */
   declineAccessRequest(requestId: string): Observable<AccessRequestDecisionDto> {
     return this.http.post<AccessRequestDecisionDto>(
-      `${API_BASE_URL}/api/auth/requests/${encodeURIComponent(requestId)}/decline`,
+      `${this.baseUrl}/api/auth/requests/${encodeURIComponent(requestId)}/decline`,
       {},
       this.credentials(),
     );
@@ -358,7 +558,7 @@ export class AuthService {
 
     this.refreshPromise = firstValueFrom(
       this.http
-        .post<UserResponseDto>(`${API_BASE_URL}/api/auth/refresh`, {}, this.credentials())
+        .post<UserResponseDto>(`${this.baseUrl}/api/auth/refresh`, {}, this.credentials())
         .pipe(
           map((response) => response.user),
           tap((user) => this.setUser(user)),
@@ -376,7 +576,7 @@ export class AuthService {
 
   /** `POST /api/auth/logout`. Ends the session server-side, then locally. */
   logout(): Observable<void> {
-    return this.http.post<void>(`${API_BASE_URL}/api/auth/logout`, {}, this.credentials()).pipe(
+    return this.http.post<void>(`${this.baseUrl}/api/auth/logout`, {}, this.credentials()).pipe(
       // The local session is ended even if the request failed. The user asked to
       // sign out, and leaving them apparently signed in because a network call
       // timed out would be the worse of the two answers.
@@ -439,12 +639,36 @@ export class AuthService {
    * Duplicating the token in memory would create a second copy of a secret that
    * exists precisely so that only the server and this cookie hold it.
    */
+  /**
+   * Fetches a new CSRF token, for a request refused with a stale one.
+   *
+   * Public because the interceptor is what discovers the refusal, and it has to be
+   * able to recover without the caller knowing anything went wrong.
+   */
+  refreshCsrfToken(): Observable<void> {
+    if (!this.isBrowser) {
+      return of(undefined);
+    }
+
+    // Awaitable, and that is the whole point. The caller has to read the new cookie
+    // *after* the browser has stored it, and reading it straight after firing the
+    // request gets the old one — so a retry sent that way carries the token that was
+    // just refused, and is refused again for the same reason.
+    return this.http
+      .get<CsrfResponseDto>(`${this.baseUrl}/api/auth/csrf`, this.credentials())
+      .pipe(
+        map(() => undefined),
+        // A refresh that fails is not worth a second exception on top of the first.
+        catchError(() => of(undefined)),
+      );
+  }
+
   private loadCsrfToken(): void {
     if (!this.isBrowser) {
       return;
     }
 
-    this.http.get<CsrfResponseDto>(`${API_BASE_URL}/api/auth/csrf`, this.credentials()).subscribe({
+    this.http.get<CsrfResponseDto>(`${this.baseUrl}/api/auth/csrf`, this.credentials()).subscribe({
       error: () => undefined,
     });
   }

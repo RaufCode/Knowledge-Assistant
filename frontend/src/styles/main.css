@@ -110,7 +110,33 @@
 
 @utility animate-panel-rise {
   animation: panel-rise 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  transform-origin: bottom center;
+}
+
+/**
+ * The assistant's thinking bubbles.
+ *
+ * Each bubble rises a little and settles, and the three are staggered by the delay
+ * set inline on the element. `alternate` rather than a plain loop so the motion is
+ * continuous: a bubble that restarts from nothing three times a cycle reads as three
+ * separate events, and the whole point is that this is one thing happening.
+ *
+ * The travel is four pixels. Anything larger reads as bouncing rather than working,
+ * and the indicator sits in a thread that is otherwise still.
+ */
+@keyframes thinking-bubble {
+  from {
+    opacity: 0.35;
+    transform: translateY(4px) scale(0.8);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@utility thinking-bubble {
+  animation: thinking-bubble 900ms cubic-bezier(0.4, 0, 0.2, 1) infinite alternate;
 }
 
 @layer base {

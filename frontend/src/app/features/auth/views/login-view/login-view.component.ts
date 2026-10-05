@@ -8,6 +8,7 @@ import { IconComponent } from '../../../../shared/components/icon/icon.component
 import { COMPANY_EMAIL_DOMAIN, isCompanyEmail } from '../../../../core/models/auth.model';
 import { AuthService } from '../../../../core/services/auth.service';
 import { AuthLayoutComponent } from '../../components/auth-layout/auth-layout.component';
+import { GENERIC_REFUSAL, readRefusalOr } from '../../utils/read-backend-refusal';
 
 /**
  * Key the remembered work email is kept under.
@@ -47,9 +48,7 @@ const REMEMBERED_EMAIL_KEY = 'knowledge-assistant.remembered-email';
   template: `
     <app-auth-layout>
       <h1 class="text-center font-headings text-xl font-semibold text-foreground">Sign in</h1>
-      <p class="mt-1 text-center text-sm text-muted-foreground">
-        Use your {{ companyDomain }} work email to reach the knowledge base.
-      </p>
+      <p class="mt-1 text-center text-sm text-muted-foreground">Sign in to get started</p>
 
       <form class="mt-6 flex flex-col gap-4" [formGroup]="form" (ngSubmit)="onSubmit()">
         <app-form-field
@@ -109,10 +108,36 @@ const REMEMBERED_EMAIL_KEY = 'knowledge-assistant.remembered-email';
         </p>
       }
 
-      <p class="mt-6 border-t border-border pt-4 text-center text-sm text-muted-foreground">
-        Don&apos;t have an account?
-        <a routerLink="/register" class="font-medium text-primary hover:underline">Create one</a>
-      </p>
+      <!--
+        One line, under the form.
+
+        Stacked, these were three short lines in a centred column, which read as a
+        footnote rather than as part of the form. On one line they read as one
+        question with one answer, which is all they are.
+
+        The invitation link is not here. Somebody who was invited already knows they
+        were, and it reached them by a link an administrator sent; putting it beside
+        "no account yet" invited a second question for the person who had just been
+        told the answer.
+      -->
+      <!--
+        Centred by the box, not by 'text-align'.
+
+        'text-center' centres whatever is inline inside it and nothing else, so the
+        two halves lined up only for as long as they stayed inline — and the moment
+        either became a block, or the row wrapped on a narrow screen, the question and
+        the answer drifted apart to opposite edges. A centred flex row positions the
+        two together whatever they are, and wraps as one unit rather than separating.
+      -->
+      <div
+        class="mt-6 flex flex-wrap items-center justify-center gap-x-1.5 border-t
+          border-border pt-4 text-sm text-muted-foreground"
+      >
+        <span>Don't have an account?</span>
+        <a routerLink="/register" class="font-medium text-primary hover:underline">
+          Create an account
+        </a>
+      </div>
     </app-auth-layout>
   `,
 })
@@ -237,9 +262,15 @@ export class LoginViewComponent {
     this.isSubmitting.set(true);
 
     this.auth.login(this.form.controls.email.value, this.form.controls.password.value).subscribe({
-      next: () => {
+      next: (user) => {
         this.isSubmitting.set(false);
-        void this.router.navigateByUrl(this.returnUrl());
+
+        // `null` is the server's "your account exists and is waiting to be approved".
+        // A separate screen, because nothing is wrong and a 401 here would send
+        // somebody to reset a password that is fine.
+        void this.router.navigate(
+          user === null ? ['/pending-approval'] : [this.returnUrl()],
+        );
       },
       error: (error: unknown) => {
         this.isSubmitting.set(false);
@@ -309,7 +340,10 @@ function readSignInFailure(error: unknown): string {
     return 'Could not reach the server. Please check your connection and try again.';
   }
   if (status === 422) {
-    return 'That email address is not one this workspace accepts.';
+    // What the backend said, which for a sign-in means a malformed address or a
+    // password the policy refuses. Naming the email here would be wrong: the address
+    // is only one of the two fields that can be refused.
+    return readRefusalOr(error, GENERIC_REFUSAL);
   }
 
   return 'That email and password do not match an account.';

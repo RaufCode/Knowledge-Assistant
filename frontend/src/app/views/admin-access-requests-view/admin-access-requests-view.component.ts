@@ -50,11 +50,11 @@ const STATUS_LABELS: Record<AccessRequestStatus, string> = {
  * with the role set to Administrator is the only way that role comes into being
  * through this route.
  *
- * Approving activates the account with the password they chose when registering,
- * so they can sign in straight away. Requests made before the register form grew
- * password fields carry no password and still hand back an invitation link, shown
- * once per approval rather than stored, because it is a single-use secret and
- * leaving it lying around in a list would be the wrong place for it.
+ * Approving hands back an invitation link, because there is no mail service: the
+ * administrator copies it and sends it, which is the same workflow as inviting
+ * somebody directly. It is shown once per approval rather than stored, because it is
+ * a single-use secret and leaving it lying around in a list would be the wrong place
+ * for it.
  */
 @Component({
   selector: 'app-admin-access-requests-view',
@@ -70,16 +70,27 @@ const STATUS_LABELS: Record<AccessRequestStatus, string> = {
   ],
   host: { class: 'flex min-h-0 flex-1 flex-col' },
   template: `
-    <app-view-header title="Access requests" />
+    <!--
+      Back to Users, which is where the queue is reached from.
+
+      The history fallback is the right one here because this page is a queue beside
+      the accounts rather than a place of its own: somebody who typed the address or
+      followed a link has not been "anywhere" to go back to, and leaving them on a
+      list of people who cannot get in — with no way out of it — is the one outcome
+      worth avoiding.
+    -->
+    <app-view-header title="Access requests" backLabel="Back to users" backTo="/admin/users" />
 
     @if (auth.isAdmin()) {
       <div class="scrollbar-thin min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:px-8">
-        <div class="mx-auto w-full max-w-5xl">
-          <p class="text-sm text-muted-foreground">
-            People waiting to be given an account. Approving activates them with the
-            password they chose, so they can sign in straight away.
-          </p>
+        <!--
+          Full width, matching the users page beside it and the documents page.
 
+          The two pages are the same kind of screen: a queue, and the people in it.
+          They were laid out at two different widths, so moving between them moved
+          the content sideways.
+        -->
+        <div class="flex min-w-0 flex-1 flex-col">
           @if (failure()) {
             <p
               class="mt-4 flex items-start gap-2 rounded-md bg-danger/10 px-3 py-2 text-xs
@@ -163,7 +174,21 @@ const STATUS_LABELS: Record<AccessRequestStatus, string> = {
                       </span>
                     </span>
 
-                    <app-badge [tone]="tones[row.status]">{{ labels[row.status] }}</app-badge>
+                    <!--
+                      Hovering a decision says when it was decided. The badge said
+                      only "Declined", which left the one question an administrator
+                      has about a closed request — how long has this been sitting
+                      here — answerable only by opening the row.
+                    -->
+                    <app-badge
+                      [tone]="tones[row.status]"
+                      [title]="
+                        row.decided_at
+                          ? labels[row.status] + ' ' + ago(row.decided_at)
+                          : 'Waiting for a decision'
+                      "
+                      >{{ labels[row.status] }}</app-badge
+                    >
 
                     @if (row.status === 'pending') {
                       <span class="flex shrink-0 items-center gap-1.5">

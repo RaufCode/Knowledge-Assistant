@@ -54,9 +54,9 @@ describe('ApiService', () => {
     it('lists conversations for a client, naming it in the query', () => {
       let conversations: Conversation[] = [];
 
-      api.getConversations(CLIENT).subscribe((value) => (conversations = value));
+      api.getConversations().subscribe((value) => (conversations = value));
 
-      const request = http.expectOne(`${API_BASE_URL}/api/conversations?client_id=${CLIENT}`);
+      const request = http.expectOne(`${API_BASE_URL}/api/conversations`);
 
       expect(request.request.method).toBe('GET');
       request.flush({
@@ -72,9 +72,9 @@ describe('ApiService', () => {
     it('reads one conversation with its messages and names the client in the query', () => {
       let thread: ConversationThread | undefined;
 
-      api.getConversation('conv-1', CLIENT).subscribe((value) => (thread = value));
+      api.getConversation('conv-1').subscribe((value) => (thread = value));
 
-      const request = http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`);
+      const request = http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`);
 
       expect(request.request.method).toBe('GET');
       request.flush({
@@ -93,11 +93,83 @@ describe('ApiService', () => {
       ]);
     });
 
+    it('reads each stored outcome back as itself', async () => {
+      let thread: ConversationThread | undefined;
+
+      api.getConversation('conv-1').subscribe((value) => (thread = value));
+
+      // Four replies that all cite nothing. Only the recorded outcome tells a
+      // greeting from a refusal from a genuine gap, so a thread reopened tomorrow
+      // draws the same cards it did while it was being answered.
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+        id: 'conv-1',
+        title: null,
+        messages: [
+          { id: 'm1', role: 'user', content: 'Hello', sources: null, status: null, confidence: null, created_at: '2026-09-30T09:00:00' },
+          { id: 'm2', role: 'assistant', content: "Hello! I'm the assistant.", sources: null, status: 'greeting', confidence: null, created_at: '2026-09-30T09:00:01' },
+          { id: 'm3', role: 'assistant', content: 'Confidential.', sources: null, status: 'restricted', confidence: null, created_at: '2026-09-30T09:00:02' },
+          { id: 'm4', role: 'assistant', content: "I couldn't find that.", sources: null, status: 'not-found', confidence: null, created_at: '2026-09-30T09:00:03' },
+        ],
+      });
+
+      expect(thread?.messages.map((message) => message.status)).toEqual([
+        'answered',
+        'greeting',
+        'restricted',
+        'not-found',
+      ]);
+    });
+
+    it('reads the confidence the backend derived from the citations', async () => {
+      let thread: ConversationThread | undefined;
+
+      api.getConversation('conv-1').subscribe((value) => (thread = value));
+
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+        id: 'conv-1',
+        title: null,
+        messages: [
+          {
+            id: 'm1',
+            role: 'assistant',
+            content: 'Twenty days.',
+            sources: [SOURCE],
+            status: 'answered',
+            confidence: 8,
+            created_at: '2026-09-30T09:00:00',
+          },
+        ],
+      });
+
+      expect(thread?.messages[0].confidence).toBe(8);
+    });
+
+    it('reads a row stored before outcomes were recorded as before', async () => {
+      let thread: ConversationThread | undefined;
+
+      api.getConversation('conv-1').subscribe((value) => (thread = value));
+
+      // No status on the row. The citations are all the evidence there is, so an
+      // ungrounded answer falls back to the not-found card and a grounded one to the
+      // answer card. These threads are old, and this is the best that can be said
+      // about them.
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+        id: 'conv-1',
+        title: null,
+        messages: [
+          { id: 'm1', role: 'assistant', content: 'Twenty days.', sources: [SOURCE], created_at: '2026-09-30T09:00:00' },
+          { id: 'm2', role: 'assistant', content: "I couldn't find that.", sources: null, created_at: '2026-09-30T09:00:01' },
+        ],
+      });
+
+      expect(thread?.messages.map((message) => message.status)).toEqual(['answered', 'not-found']);
+    });
+
     it('escapes both the conversation id and the client id', () => {
-      api.getConversation('a/b?c', 'client id&x').subscribe();
+      api.getConversation('a/b?c').subscribe();
 
       http
-        .expectOne(`${API_BASE_URL}/api/conversations/a%2Fb%3Fc?client_id=client%20id%26x`)
+        .expectOne(`${API_BASE_URL}/api/conversations/a%2Fb%3Fc`)
         .flush({ id: 'a/b?c', title: null, messages: [] });
     });
 
@@ -117,9 +189,9 @@ describe('ApiService', () => {
     });
 
     it('deletes with the client id in the query, since a DELETE has no body worth reading', () => {
-      api.deleteConversation('conv-1', CLIENT).subscribe();
+      api.deleteConversation('conv-1').subscribe();
 
-      const request = http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`);
+      const request = http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`);
 
       expect(request.request.method).toBe('DELETE');
       request.flush(null);
@@ -130,8 +202,8 @@ describe('ApiService', () => {
     it('keeps an unnamed conversation null rather than inventing a name for it', () => {
       let conversations: Conversation[] = [];
 
-      api.getConversations(CLIENT).subscribe((value) => (conversations = value));
-      http.expectOne(`${API_BASE_URL}/api/conversations?client_id=${CLIENT}`).flush({
+      api.getConversations().subscribe((value) => (conversations = value));
+      http.expectOne(`${API_BASE_URL}/api/conversations`).flush({
         conversations: [{ id: 'conv-1', title: null, updated_at: '2026-09-30T09:00:00' }],
       });
 
@@ -143,8 +215,8 @@ describe('ApiService', () => {
     it('reads timestamps as UTC, so ordering does not shift with the browser offset', () => {
       let conversations: Conversation[] = [];
 
-      api.getConversations(CLIENT).subscribe((value) => (conversations = value));
-      http.expectOne(`${API_BASE_URL}/api/conversations?client_id=${CLIENT}`).flush({
+      api.getConversations().subscribe((value) => (conversations = value));
+      http.expectOne(`${API_BASE_URL}/api/conversations`).flush({
         conversations: [{ id: 'conv-1', title: 'Leave', updated_at: '2026-09-30T09:00:00' }],
       });
 
@@ -157,8 +229,8 @@ describe('ApiService', () => {
     it('leaves a timestamp that already carries an offset alone', () => {
       let conversations: Conversation[] = [];
 
-      api.getConversations(CLIENT).subscribe((value) => (conversations = value));
-      http.expectOne(`${API_BASE_URL}/api/conversations?client_id=${CLIENT}`).flush({
+      api.getConversations().subscribe((value) => (conversations = value));
+      http.expectOne(`${API_BASE_URL}/api/conversations`).flush({
         conversations: [{ id: 'conv-1', title: null, updated_at: '2026-09-30T09:00:00+02:00' }],
       });
 
@@ -170,8 +242,8 @@ describe('ApiService', () => {
     it('maps a stored message as finished, since only a local one can be pending', () => {
       let thread: ConversationThread | undefined;
 
-      api.getConversation('conv-1', CLIENT).subscribe((value) => (thread = value));
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`).flush({
+      api.getConversation('conv-1').subscribe((value) => (thread = value));
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
         id: 'conv-1',
         title: null,
         messages: [
@@ -198,8 +270,8 @@ describe('ApiService', () => {
     it('derives the document count from distinct documents, not from citations', () => {
       let thread: ConversationThread | undefined;
 
-      api.getConversation('conv-1', CLIENT).subscribe((value) => (thread = value));
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`).flush({
+      api.getConversation('conv-1').subscribe((value) => (thread = value));
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
         id: 'conv-1',
         title: null,
         messages: [
@@ -221,8 +293,8 @@ describe('ApiService', () => {
     it('tolerates a message with no sources field rather than crashing on it', () => {
       let thread: ConversationThread | undefined;
 
-      api.getConversation('conv-1', CLIENT).subscribe((value) => (thread = value));
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`).flush({
+      api.getConversation('conv-1').subscribe((value) => (thread = value));
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
         id: 'conv-1',
         title: null,
         messages: [{ id: 'm1', role: 'user', content: 'Leave?', created_at: '2026-09-30T09:00:00' }],
@@ -237,11 +309,11 @@ describe('ApiService', () => {
       let error: ApiError | undefined;
 
       api
-        .getConversation('conv-1', CLIENT)
+        .getConversation('conv-1')
         .subscribe({ error: (value: ApiError) => (error = value) });
 
       http
-        .expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`)
+        .expectOne(`${API_BASE_URL}/api/conversations/conv-1`)
         .flush('Internal Server Error', { status: 500, statusText: 'Server Error' });
 
       expect(error).toBeInstanceOf(ApiError);
@@ -252,10 +324,10 @@ describe('ApiService', () => {
     it('marks a 404 as permanent, since a missing conversation cannot be retried into being there', () => {
       let error: ApiError | undefined;
 
-      api.getConversation('gone', CLIENT).subscribe({ error: (value: ApiError) => (error = value) });
+      api.getConversation('gone').subscribe({ error: (value: ApiError) => (error = value) });
 
       http
-        .expectOne(`${API_BASE_URL}/api/conversations/gone?client_id=${CLIENT}`)
+        .expectOne(`${API_BASE_URL}/api/conversations/gone`)
         .flush('Not Found', { status: 404, statusText: 'Not Found' });
 
       expect(error?.isTransient).toBe(false);
@@ -302,11 +374,11 @@ describe('ApiService', () => {
       let error: ApiError | undefined;
 
       api
-        .getConversations(CLIENT)
+        .getConversations()
         .subscribe({ error: (value: ApiError) => (error = value) });
 
       http
-        .expectOne(`${API_BASE_URL}/api/conversations?client_id=${CLIENT}`)
+        .expectOne(`${API_BASE_URL}/api/conversations`)
         .error(new ProgressEvent('error'), { status: 0 });
 
       expect(error?.status).toBe(0);

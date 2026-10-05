@@ -19,9 +19,21 @@ describe('AuthService', () => {
     http.expectOne(ME).flush({ id: 'u1', name: 'Ama Konadu', email: 'ama@acmetech.example', role });
   };
 
+  /**
+   * Answers a 401 on `/me`, and the refresh that follows it.
+   *
+   * A 401 on `/me` no longer settles the question by itself. The access cookie is
+   * deliberately short-lived and the refresh cookie outlives it, so one refresh is
+   * tried before the session is called over — and it is that refresh, refused, that
+   * finally means signed out and clears the hint cookie.
+   */
   const answerWithNobody = (): void => {
     http
       .expectOne(ME)
+      .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
+
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/refresh`)
       .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
   };
 

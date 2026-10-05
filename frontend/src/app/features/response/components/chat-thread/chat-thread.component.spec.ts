@@ -17,6 +17,7 @@ function userMessage(id: string, text: string): Message {
     status: 'answered',
     sources: [],
     documentCount: 0,
+    confidence: null,
   };
 }
 
@@ -94,6 +95,44 @@ describe('ChatThreadComponent', () => {
 
     scroller = (fixture.nativeElement as HTMLElement).querySelector('[role="log"]') as HTMLElement;
     geometry = giveScrollerGeometry(scroller);
+  });
+
+  it('offers no edit on a question that has already been answered', async () => {
+    // Editing rewrites the question and sends it again as a new turn, so on an
+    // answered question it offered to contradict the answer already on screen — and
+    // that answer stayed put underneath, so the thread read as though the new question
+    // had been asked before it.
+    messages.set([userMessage('u1', 'How much leave?'), answerMessage('a1', 'Up to 21 days.')]);
+    await render();
+
+    const element = (): HTMLElement => fixture.nativeElement as HTMLElement;
+
+    expect(element().querySelector('button[aria-label="Edit your question"]')).toBeNull();
+  });
+
+  it('still offers the edit on a question with no answer after it yet', async () => {
+    // Nothing to contradict, so the correction is still worth offering.
+    messages.set([userMessage('u1', 'How much leave?')]);
+    await render();
+
+    const element = (): HTMLElement => fixture.nativeElement as HTMLElement;
+
+    expect(element().querySelector('button[aria-label="Edit your question"]')).not.toBeNull();
+  });
+
+  it('edits the newest of several turns without touching the older ones', async () => {
+    messages.set([
+      userMessage('u1', 'First question'),
+      answerMessage('a1', 'An answer'),
+      userMessage('u2', 'Second question'),
+    ]);
+    await render();
+
+    const element = (): HTMLElement => fixture.nativeElement as HTMLElement;
+
+    // The one with nothing after it. The first has an answer under it and offers
+    // nothing at all, so exactly one edit is available across the thread.
+    expect(element().querySelectorAll('button[aria-label="Edit your question"]').length).toBe(1);
   });
 
   it('is the scrollable area, and it is the one that grows', () => {
@@ -191,5 +230,44 @@ describe('ChatThreadComponent', () => {
     // Asking a question means waiting for its answer. Following is only suspended
     // while they are reading something already written.
     expect(scroller.scrollTop).toBe(4200);
+  });
+  describe('drawing the four outcomes that cite nothing', () => {
+    /**
+     * A refusal, a greeting and a gap all arrive with no citations, so they can only
+     * be told apart by the outcome the backend recorded. These assert each draws its
+     * own card rather than falling through to the ordinary answer one.
+     */
+    const draw = async (status: Message['status'], text: string): Promise<void> => {
+      messages.set([
+        userMessage('1-user', 'A question'),
+        { ...answerMessage('1-assistant', text), status },
+      ]);
+      await render();
+    };
+
+    const element = (): HTMLElement => fixture.nativeElement as HTMLElement;
+
+    it('draws a refusal as withheld rather than as a failed search', async () => {
+      await draw('restricted', "This question involves confidential information.");
+
+      // "Not found in company documents" would claim the gap is in the documents,
+      // when the answer was withheld on purpose and rephrasing will not help.
+      expect(element().textContent).toContain('Not shared');
+      expect(element().textContent).not.toContain('Not found in company documents');
+    });
+
+    it('draws a gap in the corpus as not found', async () => {
+      await draw('not-found', "I couldn't find that in the company documents.");
+
+      expect(element().textContent).toContain('Not found in company documents');
+    });
+
+    it('draws a greeting as an ordinary answer, because that is what it is', async () => {
+      await draw('greeting', "Hello! I'm the assistant.");
+
+      expect(element().querySelector('app-answer-restricted')).toBeNull();
+      expect(element().querySelector('app-answer-not-found')).toBeNull();
+      expect(element().querySelector('.answer-prose')?.textContent).toContain("Hello!");
+    });
   });
 });

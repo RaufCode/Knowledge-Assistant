@@ -52,6 +52,15 @@ export class AuthServiceStub {
    */
   readonly landingPath = computed(() => (this.isAdmin() ? '/admin' : '/'));
 
+  /**
+   * Where the assistant is reached deliberately.
+   *
+   * Mirrors the real service's rule for the same reason `landingPath` does: the
+   * sidebar links here, and a stub answering `/` for an administrator would point
+   * the link at the front door that turns administrators away.
+   */
+  readonly assistantPath = computed(() => (this.isAdmin() ? '/ask' : '/'));
+
   /** Sign-out is a navigation in these tests, so the call itself does nothing. */
   logout(): Observable<void> {
     this.setRole('anonymous');

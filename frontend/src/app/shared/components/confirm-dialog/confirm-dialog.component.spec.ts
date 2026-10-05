@@ -67,6 +67,45 @@ describe('ConfirmDialogComponent', () => {
     expect(fixture.componentInstance.isOpen()).toBe(false);
   });
 
+  it('closes when the backdrop is clicked', async () => {
+    fixture.componentRef.setInput('isOpen', true);
+    await render();
+
+    // A native modal gives Escape and nothing else, so a click on the backdrop is the
+    // dismissal most people try first. A modal's backdrop is not its own element: the
+    // click lands on the <dialog>, which is what is matched here.
+    element().querySelector('dialog')?.click();
+    await render();
+
+    expect(fixture.componentInstance.isOpen()).toBe(false);
+    expect(cancelled).toBe(1);
+  });
+
+  it('does not close when the dialog itself is clicked', async () => {
+    fixture.componentRef.setInput('isOpen', true);
+    await render();
+
+    // The heading, the message and the padding around the buttons are all inside, and
+    // clicking any of them is not a request to dismiss.
+    (element().querySelector('#confirm-dialog-title') as HTMLElement).click();
+    await render();
+
+    expect(fixture.componentInstance.isOpen()).toBe(true);
+    expect(cancelled).toBe(0);
+  });
+
+  it('never confirms because something outside was clicked', async () => {
+    fixture.componentRef.setInput('isOpen', true);
+    await render();
+
+    // A confirmation is a decision; a stray click outside is a change of mind.
+    // Confirming here is how a destructive action happens by accident.
+    element().querySelector('dialog')?.click();
+    await render();
+
+    expect(confirmed).toBe(0);
+  });
+
   it('uses the danger colour only for a destructive confirmation', async () => {
     await render();
     const [routineCancel] = buttons();

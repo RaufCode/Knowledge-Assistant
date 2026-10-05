@@ -1,4 +1,6 @@
+import { Location } from '@angular/common';
 import { ChangeDetectionStrategy, Component, inject, input } from '@angular/core';
+import { Router } from '@angular/router';
 
 import { LayoutService } from '../../../../core/services/layout.service';
 import { ButtonComponent } from '../../../../shared/components/button/button.component';
@@ -43,6 +45,30 @@ import { IconComponent } from '../../../../shared/components/icon/icon.component
       'border-border bg-card px-4 py-4 sm:px-6 lg:justify-center lg:py-4 lg:px-8',
   },
   template: `
+    <!--
+      Back, for a view somebody arrived at from somewhere else.
+
+      On the leading edge below lg, where the product name truncates to make room,
+      and on the trailing edge from lg up, where the sidebar toggle already owns the
+      left. Anywhere else it would have sat on top of the toggle, which is the one
+      control on this bar that must never be covered.
+    -->
+    @if (backLabel()) {
+      <button
+        app-button
+        type="button"
+        variant="ghost"
+        tone="brand"
+        size="sm"
+        class="shrink-0 lg:absolute lg:top-1/2 lg:right-6 lg:-translate-y-1/2"
+        [attr.aria-label]="backLabel()"
+        (click)="goBack()"
+      >
+        <app-icon name="arrow-left" [size]="16" />
+        <span class="hidden sm:inline">{{ backLabel() }}</span>
+      </button>
+    }
+
     <span class="truncate font-headings text-base font-semibold text-foreground lg:hidden">
       Knowledge Assistant
     </span>
@@ -78,4 +104,50 @@ export class ViewHeaderComponent {
 
   /** Primary heading of the view. */
   readonly title = input('');
+
+  /**
+   * Label for the back control, and the signal that there is one at all.
+   *
+   * Optional rather than a boolean: every view would otherwise have to pass `false`,
+   * and a header that grew a control most views do not want would be one more thing
+   * to keep out of the way of the title on the screens that do.
+   */
+  readonly backLabel = input('');
+
+  /**
+   * Where back goes when there is no history to go back to.
+   *
+   * Somebody who opened this view from a bookmark or a pasted link never came from
+   * anywhere in the product, and history.back() on that first entry leaves the site
+   * entirely — so the browser's back button on a fresh tab takes them off the
+   * application. The fallback keeps them inside it.
+   */
+  readonly backTo = input('/');
+
+  /**
+   * Returns to the previous view, or to `backTo` if this is the first one.
+   *
+   * Prefers the real previous entry over a hard-coded route, because the previous
+   * view is what "back" means to the person pressing it: they came from somewhere
+   * specific and a fixed destination is only right when that somewhere is known.
+   *
+   * `navigationId` is the router's own counter in the history state, which is the
+   * only way to tell an in-app previous entry from the blank one before a first
+   * navigation. `history.length` cannot: it counts entries from other sites too, and
+   * is greater than one on a tab that has never been to this application.
+   */
+  protected goBack(): void {
+    const state = (globalThis.history?.state ?? null) as { navigationId?: number } | null;
+    const hasPreviousEntry = (state?.navigationId ?? 0) > 1;
+
+    if (hasPreviousEntry) {
+      this.location.back();
+      return;
+    }
+
+    void this.router.navigateByUrl(this.backTo());
+  }
+
+  private readonly location = inject(Location);
+  private readonly router = inject(Router);
 }

@@ -1,24 +1,33 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
+  ElementRef,
   HostListener,
   computed,
   inject,
   signal,
+  viewChild,
 } from '@angular/core';
-import { Router, RouterLink, RouterLinkActive } from '@angular/router';
+import { NgClass } from '@angular/common';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { filter, map } from 'rxjs';
+import { NavigationEnd, Router, RouterLink } from '@angular/router';
 
 import { AuthService } from '../../../../core/services/auth.service';
 import { ChatService } from '../../../../core/services/chat.service';
 import { ConversationService } from '../../../../core/services/conversation.service';
 import { LayoutService } from '../../../../core/services/layout.service';
 import { SectionService } from '../../../../core/services/section.service';
+import { MIN_PASSWORD_LENGTH } from '../../../../core/models/auth.model';
 import { toInitials } from '../../../../shared/utils/initials.util';
 import { AvatarComponent } from '../../../../shared/components/avatar/avatar.component';
 import { ButtonComponent } from '../../../../shared/components/button/button.component';
 import { ConfirmDialogComponent } from '../../../../shared/components/confirm-dialog/confirm-dialog.component';
 import { IconComponent, type IconName } from '../../../../shared/components/icon/icon.component';
+import { FormFieldComponent } from '../../../../shared/components/form-field/form-field.component';
 import { InputComponent } from '../../../../shared/components/input/input.component';
+import { ModalComponent } from '../../../../shared/components/modal/modal.component';
 import { ConversationItemComponent } from '../../../conversations/components/conversation-item/conversation-item.component';
 import { BrandLogoComponent } from '../brand-logo/brand-logo.component';
 
@@ -35,18 +44,33 @@ interface AdminNavItem {
   label: string;
   path: string;
   icon: IconName;
+
+  /**
+   * Every path that counts as being on this destination.
+   *
+   * A screen can be reached from more than one address without becoming more than
+   * one place in the navigation, and `routerLinkActive` only ever matches one
+   * prefix. So a sub-page reached by a sibling address left its own section looking
+   * unselected: the highlight said "you are not in Users" while the page on screen
+   * was the queue of people waiting to join Users.
+   */
+  activeFor?: string[];
 }
 
 /**
  * What an administrator can reach, in the order they would look for it.
  *
- * Three destinations, and each is a job rather than a screen: the overview, the
- * documents the assistant answers from, and giving somebody access.
+ * Four destinations, and each is a job rather than a screen: the overview, the
+ * documents the assistant answers from, and the people who have access — which is
+ * where a new account is added, so that adding one and seeing who has one are the
+ * same screen rather than two addresses to remember.
  */
 const ADMIN_NAV: AdminNavItem[] = [
   { label: 'Dashboard', path: '/admin', icon: 'layout-dashboard' },
   { label: 'Documents', path: '/admin/documents', icon: 'file-text' },
-  { label: 'Add a user', path: '/admin/invite', icon: 'user-plus' },
+  // The access queue belongs to Users. It is reached from the users screen and from
+  // the sidebar, and either way the section somebody is inside is the one lit up.
+  { label: 'Users', path: '/admin/users', icon: 'users', activeFor: ['/admin/users', '/admin/access'] },
 ];
 
 /**
@@ -77,9 +101,11 @@ const ADMIN_NAV: AdminNavItem[] = [
     ConfirmDialogComponent,
     ConversationItemComponent,
     IconComponent,
+    FormFieldComponent,
     InputComponent,
+    ModalComponent,
+    NgClass,
     RouterLink,
-    RouterLinkActive,
   ],
   host: { class: 'relative flex h-full flex-col overflow-hidden bg-sidebar' },
   template: `
@@ -118,6 +144,39 @@ const ADMIN_NAV: AdminNavItem[] = [
             }
           </nav>
         } @else {
+          <!--
+            The assistant's own controls, at the same height the expanded column puts
+            them. The rail kept only the administration links, so an administrator who
+            collapsed the sidebar lost the two things this section is for — starting a
+            conversation and reaching the conversation list — and collapsing changed
+            what the sidebar was for rather than how much of it there was.
+          -->
+          <button
+            app-button
+            type="button"
+            variant="ghost"
+            tone="dark"
+            size="rail"
+            class="mt-6"
+            aria-label="New conversation"
+            title="New Conversation"
+            (click)="onNewConversation()"
+          >
+            <app-icon name="plus" [size]="18" />
+          </button>
+
+          <div class="scrollbar-thin mt-4 flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto">
+            @for (conversation of conversations.filteredConversations(); track conversation.id) {
+              <app-conversation-item
+                appearance="rail"
+                [conversation]="conversation"
+                [isSelected]="isActive(conversation.id)"
+                (selected)="openConversation($event)"
+                (renamed)="onRenamed($event)"
+                (removed)="askToDelete($event)"
+              />
+            }
+          </div>
           <button
             app-button
             type="button"
@@ -147,7 +206,7 @@ const ADMIN_NAV: AdminNavItem[] = [
               <app-conversation-item
                 appearance="rail"
                 [conversation]="conversation"
-                [isSelected]="conversation.id === conversations.activeId()"
+                [isSelected]="isActive(conversation.id)"
                 (selected)="openConversation($event)"
               />
             }
@@ -168,7 +227,7 @@ const ADMIN_NAV: AdminNavItem[] = [
               variant="ghost"
               tone="dark"
               size="rail"
-              [routerLink]="showsAdminNav() ? '/' : '/admin'"
+              [routerLink]="showsAdminNav() ? auth.assistantPath() : '/admin'"
               [attr.aria-label]="showsAdminNav() ? 'Ask' : 'View as admin'"
               [title]="showsAdminNav() ? 'Ask' : 'View as admin'"
               (click)="layout.closeAfterNavigation()"
@@ -205,8 +264,7 @@ const ADMIN_NAV: AdminNavItem[] = [
               [fullWidth]="true"
               [alignStart]="true"
               [routerLink]="item.path"
-              routerLinkActive="bg-white/10 text-sidebar-foreground"
-              [routerLinkActiveOptions]="{ exact: item.path === '/admin' }"
+              [ngClass]="{ 'bg-white/10 text-sidebar-foreground': isNavItemActive(item) }"
               (click)="layout.closeAfterNavigation()"
             >
               <app-icon [name]="item.icon" [size]="16" />
@@ -229,20 +287,39 @@ const ADMIN_NAV: AdminNavItem[] = [
             <span>New Conversation</span>
           </button>
 
-          <div class="mt-3">
-            <app-input
-              [value]="conversations.searchTerm()"
-              (valueChange)="conversations.setSearchTerm($event)"
-              placeholder="Search conversations"
-              ariaLabel="Search conversations"
-            />
-          </div>
+          <!--
+            Only once there is something to search. An empty list offered a search box
+            that could only ever fail, and typing in it changed the message underneath
+            from "no conversations yet" to "nothing matched" — so the one action
+            available on an empty list was the one that made it look emptier.
+          -->
+          @if (conversations.hasConversations()) {
+            <div class="mt-3">
+              <app-input
+                [value]="conversations.searchTerm()"
+                (valueChange)="conversations.setSearchTerm($event)"
+                placeholder="Search conversations"
+                ariaLabel="Search conversations"
+              />
+            </div>
+          }
         </div>
       }
 
       @if (!showsAdminNav()) {
+        <!--
+          The same inset as the New Conversation button and the search box above, so
+          the three are one column rather than three that happen to be near each
+          other.
+
+          It was a half-step narrower with each row adding its own padding inside
+          itself, which put the conversation titles at 20px from the edge while the
+          search box's text sat at 28px and the New Conversation button's label at
+          32px. Three values for one alignment. The row now lines its border box up
+          with those controls and its title up with the search placeholder.
+        -->
         <nav
-          class="scrollbar-thin mt-4 min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2"
+          class="scrollbar-thin mt-4 min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4"
           aria-label="Your conversations"
         >
           <div class="flex flex-col gap-1 pb-2">
@@ -254,8 +331,10 @@ const ADMIN_NAV: AdminNavItem[] = [
                 <app-conversation-item
                   appearance="sidebar"
                   [conversation]="conversation"
-                  [isSelected]="conversation.id === conversations.activeId()"
+                  [isSelected]="isActive(conversation.id)"
                   (selected)="openConversation($event)"
+                  (renamed)="onRenamed($event)"
+                  (removed)="askToDelete($event)"
                 />
               }
             } @empty {
@@ -298,7 +377,7 @@ const ADMIN_NAV: AdminNavItem[] = [
               size="md"
               [fullWidth]="true"
               [alignStart]="true"
-              [routerLink]="showsAdminNav() ? '/' : '/admin'"
+              [routerLink]="showsAdminNav() ? auth.assistantPath() : '/admin'"
               (click)="layout.closeAfterNavigation()"
             >
               <app-icon [name]="showsAdminNav() ? 'bot' : 'layout-dashboard'" [size]="16" />
@@ -347,21 +426,8 @@ const ADMIN_NAV: AdminNavItem[] = [
             </button>
 
             @if (isAccountOpen()) {
-              <!--
-                Dismissed by clicking anywhere outside it, and by Escape. The overlay
-                is a sibling of the card rather than a document listener, so the click
-                that opened the card cannot also be the one that closes it, and a click
-                inside the card is never mistaken for one outside it.
-              -->
-              <button
-                type="button"
-                class="fixed inset-0 z-40 cursor-default"
-                tabindex="-1"
-                aria-hidden="true"
-                (click)="closeAccount()"
-              ></button>
-
               <div
+                #accountCard
                 class="animate-panel-rise absolute right-0 bottom-full left-0 z-50 mb-2
                   overflow-hidden rounded-lg border border-border bg-card shadow-raised"
                 role="menu"
@@ -382,6 +448,21 @@ const ADMIN_NAV: AdminNavItem[] = [
 
                 <div class="border-t border-border"></div>
 
+                @if (canChangeOwnPassword()) {
+                  <button
+                    app-button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    class="w-full justify-start rounded-none text-left"
+                    role="menuitem"
+                    (click)="askToChangeOwnPassword()"
+                  >
+                    <app-icon name="key-round" [size]="15" />
+                    <span>Change password</span>
+                  </button>
+                }
+
                 <button
                   app-button
                   type="button"
@@ -400,13 +481,59 @@ const ADMIN_NAV: AdminNavItem[] = [
         </div>
       </div>
 
+      <app-modal
+        [(isOpen)]="isOwnPasswordOpen"
+        icon="key-round"
+        title="Change your password"
+        message="You will be signed out everywhere, including here. Sign in again with the new one."
+        (closed)="closeOwnPassword()"
+      >
+        <app-form-field
+          label="New password"
+          type="password"
+          icon="lock"
+          autocomplete="new-password"
+          placeholder="Something you have not used here"
+          [required]="true"
+          [(value)]="ownPassword"
+          [error]="ownPasswordError()"
+        />
+
+        <div modalFooter class="flex justify-between gap-2">
+          <button app-button type="button" variant="ghost" (click)="closeOwnPassword()">
+            Go back
+          </button>
+          <button app-button type="button" [disabled]="isBusy()" (click)="saveOwnPassword()">
+            Change password
+          </button>
+        </div>
+      </app-modal>
+
       <app-confirm-dialog
         [isOpen]="isSignOutOpen()"
         icon="log-out"
         title="Sign out?"
-        message="You will be asked to sign in again. Your conversations stay saved to this browser."
+        message="You will be asked to sign in again. Your conversations stay saved to your account."
         confirmLabel="Sign out"
+        tone="danger"
         (confirmed)="signOut()"
+      />
+
+      <!--
+        A separate dialog from the sign-out one rather than a shared instance: two
+        confirmations cannot both be open, and a single component with one open state
+        would let deleting a conversation raise the sign-out question.
+      -->
+      <app-confirm-dialog
+        [isOpen]="pendingDeleteId !== null"
+        icon="trash-2"
+        tone="danger"
+        title="Delete this conversation?"
+        message="The conversation and every question and answer in it are removed. This cannot be undone."
+        confirmLabel="Delete"
+        tone="danger"
+        (confirmed)="confirmDelete()"
+        (cancelled)="pendingDeleteId = null"
       />
     }
   `,
@@ -414,6 +541,9 @@ const ADMIN_NAV: AdminNavItem[] = [
 export class ChatSidebarComponent {
   /** Layout state: breakpoint bucket, collapse preference and drawer. */
   protected readonly layout = inject(LayoutService);
+
+  /** The router, for the address bar's contents rather than for navigating. */
+  private readonly router = inject(Router);
 
   /** The conversation list and search term, shared with the conversations view. */
   protected readonly conversations = inject(ConversationService);
@@ -423,6 +553,37 @@ export class ChatSidebarComponent {
 
   /** The administrator's destinations, hidden from everybody else. */
   protected readonly adminNav = ADMIN_NAV;
+
+  /**
+   * The path on screen, as a signal.
+   *
+   * Read from the router's events rather than from `router.url`, which is only a
+   * snapshot: a plain property read in a template is not re-evaluated when the URL
+   * changes, so the highlight would be right on first paint and stale after every
+   * navigation.
+   */
+  private readonly currentUrl = toSignal(
+    this.router.events.pipe(
+      filter((event) => event instanceof NavigationEnd),
+      map(() => this.router.url),
+    ),
+    { initialValue: this.router.url },
+  );
+
+  /**
+   * Whether this destination is the one on screen.
+   *
+   * Prefix matching, and exact for the overview, so `/admin` does not light up for
+   * every administration page. That is the behaviour `routerLinkActive` was
+   * configured for, and losing it would have lit three items at once.
+   */
+  protected isNavItemActive(item: AdminNavItem): boolean {
+    const url = this.currentUrl();
+
+    return (item.activeFor ?? [item.path]).some((path) =>
+      path === '/admin' ? url === path : url.startsWith(path),
+    );
+  }
 
   /** Which of the two sections the signed-in person is currently in. */
   protected readonly section = inject(SectionService);
@@ -446,14 +607,76 @@ export class ChatSidebarComponent {
     return name ? toInitials(name) : '';
   });
 
+  /** The conversation a delete confirmation is about, or null when there is none. */
+  private pendingDeleteId: string | null = null;
+
+  constructor() {
+    // Registered on the document so a click in the chat area, the header, or any
+    // other part of the page dismisses the card. Removed with the component, so it
+    // cannot outlive the sidebar and keep swallowing clicks after a navigation.
+    if (typeof document !== 'undefined') {
+      document.addEventListener('click', this.onDocumentClick, true);
+      inject(DestroyRef).onDestroy(() =>
+        document.removeEventListener('click', this.onDocumentClick, true),
+      );
+    }
+  }
+
   /** Whether the sign-out confirmation is open. */
   protected readonly isSignOutOpen = signal(false);
 
   /** Whether the account card is open. */
   protected readonly isAccountOpen = signal(false);
 
+  /**
+   * Closes the account card on any click elsewhere on the page.
+   *
+   * Not an overlay element. An overlay large enough to cover the page has to live
+   * outside the sidebar, because the sidebar clips its own contents — a `fixed`
+   * overlay inside it covers the sidebar's box and nothing else, which meant only a
+   * click within the sidebar dismissed the card. A click in the chat area, on the
+   * header, or anywhere else on the page went straight through.
+   *
+   * Bound to the document rather than to an element so the click that opened the
+   * card, and a click inside the card, are both recognised as outside-the-rest and
+   * ignored: `relatedTarget` is still inside for both, since neither moves focus.
+   */
+  protected readonly onDocumentClick = (event: MouseEvent): void => {
+    if (!this.isAccountOpen()) {
+      return;
+    }
+
+    const origin = event.target;
+    if (!(origin instanceof Node)) {
+      return;
+    }
+
+    const insideTrigger = this.accountTrigger()?.nativeElement.contains(origin) ?? false;
+    const insideCard = this.accountCard()?.nativeElement.contains(origin) ?? false;
+
+    if (insideTrigger || insideCard) {
+      return;
+    }
+
+    this.closeAccount();
+  };
+
   private readonly chat = inject(ChatService);
-  private readonly router = inject(Router);
+
+  /**
+   * Whether this row is the open conversation.
+   *
+   * One value decides this, and it is the same one that decides where a new question
+   * goes. That is the whole point: the highlight used to be computed from the route
+   * while the question went to `activeId`, so the row could be lit for a conversation
+   * nothing was being added to, or unlit for the one that was.
+   *
+   * A blank window now has nothing open at all, because the ask screen says so when
+   * it is built, rather than this hiding the disagreement.
+   */
+  protected isActive(conversationId: string): boolean {
+    return this.conversations.activeId() === conversationId;
+  }
 
   /** Explains an empty list, distinguishing "none yet" from "no matches". */
   protected readonly emptyMessage = computed(() =>
@@ -487,6 +710,73 @@ export class ChatSidebarComponent {
     this.isAccountOpen.update((open) => !open);
   }
 
+  private readonly accountTrigger = viewChild<ElementRef<HTMLButtonElement>>('accountTrigger');
+  private readonly accountCard = viewChild<ElementRef<HTMLElement>>('accountCard');
+
+  /**
+   * Whether this person can change their own password from here.
+   *
+   * An administrator can, and this is the only route that does not require them to
+   * find themselves in a list of other people first — which is where a password
+   * change otherwise went to be done, by an administrator, about themselves.
+   */
+  protected readonly canChangeOwnPassword = computed(() => this.auth.isAdmin());
+
+  protected readonly isOwnPasswordOpen = signal(false);
+  protected readonly ownPassword = signal('');
+  protected readonly isBusy = signal(false);
+
+  protected readonly ownPasswordError = computed(() => {
+    const value = this.ownPassword();
+
+    if (value === '') {
+      return '';
+    }
+
+    return value.length >= MIN_PASSWORD_LENGTH ? '' : `Use at least ${MIN_PASSWORD_LENGTH} characters`;
+  });
+
+  /** Opens the dialog, discarding whatever the last attempt left behind. */
+  protected askToChangeOwnPassword(): void {
+    this.closeAccount();
+    this.ownPassword.set('');
+    this.isOwnPasswordOpen.set(true);
+  }
+
+  protected closeOwnPassword(): void {
+    this.isOwnPasswordOpen.set(false);
+    this.ownPassword.set('');
+  }
+
+  /**
+   * Sets the new password, then signs out.
+   *
+   * The sign-out is not a flourish. The server revokes every session for the account,
+   * so staying put would leave a page that looks signed in and fails on the next
+   * action — going through the sign-in screen is the honest sequence.
+   */
+  protected saveOwnPassword(): void {
+    const me = this.auth.user();
+
+    if (me === null || this.ownPassword().length < MIN_PASSWORD_LENGTH || this.isBusy()) {
+      return;
+    }
+
+    this.isBusy.set(true);
+
+    this.auth.resetPassword(me.id, this.ownPassword()).subscribe({
+      next: () => {
+        this.isBusy.set(false);
+        this.closeOwnPassword();
+        this.signOut();
+      },
+      error: () => {
+        this.isBusy.set(false);
+        this.closeOwnPassword();
+      },
+    });
+  }
+
   /** Closes the account card without acting on anything in it. */
   protected closeAccount(): void {
     this.isAccountOpen.set(false);
@@ -510,11 +800,37 @@ export class ChatSidebarComponent {
     this.closeAccount();
   }
 
-  /** Starts a new conversation and returns to the dashboard. */
+  /** Starts a new conversation and returns to the assistant. */
   protected onNewConversation(): void {
     this.chat.startNewConversation();
     this.layout.closeAfterNavigation();
-    void this.router.navigate(['/']);
+    void this.router.navigateByUrl(this.auth.assistantPath());
+  }
+
+  /** Names a conversation from its row. */
+  protected onRenamed(change: { id: string; title: string }): void {
+    this.conversations.renameConversation(change.id, change.title);
+  }
+
+  /**
+   * Asks before deleting, rather than deleting.
+   *
+   * A conversation and everything said in it cannot be recovered, and the row this is
+   * reached from is one click away from opening it — so the click that asks for the
+   * deletion is also a click that deletes it.
+   */
+  protected askToDelete(conversationId: string): void {
+    this.pendingDeleteId = conversationId;
+  }
+
+  /** Deletes the conversation the confirmation is about. */
+  protected confirmDelete(): void {
+    const conversationId = this.pendingDeleteId;
+    this.pendingDeleteId = null;
+
+    if (conversationId !== null) {
+      this.conversations.deleteConversation(conversationId);
+    }
   }
 
   /** Opens the conversation a row stands for. */

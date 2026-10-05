@@ -63,6 +63,41 @@ async function decideForAppRoutes(): Promise<Decision> {
 export const authGuard: CanActivateFn = () => decideForAppRoutes();
 
 /**
+ * Sends an administrator arriving at the app's front door to the dashboard.
+ *
+ * On the root route rather than at sign-in, so it covers every way in: the sign-in
+ * screen, a bookmark, a pasted link, and the guard handing somebody back the page
+ * they were bounced off. Fixing it in the login screen alone would leave an
+ * administrator who opens the app on `/` — which is what a browser does with the
+ * address they have bookmarked — looking at a chat screen they have to navigate out
+ * of.
+ *
+ * Only the front door is redirected. Reaching the assistant is a decision, and it
+ * stays reachable at `/ask`; redirecting the root alone is what keeps the sidebar's
+ * own "Ask" link working instead of bouncing an administrator straight back here.
+ */
+export const landingGuard: CanActivateFn = async () => {
+  const auth = inject(AuthService);
+  const router = inject(Router);
+
+  // Deferred to the browser for the same reason `adminGuard` defers: a server render
+  // knows nobody's role, so answering "not an administrator" here would redirect
+  // every administrator on every full page load. The moment the client takes over
+  // this runs again with a real answer.
+  if (!auth.isBrowserOnly()) {
+    return true;
+  }
+
+  const allowed = await decideForAppRoutes();
+
+  if (allowed !== true) {
+    return allowed;
+  }
+
+  return auth.isAdmin() ? router.createUrlTree([auth.landingPath()]) : true;
+};
+
+/**
  * Keeps signed-in people away from the administrator screens.
  *
  * A non-administrator goes to the dashboard rather than to a refusal screen: there

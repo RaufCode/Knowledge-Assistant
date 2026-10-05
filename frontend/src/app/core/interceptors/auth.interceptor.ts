@@ -41,6 +41,17 @@ export const authInterceptor: HttpInterceptorFn = (request, next) => {
   const auth = inject(AuthService);
   const router = inject(Router);
 
+  // Per request, not per interceptor: one tab sending several requests must not
+  // consume another's single retry.
+  let hasRetried = false;
+
+  /** Whether this refusal is about the CSRF token rather than about permission. */
+  const this_is_csrf_refusal = (error: HttpErrorResponse): boolean => {
+    const detail = (error.error as { detail?: unknown } | null)?.detail;
+
+    return typeof detail === 'string' && detail.includes('CSRF token');
+  };
+
   const isExempt = EXEMPT_PATHS.some((path) => request.url.includes(path));
   const withHeader =
     SAFE_METHODS.has(request.method) || isExempt
@@ -49,6 +60,37 @@ export const authInterceptor: HttpInterceptorFn = (request, next) => {
 
   return next(withHeader).pipe(
     catchError((error: unknown) => {
+      // A CSRF token the server has already rotated away, retried once with a fresh
+      // one.
+      //
+      // The cookie is replaced server-side whenever the session changes — signing in,
+      // accepting an invitation, registering — so a token read before any of those is
+      // stale, and the browser sends the new cookie with a header holding the old
+      // value. The two disagree and the server refuses, which is the correct thing to
+      // do: it cannot tell a stale tab from a forged request.
+      //
+      // So the tab refreshes and tries again. Once, and only for this exact refusal:
+      // a retried request must never repeat a side effect, and a 403 about anything
+      // else — an employee reaching an administrator's route — is not this problem
+      // and must not be turned into a second attempt.
+      if (
+        error instanceof HttpErrorResponse &&
+        error.status === 403 &&
+        this_is_csrf_refusal(error) &&
+        !hasRetried
+      ) {
+        hasRetried = true;
+
+        // Waiting for the refresh before reading the cookie. Reading it as soon as
+        // the request was fired gets the value that was just refused, which fails
+        // again for exactly the same reason and looks like the fix doing nothing.
+        return auth.refreshCsrfToken().pipe(
+          switchMap(() =>
+            next(request.clone({ setHeaders: { [CSRF_HEADER]: auth.readCsrfToken() ?? '' } })),
+          ),
+        );
+      }
+
       if (!(error instanceof HttpErrorResponse) || error.status !== 401) {
         return throwError(() => error);
       }

@@ -47,11 +47,9 @@ SESSION_HINT_COOKIE = "ika_session"
 #
 # The four exemptions are all reached at a point where no session exists yet: you
 # cannot present a CSRF token before you have cookies to have issued it alongside.
-# They are covered instead by the rate limit on the ones that take a password and
-# by the fact that a forged sign-in still needs a password the attacker does not
-# have. (`SameSite` does not protect these in production: the session cookies are
-# `SameSite=None` so the browser attaches them cross-site, which is why the
-# double-submit token + origin check exists on everything else.)
+# They are covered instead by `SameSite=Lax` (which withholds cookies from
+# cross-site POSTs), the origin check below, and the rate limit on the two that
+# take a password.
 CSRF_EXEMPT_PATHS = frozenset(
     {
         "/api/auth/login",

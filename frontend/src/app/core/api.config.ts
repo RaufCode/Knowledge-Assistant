@@ -1,3 +1,7 @@
+import { inject } from '@angular/core';
+
+import { ConfigService } from './config.service';
+
 /**
  * Single source for the backend origin. Every HTTP call is built from this
  * constant, so pointing the app at a different deployment is a one-line change.
@@ -22,18 +26,16 @@
  * only permits `127.0.0.1` by default, so a `localhost` page is refused with a 400
  * before any of this matters.
  */
-// The deployed backend on Render. The backend lists this app's exact origin in
-// `ALLOWED_ORIGINS`/`CSRF_TRUSTED_ORIGINS`, which is what makes a credentialed
-// cross-origin response acceptable to the browser. Session cookies are
-// `SameSite=None; Secure` in production so the browser attaches them to these
-// cross-subdomain `fetch` calls (`withCredentials` in `ApiService`).
-export const API_BASE_URL = 'https://knowledge-assistant-chatbot.onrender.com';
+export const API_BASE_URL = 'http://localhost:8099';
 
-// Local development. The backend runs from `backend/` with
-// `uvicorn app.main:app --host 127.0.0.1 --port 8099`, and its ALLOWED_ORIGINS
-// lists http://localhost:4200. Swap the two lines above to move between them:
-//
-//   export const API_BASE_URL = 'http://localhost:8099';
+/**
+ * Returns the configured API base URL at runtime, or the default constant when
+ * not in an injection context (e.g., during testing).
+ */
+export function getApiBaseUrl(): string {
+  const config = inject(ConfigService, { optional: true });
+  return config?.getApiBaseUrl() ?? API_BASE_URL;
+}
 
 /**
  * How long a single request may take before it is abandoned.

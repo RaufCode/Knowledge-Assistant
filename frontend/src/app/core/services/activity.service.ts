@@ -98,7 +98,7 @@ export class ActivityService {
     forkJoin({
       requests: this.read(this.auth.listAccessRequests(), (response) => response.requests, []),
       conversations: this.read(
-        this.api.getConversations(this.identity.clientId()),
+        this.api.getConversations(),
         (rows) => rows,
         [],
       ),

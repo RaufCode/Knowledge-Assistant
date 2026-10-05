@@ -1,7 +1,11 @@
 import { provideHttpClient } from '@angular/common/http';
 import { provideHttpClientTesting } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { HttpTestingController } from '@angular/common/http/testing';
 import { Router, provideRouter } from '@angular/router';
+
+import { API_BASE_URL } from './core/api.config';
+import { AuthService } from './core/services/auth.service';
 
 import { AppComponent } from './app.component';
 
@@ -38,6 +42,23 @@ describe('AppComponent', () => {
     router = TestBed.inject(Router);
   });
 
+  it('shows a loading card, not a wrong screen, until it knows who is signed in', async () => {
+    // The bug this covers: a refresh answered every question about the role with
+    // "no" until the answer arrived, so an administrator saw a non-administrator's
+    // shell for a frame before the dashboard appeared.
+    const fixture = TestBed.createComponent(AppComponent);
+
+    // Navigate to an app route (not plain) so the loading card can appear
+    await router.navigate(['/']);
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    const element = fixture.nativeElement as HTMLElement;
+
+    expect(element.textContent).toContain('Loading your account');
+    expect(element.querySelector('aside')).toBeNull();
+  });
+
   /**
    * The shell, either as it stands or once a navigation has landed.
    *
@@ -46,6 +67,18 @@ describe('AppComponent', () => {
    */
   const render = async (navigateTo?: string): Promise<ComponentFixture<AppComponent>> => {
     const fixture = TestBed.createComponent(AppComponent);
+
+    // Signed in, and known to be. The shell draws a loading card until the answer
+    // about the person arrives, and every case below is about what it draws after
+    // that — so the answer is settled here rather than in each test.
+    const auth = TestBed.inject(AuthService);
+    const known = auth.bootstrap();
+
+    TestBed.inject(HttpTestingController)
+      .expectOne(`${API_BASE_URL}/api/auth/me`)
+      .flush({ id: 'u1', name: 'Ama Konadu', email: 'ama@acmetech.example', role: 'admin' });
+    await known;
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     fixture.detectChanges();
 

@@ -34,11 +34,12 @@ describe('RegisterViewComponent', () => {
     await render();
   };
 
-  const fillValid = (): void => {
+  /** A complete, valid form: everything filled, and the password confirmed. */
+  const fillValid = (password = 'their-own-pass1'): void => {
     type(0, 'Kofi Mensah');
     type(1, `kofi@${DOMAIN}`);
-    type(2, 'correct-horse-1!');
-    type(3, 'correct-horse-1!');
+    type(2, password);
+    type(3, password);
   };
 
   /** The one request this screen can make. */
@@ -55,11 +56,21 @@ describe('RegisterViewComponent', () => {
     await render();
   });
 
-  it('asks for a name, an address and a password with confirmation', async () => {
-    expect(element().textContent).toContain('Request access');
+  it('asks for a name, an address and the password twice, and nothing else', async () => {
+    expect(element().textContent).toContain('Register');
     expect(fields().length).toBe(4);
-    expect(fields().map((field) => field.type)).toEqual(['text', 'email', 'password', 'password']);
-    expect(element().textContent).toContain('At least 6 characters');
+    expect(fields().map((field) => field.type)).toEqual([
+      'text',
+      'email',
+      'password',
+      'password',
+    ]);
+  });
+
+  it('says what registering is for, under the title', () => {
+    // The sign-in screen says why it is there; this one said nothing, which left the
+    // title and a form with no indication that an administrator is involved.
+    expect(element().textContent).toContain('An administrator will review your request');
   });
 
   it('says the account is not created yet, so nobody expects to be signed in', async () => {
@@ -70,17 +81,20 @@ describe('RegisterViewComponent', () => {
     await render();
 
     // The one thing that must not be implied: that filling this in signed anybody in.
-    expect(element().textContent).toContain('with an administrator now');
-    expect(element().textContent).toContain('once they approve it');
     expect(element().textContent).not.toContain('you are now signed in');
+    expect(element().textContent).toContain('your request is with an administrator');
     expect(element().querySelector('app-form-field')).toBeNull();
+
+    // And it says what to do next, which is sign in and check. The account exists from
+    // here, switched off, so this is somewhere they can come back to.
+    expect(element().textContent).toContain('Sign in with the password you just chose');
   });
 
-  it('sends the name, the address and the password, trimmed', async () => {
+  it('trims the name and the address but never the password', async () => {
     type(0, '  Kofi Mensah  ');
     type(1, `  kofi@${DOMAIN}  `);
-    type(2, 'correct-horse-1!');
-    type(3, 'correct-horse-1!');
+    type(2, '  their-own-pass1  ');
+    type(3, '  their-own-pass1  ');
     await submit();
 
     const request = http.expectOne(REQUEST_URL);
@@ -89,43 +103,63 @@ describe('RegisterViewComponent', () => {
     expect(request.request.body).toEqual({
       name: 'Kofi Mensah',
       email: `kofi@${DOMAIN}`,
-      password: 'correct-horse-1!',
+      role: 'employee',
+      // Deliberately untrimmed. A password is whatever the person chose, and quietly
+      // removing a space from it gives them a password they have never typed and will
+      // be told is wrong.
+      password: '  their-own-pass1  ',
     });
     request.flush({ status: 'received' });
   });
 
-  it('carries no role, because the person asking does not get to choose one', async () => {
+  it('never shows a choice of role, and asks for the least privileged one', async () => {
+    // There is no role on this form. Somebody registering is asking for an account,
+    // not choosing a level of access for it, and a chooser here would have been the
+    // one control in the product that hands out privilege without an administrator.
+    expect(element().querySelector('input[type="radio"]')).toBeNull();
+    expect(element().textContent).not.toContain('Access you are asking for');
+    expect(element().textContent).not.toContain('Administrator');
+
     fillValid();
     await submit();
 
-    // The backend has no field for it either, so sending one would be meaningless —
-    // but the shape of what is sent is worth pinning, since a role here would be the
-    // whole security property of the request flow.
     const request = http.expectOne(REQUEST_URL);
 
-    expect(Object.keys(request.request.body as object).sort()).toEqual([
-      'email',
-      'name',
-      'password',
-    ]);
-    request.flush({ status: 'received' });
+    expect(request.request.body.role).toBe('employee');
   });
 
-  it('refuses a short password and a mismatch before making a round trip', async () => {
-    fillValid();
-    type(2, 'abc');
-    type(3, 'abc');
+  it('asks for the password twice, and refuses the two that differ', async () => {
+    // The backend receives one password field and cannot tell a mistyped one from a
+    // deliberate one, so this is the only place the mistake can be caught.
+    type(0, 'Kofi Mensah');
+    type(1, `kofi@${DOMAIN}`);
+    type(2, 'their-own-pass1');
+    type(3, 'their-own-pass2');
     await submit();
 
-    expect(element().textContent).toContain('satisfies every rule');
     http.expectNone(REQUEST_URL);
+    expect(element().textContent).toContain('Those passwords do not match');
+  });
 
-    fillValid();
-    type(3, 'something-else-1!');
+  it('never sends the confirmation, only the password', async () => {
+    // The confirmation is a check, not a second secret. Sending it would put a field
+    // in the request that the backend has no use for.
+    fillValid('their-own-pass1');
     await submit();
 
-    expect(element().textContent).toContain('Passwords do not match');
+    const body = http.expectOne(REQUEST_URL).request.body as Record<string, unknown>;
+
+    expect(body['password']).toBe('their-own-pass1');
+    expect(Object.keys(body)).not.toContain('confirmPassword');
+    expect(Object.keys(body)).not.toContain('confirm_password');
+  });
+
+  it('refuses a password the backend would refuse, before a round trip', async () => {
+    fillValid('short');
+    await submit();
+
     http.expectNone(REQUEST_URL);
+    expect(element().textContent).toContain('at least 8 characters');
   });
 
   it('refuses an address outside the company before making a round trip', async () => {
@@ -140,6 +174,8 @@ describe('RegisterViewComponent', () => {
   it('refuses something that is not an address at all', async () => {
     fillValid();
     type(1, 'kofi');
+    // Re-typed at the confirmation field's index too, so the only thing wrong with
+    // this form is the address.
     await submit();
 
     expect(element().textContent).toContain('does not look like an email address');
@@ -153,8 +189,6 @@ describe('RegisterViewComponent', () => {
 
     expect(element().textContent).toContain('Enter your full name');
     expect(element().textContent).toContain('Enter your work email');
-    expect(element().textContent).toContain('Choose a password');
-    expect(element().textContent).toContain('Type your password again');
     http.expectNone(REQUEST_URL);
   });
 
@@ -203,8 +237,30 @@ describe('RegisterViewComponent', () => {
     expect(element().querySelector('form')).not.toBeNull();
   });
 
-  it('offers a single-line way back to signing in, and no invite link', async () => {
-    expect(element().querySelector('a[href="/login"]')).not.toBeNull();
+  it('offers a way back to signing in, on one line', () => {
+    const back = element().querySelector('a[href="/login"]') as HTMLElement;
+
+    expect(back).not.toBeNull();
+
+    // One line, and centred with the question it answers. Stacked, these were three
+    // short centred lines that read as a footnote rather than as part of the form.
+    const footer = back.closest('div') as HTMLElement;
+
+    // The two halves separately, because Angular drops the whitespace between
+    // elements and the gap is a flex gap rather than a character.
+    expect(footer.querySelector('span')?.textContent?.trim()).toBe(
+      'Already have an account?',
+    );
+    expect(back.textContent?.trim()).toBe('Sign in');
+
+    // Centred by the box rather than by `text-align`, which only holds while both
+    // halves happen to be inline.
+    expect(footer.className).toContain('justify-center');
+    expect(footer.className).toContain('flex-wrap');
+    expect(footer.className).not.toContain('flex-col');
+
+    // The invitation route is not offered here. Somebody who was invited was told so,
+    // and it reached them by a link an administrator sent.
     expect(element().querySelector('a[href="/accept-invite"]')).toBeNull();
   });
 });

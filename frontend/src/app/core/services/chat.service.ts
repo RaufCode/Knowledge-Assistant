@@ -14,10 +14,27 @@ import {
 
 import { SourceDto } from '../models/api.model';
 import { UNTITLED_CONVERSATION } from '../models/conversation.model';
-import { SourceReference } from '../models/message.model';
+import {
+  AnswerStatus,
+  MIN_MESSAGE_LENGTH,
+  ResolvedAnswer,
+  SourceReference,
+  toKnownAnswerStatus,
+} from '../models/message.model';
 import { ApiError, ApiService, STREAM_INCOMPLETE_MESSAGE } from './api.service';
 import { ConversationService } from './conversation.service';
 import { IdentityService } from './identity.service';
+
+/**
+ * What the closing event settled on.
+ *
+ * The backend's own `status` when it is one this app knows, and `answered` only as
+ * the fallback for a deployment predating it — where `answered` is still the only
+ * signal on the wire and un-answered has to mean the not-found card.
+ */
+function toAnswerStatus(event: { status: string; answered: boolean }): AnswerStatus {
+  return toKnownAnswerStatus(event.status) ?? (event.answered ? 'answered' : 'not-found');
+}
 
 /**
  * Owns the open conversation while a question is in flight: what is being asked,
@@ -38,6 +55,15 @@ export class ChatService {
   private readonly destroyRef = inject(DestroyRef);
 
   private readonly askingState = signal(false);
+
+  /**
+   * Why the last correction failed, and null when none has.
+   *
+   * Held here rather than in the bubble because the failure is about the correction,
+   * not about one bubble: the bubble that was being edited is still on screen with
+   * its original wording, and the reader needs to be told why nothing happened.
+   */
+  private readonly editNoticeState = signal<string | null>(null);
 
   /**
    * True between the backend saying the answer is being written and its first
@@ -157,6 +183,68 @@ export class ChatService {
       )
       .subscribe();
   }
+
+  /**
+   * Corrects a question already asked, and asks it again.
+   *
+   * The backend stores the new wording and removes the answer that was generated from
+   * the old one — an answer to different words is not an answer to these. Asking the
+   * corrected text again is what leaves the reader with something to read: without
+   * it the edit would silently remove an answer and offer nothing in its place.
+   *
+   * The question keeps its own id and the answer is appended under it, so the
+   * exchange is corrected in place rather than becoming a second question below the
+   * first. A failure leaves the original wording on screen: a half-applied correction
+   * is worse than none, because the reader would be looking at words the backend
+   * never stored.
+   */
+  editQuestion(messageId: string, content: string): void {
+    const conversationId = this.conversations.activeId();
+    const trimmed = content.trim();
+
+    if (!conversationId || this.askingState() || trimmed.length < MIN_MESSAGE_LENGTH) {
+      return;
+    }
+
+    const original = this.conversations.messageAt(messageId)?.text ?? '';
+    const answerId = this.conversations.appendAnswer();
+
+    this.editNoticeState.set(null);
+
+    this.askingState.set(true);
+    this.preparingState.set(false);
+
+    this.api
+      .editMessage(conversationId, messageId, this.identity.clientId(), trimmed)
+      .pipe(
+        switchMap(() => {
+          // Applied only once the backend has the new wording, and in the same tick
+          // the answer slot is filled, so the reader never sees an edited question
+          // sitting above a spinner that belongs to the previous exchange.
+          this.conversations.applyEdit(messageId, trimmed);
+          this.conversations.removeAnswerTo(messageId);
+
+          return this.dispatch(conversationId, answerId, trimmed);
+        }),
+        catchError((error: unknown) => {
+          // Undo the answer slot and put the original words back.
+          this.conversations.removeExchange(answerId);
+          this.conversations.applyEdit(messageId, original);
+          this.editNoticeState.set(this.describeFailure(error));
+
+          return of(null);
+        }),
+        finalize(() => {
+          this.askingState.set(false);
+          this.preparingState.set(false);
+        }),
+        takeUntilDestroyed(this.destroyRef),
+      )
+      .subscribe();
+  }
+
+  /** Why the last correction was refused, for the thread to show above it. */
+  readonly editNotice = this.editNoticeState.asReadonly();
 
   /**
    * Asks a failed exchange's question again.
@@ -285,11 +373,7 @@ export class ChatService {
    * empty answer: a connection dropped mid-answer has produced no answer, and
    * reporting it as "not found in the documents" would blame the corpus for it.
    */
-  private stream(
-    conversationId: string,
-    question: string,
-    messageId: string,
-  ): Observable<{ text: string; status: 'answered' | 'not-found'; sources: SourceReference[] }> {
+  private stream(conversationId: string, question: string, messageId: string): Observable<ResolvedAnswer> {
     return this.api.sendMessage(conversationId, this.identity.clientId(), question).pipe(
       reduce(
         (answer, event) => {
@@ -322,13 +406,17 @@ export class ChatService {
             throw new ApiError(event.detail, 0, true);
           }
 
+          // `done` replaces whatever the deltas wrote. The model can finish by
+          // declining the question after all, and the text on screen until this
+          // point is then not the answer at all.
           return {
             text: event.answer,
-            status: event.answered ? ('answered' as const) : ('not-found' as const),
+            status: toAnswerStatus(event),
             sources: event.sources.map((dto) => this.toSource(dto)),
+            confidence: event.confidence ?? null,
           };
         },
-        null as { text: string; status: 'answered' | 'not-found'; sources: SourceReference[] } | null,
+        null as ResolvedAnswer | null,
       ),
       mergeMap((answer) =>
         answer === null ? throwError(() => new ApiError(STREAM_INCOMPLETE_MESSAGE, 0, true)) : of(answer),

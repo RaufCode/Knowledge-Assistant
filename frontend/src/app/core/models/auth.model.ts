@@ -77,7 +77,23 @@ export interface CsrfResponseDto {
  * enforces rather than the rule itself. Kept next to the model it belongs to so
  * the two cannot drift apart without that being obvious.
  */
-export const MIN_PASSWORD_LENGTH = 6;
+export const MIN_PASSWORD_LENGTH = 8;
+
+/**
+ * The longest password the backend will store, mirrored here.
+ *
+ * Present because the length policy was checked at one end only. A password past
+ * this was accepted by the form and then refused by the server, which is the worst
+ * way to find out: the round trip reports a rejection the form said was fine.
+ */
+export const MAX_PASSWORD_LENGTH = 128;
+
+/**
+ * The longest name the backend will store, for the same reason.
+ *
+ * `NameStr` on the backend caps this at 120; nothing in the form did.
+ */
+export const MAX_NAME_LENGTH = 120;
 
 /** The company domain an address has to be in, for the hint on the login screen. */
 export const COMPANY_EMAIL_DOMAIN = 'acmetech.example';

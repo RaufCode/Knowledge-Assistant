@@ -2,20 +2,49 @@ import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable, catchError, map, throwError, timeout } from 'rxjs';
 
-import { API_BASE_URL, API_TIMEOUT_MS } from '../api.config';
+import { ConfigService } from '../config.service';
+import { API_TIMEOUT_MS } from '../api.config';
 import {
   ChatStreamEventDto,
   ConversationCreateResponse,
   ConversationDetailResponse,
   ConversationListResponse,
   ConversationSummaryDto,
+  MessageDto,
   MessageSendRequest,
   SourceDto,
   parseUtcTimestamp,
 } from '../models/api.model';
 import { Conversation, ConversationThread } from '../models/conversation.model';
-import { Message, SourceReference, countDocuments } from '../models/message.model';
+import {
+  AnswerStatus,
+  Message,
+  SourceReference,
+  countDocuments,
+  toKnownAnswerStatus,
+} from '../models/message.model';
 import { AuthService, CSRF_HEADER } from './auth.service';
+
+/**
+ * How a stored message should be rendered.
+ *
+ * The backend records the outcome on the row, so this is read rather than guessed,
+ * and a conversation reopened tomorrow draws the same cards it did when it was
+ * being answered.
+ *
+ * Two fallbacks, both about rows that predate the field. A question carries no
+ * outcome at all and is never anything but answered, and an assistant row with no
+ * recorded status and no citations is a miss — which is all the evidence such a row
+ * has, and is why those older threads may draw a greeting as a not-found until they
+ * are asked again.
+ */
+function toAnswerStatus(dto: MessageDto): AnswerStatus {
+  if (dto.role === 'user') {
+    return 'answered';
+  }
+
+  return toKnownAnswerStatus(dto.status) ?? (dto.sources?.length ? 'answered' : 'not-found');
+}
 
 /** An error from the backend, already reduced to something a view can show. */
 export class ApiError extends Error {
@@ -54,6 +83,7 @@ export const STREAM_INCOMPLETE_MESSAGE =
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
+  private readonly config = inject(ConfigService);
 
   /**
    * The session lives in cookies, so every call has to be allowed to carry them.
@@ -65,6 +95,10 @@ export class ApiService {
   private readonly credentials = { withCredentials: true } as const;
 
   private readonly auth = inject(AuthService);
+
+  private get baseUrl(): string {
+    return this.config.getApiBaseUrl();
+  }
 
   /**
    * `POST /api/conversations`. Opens a conversation for this client.
@@ -90,11 +124,15 @@ export class ApiService {
     return this.get<string[]>('/documents');
   }
 
-  /** `GET /api/conversations`. Every conversation this client owns, newest first. */
-  getConversations(clientId: string): Observable<Conversation[]> {
-    const path = `/api/conversations?client_id=${encodeURIComponent(clientId)}`;
-
-    return this.get<ConversationListResponse>(path).pipe(
+  /**
+   * `GET /api/conversations`. Every conversation this account owns, newest first.
+   *
+   * No `client_id`, and deliberately: the backend scopes the list by the account in
+   * the session, so a person's threads follow them to another browser and cannot be
+   * widened by anything sent from here.
+   */
+  getConversations(): Observable<Conversation[]> {
+    return this.get<ConversationListResponse>('/api/conversations').pipe(
       map((response) => response.conversations.map((dto) => this.toConversation(dto))),
     );
   }
@@ -103,12 +141,11 @@ export class ApiService {
    * `GET /api/conversations/{id}`. One conversation's whole thread, oldest first.
    *
    * Ordered oldest first by the backend, which is the order a conversation reads
-   * in, so it is used as it arrives.
+   * in, so it is used as it arrives. Ownership is the account's, so nothing is sent
+   * to widen it.
    */
-  getConversation(conversationId: string, clientId: string): Observable<ConversationThread> {
-    const path =
-      `/api/conversations/${encodeURIComponent(conversationId)}` +
-      `?client_id=${encodeURIComponent(clientId)}`;
+  getConversation(conversationId: string): Observable<ConversationThread> {
+    const path = `/api/conversations/${encodeURIComponent(conversationId)}`;
 
     return this.get<ConversationDetailResponse>(path).pipe(
       map((response) => ({
@@ -156,13 +193,31 @@ export class ApiService {
     return this.patch<void>(path, { client_id: clientId, title }).pipe(map(() => undefined));
   }
 
-  /** `DELETE /api/conversations/{id}`. Removes a conversation and its messages. */
-  deleteConversation(conversationId: string, clientId: string): Observable<void> {
+  /**
+   * `PATCH /api/conversations/{id}/messages/{message_id}`. Corrects a question.
+   *
+   * The backend removes the answer that was generated from the old wording and
+   * returns the corrected question; the caller is expected to ask it again, so what
+   * the reader ends up looking at was written for the words on screen.
+   */
+  editMessage(
+    conversationId: string,
+    messageId: string,
+    clientId: string,
+    content: string,
+  ): Observable<MessageDto> {
     const path =
       `/api/conversations/${encodeURIComponent(conversationId)}` +
-      `?client_id=${encodeURIComponent(clientId)}`;
+      `/messages/${encodeURIComponent(messageId)}`;
 
-    return this.send(this.http.delete<void>(`${API_BASE_URL}${path}`, this.credentials)).pipe(
+    return this.patch<MessageDto>(path, { client_id: clientId, content });
+  }
+
+  /** `DELETE /api/conversations/{id}`. Removes a conversation and its messages. */
+  deleteConversation(conversationId: string): Observable<void> {
+    const path = `/api/conversations/${encodeURIComponent(conversationId)}`;
+
+    return this.send(this.http.delete<void>(`${this.baseUrl}${path}`, this.credentials)).pipe(
       map(() => undefined),
     );
   }
@@ -248,7 +303,7 @@ export class ApiService {
   ): Promise<Response> {
     try {
       return await fetch(
-        `${API_BASE_URL}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
+        `${this.baseUrl}/api/conversations/${encodeURIComponent(conversationId)}/messages`,
         {
           method: 'POST',
           headers: {
@@ -312,17 +367,17 @@ export class ApiService {
    * which is a request that cannot fail loudly.
    */
   private get<T>(path: string): Observable<T> {
-    return this.send(this.http.get<T>(`${API_BASE_URL}${path}`, this.credentials));
+    return this.send(this.http.get<T>(`${this.baseUrl}${path}`, this.credentials));
   }
 
   /** A POST against a path, with the timeout and the error mapping applied. */
   private post<T>(path: string, body: unknown): Observable<T> {
-    return this.send(this.http.post<T>(`${API_BASE_URL}${path}`, body, this.credentials));
+    return this.send(this.http.post<T>(`${this.baseUrl}${path}`, body, this.credentials));
   }
 
   /** A PATCH against a path, with the timeout and the error mapping applied. */
   private patch<T>(path: string, body: unknown): Observable<T> {
-    return this.send(this.http.patch<T>(`${API_BASE_URL}${path}`, body, this.credentials));
+    return this.send(this.http.patch<T>(`${this.baseUrl}${path}`, body, this.credentials));
   }
 
   /** Applies the request timeout and flattens transport failures into `ApiError`. */
@@ -342,7 +397,7 @@ export class ApiService {
     };
   }
 
-  /**
+/**
    * A wire message as the domain shape.
    *
    * `sources` is null on a question, which cites nothing, so it becomes an empty
@@ -350,13 +405,7 @@ export class ApiService {
    * status is derived here rather than stored: a message that is in the backend is
    * finished, and only a locally streamed one is still pending or has failed.
    */
-  private toMessage(dto: {
-    id: string;
-    role: 'user' | 'assistant';
-    content: string;
-    sources: SourceDto[] | null;
-    created_at: string;
-  }): Message {
+  private toMessage(dto: MessageDto): Message {
     const sources = (dto.sources ?? []).map((source) => this.toSource(source));
 
     return {
@@ -364,12 +413,10 @@ export class ApiService {
       role: dto.role,
       text: dto.content,
       createdAt: parseUtcTimestamp(dto.created_at),
-      // A message in the backend has been delivered, so it is never pending and
-      // never failed. Those two states belong to an answer being streamed here, and
-      // a question carries no outcome at all.
-      status: 'answered',
+      status: toAnswerStatus(dto),
       sources,
       documentCount: countDocuments(sources),
+      confidence: dto.confidence ?? null,
     };
   }
 
@@ -398,10 +445,22 @@ export class ApiService {
    */
   private toApiError(error: unknown): ApiError {
     if (error instanceof HttpErrorResponse) {
-      const detail = this.readValidationDetail(error.error);
+      const detail = this.readBackendDetail(error.error);
 
-      if (error.status === 422 && detail) {
-        return new ApiError(detail, 422, false);
+      // The backend's own wording, for any status that carries one.
+      //
+      // It is written for the person who hit it and says what to do next — "That
+      // address already has an account", "Only your own questions can be edited" —
+      // so replacing it with a generic sentence throws away the only part of the
+      // failure the reader can act on. This used to apply to 422 alone, which meant a
+      // 409's reason was read from a property `ApiError` does not have and was
+      // therefore always lost.
+      //
+      // Status 0 and 5xx are the deliberate exceptions: there is no server wording
+      // worth showing for a request that never arrived or failed inside the backend,
+      // and a raw traceback is not something to put in front of anybody.
+      if (detail && error.status !== 0 && error.status < 500) {
+        return new ApiError(detail, error.status, error.status >= 500);
       }
 
       if (error.status === 0) {
@@ -434,8 +493,19 @@ export class ApiService {
     return new ApiError('Something went wrong. Please try again.', 0, true);
   }
 
-  /** The first human readable message out of a FastAPI 422 body, if there is one. */
-  private readValidationDetail(body: unknown): string | null {
+  /**
+ * What the backend said went wrong, as a sentence.
+ *
+ * Handles both shapes a FastAPI failure arrives in: a plain `detail` string, which is
+ * what an `HTTPException` carries, and the `detail` array a validation failure
+ * produces, where the first entry's `msg` is the sentence.
+ *
+ * A 401 on a session check is deliberately not read. The backend sends "Sign in to
+ * continue" and "Your session has ended. Please sign in again." on purpose, and
+ * neither belongs in an error the interceptor is about to resolve by refreshing —
+ * surfacing them would flash a message at somebody whose next request succeeds.
+ */
+  private readBackendDetail(body: unknown): string | null {
     if (typeof body !== 'object' || body === null || !('detail' in body)) {
       return null;
     }

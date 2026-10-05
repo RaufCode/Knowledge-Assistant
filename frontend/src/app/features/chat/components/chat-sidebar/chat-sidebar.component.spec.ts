@@ -3,6 +3,7 @@ import { provideHttpClientTesting } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { Router, provideRouter } from '@angular/router';
 
+import { ConversationService } from '../../../../core/services/conversation.service';
 import { AuthServiceStub, provideAuthStub } from '../../../../core/testing/auth-service.stub';
 import { ChatSidebarComponent } from './chat-sidebar.component';
 
@@ -53,8 +54,12 @@ describe('ChatSidebarComponent', () => {
         provideRouter([
           { path: 'login', children: [] },
           { path: '', children: [] },
+          { path: 'ask', children: [] },
+          { path: 'response', children: [] },
           { path: 'admin', children: [] },
           { path: 'admin/documents', children: [] },
+          { path: 'admin/users', children: [] },
+          { path: 'admin/access', children: [] },
         ]),
         provideHttpClient(),
         provideHttpClientTesting(),
@@ -85,11 +90,15 @@ describe('ChatSidebarComponent', () => {
     // Switching between running the knowledge base and using it happens as often as
     // signing in, so it is a row of its own rather than something behind a profile
     // menu. It sits directly above the account, on the other side of the rule.
+    //
+    // `/ask` rather than `/`: the app's front door turns an administrator away to
+    // the dashboard, so a link to the assistant pointing there would bounce them
+    // straight back. `/ask` is the route that reaches it.
     const ask = Array.from(element().querySelectorAll('a')).find(
       (link) => link.textContent?.trim() === 'Ask',
     ) as HTMLAnchorElement;
 
-    expect(ask?.getAttribute('href')).toBe('/');
+    expect(ask?.getAttribute('href')).toBe('/ask');
 
     const switchRow = ask?.closest('div');
     const accountRow = element().querySelector('button[aria-label="Account menu"]');
@@ -102,11 +111,19 @@ describe('ChatSidebarComponent', () => {
     (accountRow as HTMLButtonElement).click();
     await render();
 
-    const labels = Array.from(element().querySelectorAll('[role="menuitem"]')).map((item) =>
+    // Scoped to the account card. A bare `[role="menuitem"]` across the whole
+    // component also matches the dialogs, which carry the same roles and have their
+    // own items in them.
+    const card = element().querySelector('[role="menu"]') as HTMLElement;
+    const labels = Array.from(card.querySelectorAll('[role="menuitem"]')).map((item) =>
       item.textContent?.trim(),
     );
 
-    expect(labels).toEqual(['Sign out']);
+    // Changing your own password is offered from the account card, so it does not
+    // require finding yourself in a list of other people first.
+    // Changing your own password is offered from the account card, so it does not
+    // require finding yourself in a list of other people first.
+    expect(labels).toEqual(['Change password', 'Sign out']);
   });
 
   it('offers the way back while in the assistant, from the same row', async () => {
@@ -151,13 +168,13 @@ describe('ChatSidebarComponent', () => {
     expect(labels).not.toContain('Ask');
   });
 
-  it('offers an administrator the three destinations, and nothing else', async () => {
+  it('offers an administrator the four destinations, and nothing else', async () => {
     auth.setRole('admin');
     await render('/admin');
 
     expect(adminLink('Dashboard')).toBe('/admin');
     expect(adminLink('Documents')).toBe('/admin/documents');
-    expect(adminLink('Add a user')).toBe('/admin/invite');
+    expect(adminLink('Users')).toBe('/admin/users');
 
     // Question logs and access requests still resolve, but neither is offered: the
     // sidebar is the only navigation there is, so a screen reachable only by typing
@@ -166,7 +183,7 @@ describe('ChatSidebarComponent', () => {
       element().querySelectorAll('nav[aria-label="Administration"] a'),
     ).map((link) => link.textContent?.trim());
 
-    expect(labels).toEqual(['Dashboard', 'Documents', 'Add a user']);
+    expect(labels).toEqual(['Dashboard', 'Documents', 'Users']);
   });
 
   it('names the person, because the name is what opens the account card', async () => {
@@ -200,6 +217,77 @@ describe('ChatSidebarComponent', () => {
     expect(card?.textContent).toContain('ama.konadu@acmetech.example');
   });
 
+  it('keeps Users lit up on the access queue, which belongs to it', async () => {
+    // The queue is reached from the users screen and lives at its own address, so
+    // prefix matching on `/admin/users` alone left the section looking unselected
+    // while the page on screen was the queue of people waiting to join it.
+    auth.setRole('admin');
+    await render('/admin/access');
+
+    const sidebar = fixture.componentInstance as unknown as {
+      adminNav: { label: string }[];
+      isNavItemActive: (item: unknown) => boolean;
+    };
+    const users = sidebar.adminNav.find((item) => item.label === 'Users') as unknown;
+    const dashboard = sidebar.adminNav.find((item) => item.label === 'Dashboard') as unknown;
+
+    expect(sidebar.isNavItemActive(users)).toBe(true);
+    // And nothing else alongside it: two lit items would say two places at once.
+    expect(sidebar.isNavItemActive(dashboard)).toBe(false);
+  });
+
+  it('does not light the overview for every administration page', async () => {
+    // `/admin` was exact before, and must stay exact: otherwise three items are lit
+    // at once and the highlight stops saying where you are.
+    auth.setRole('admin');
+    await render('/admin/documents');
+
+    // Asked of the component rather than read back off the anchors. The decision is
+    // what is being tested, and reading classes back out of the DOM would also be
+    // asserting that Angular had flushed a change-detection pass, which is a
+    // different thing and not this test's business.
+    const sidebar = fixture.componentInstance as unknown as {
+      adminNav: { label: string }[];
+      isNavItemActive: (item: unknown) => boolean;
+    };
+    const isActive = (label: string): boolean =>
+      sidebar.isNavItemActive(
+        sidebar.adminNav.find((item) => item.label === label) as unknown,
+      );
+
+    expect(isActive('Dashboard')).toBe(false);
+    expect(isActive('Documents')).toBe(true);
+    expect(isActive('Users')).toBe(false);
+  });
+
+  it('highlights the conversation that is open, and only that one', async () => {
+    // The highlight and the destination of a new question come from the same value.
+    // They used to be computed differently — the row from the route, the question
+    // from the open conversation — which is how a row could be lit for a conversation
+    // nothing was being added to.
+    auth.setRole('admin');
+    await render();
+
+    const conversations = TestBed.inject(ConversationService);
+    const sidebar = fixture.componentInstance as unknown as {
+      isActive: (id: string) => boolean;
+    };
+
+    conversations.openConversation('c2');
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    expect(sidebar.isActive('c2')).toBe(true);
+    expect(sidebar.isActive('c1')).toBe(false);
+
+    // Nothing open, so nothing lit. A blank window says so when it is built, rather
+    // than the sidebar hiding a disagreement it did not cause.
+    conversations.startUnsaved();
+    fixture.detectChanges();
+
+    expect(sidebar.isActive('c2')).toBe(false);
+  });
+
   it('closes the account card when the page outside it is clicked', async () => {
     auth.setRole('admin');
     await render();
@@ -208,12 +296,27 @@ describe('ChatSidebarComponent', () => {
     await render();
     expect(element().querySelector('[role="menu"]')).not.toBeNull();
 
-    // The overlay rather than a document listener, so the click that opened the card
-    // cannot also be the one that closes it.
-    (element().querySelector('button[aria-hidden="true"]') as HTMLButtonElement).click();
+    // A real click on the document, from outside the sidebar entirely. The catcher
+    // listens on the document rather than on an overlay element, because an overlay
+    // inside the sidebar is clipped to the sidebar and cannot reach the chat area.
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await render();
 
     expect(element().querySelector('[role="menu"]')).toBeNull();
+  });
+
+  it('keeps the account card open when the click is inside it', async () => {
+    auth.setRole('admin');
+    await render();
+
+    (element().querySelector('button[aria-label="Account menu"]') as HTMLButtonElement).click();
+    await render();
+
+    const card = element().querySelector('[role="menu"]') as HTMLElement;
+    card.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await render();
+
+    expect(element().querySelector('[role="menu"]')).not.toBeNull();
   });
 
   it('closes the account card on Escape, which works from anywhere on the page', async () => {

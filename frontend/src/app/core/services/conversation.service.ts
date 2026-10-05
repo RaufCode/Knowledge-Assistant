@@ -13,7 +13,7 @@ import { Observable, ReplaySubject, catchError, map, of, shareReplay, tap } from
 
 import { toDateBucket, type DateBucket } from '../../shared/utils/format-date.util';
 import { Conversation } from '../models/conversation.model';
-import { Message } from '../models/message.model';
+import { Message, ResolvedAnswer } from '../models/message.model';
 import { ApiError, ApiService } from './api.service';
 import { AuthService, type AuthStatus } from './auth.service';
 import { IdentityService } from './identity.service';
@@ -146,9 +146,20 @@ export class ConversationService {
   /** True when this browser has at least one conversation. */
   readonly hasConversations = computed(() => this.conversationsState().length > 0);
 
-  /** True when a search is active and matched nothing. */
+  /**
+   * True when a search is active and matched nothing.
+   *
+   * Requires there to be something to have matched. With no conversations at all, a
+   * search term matched nothing because there was nothing to match, and the list
+   * would otherwise swap "No conversations yet. Ask one to get started." for "No
+   * conversations match your search." — telling somebody who has not asked anything
+   * yet that their search failed, and offering them nothing to search.
+   */
   readonly hasNoResults = computed(
-    () => this.searchTermState().trim().length > 0 && this.filteredConversations().length === 0,
+    () =>
+      this.searchTermState().trim().length > 0 &&
+      this.conversationsState().length > 0 &&
+      this.filteredConversations().length === 0,
   );
 
   /**
@@ -265,7 +276,7 @@ export class ConversationService {
     this.loadingState.set(true);
 
     this.api
-      .getConversations(this.identity.clientId())
+      .getConversations()
       .pipe(
         catchError((error: unknown) => {
           console.error('Could not load conversations', error);
@@ -294,6 +305,12 @@ export class ConversationService {
         // list and the thread come back independently, and opening the most recent
         // here unconditionally would replace the conversation a refresh was showing
         // with a different one, which is the same as losing it.
+        //
+        // Only when the route named one. Landing on the ask screen with no
+        // conversation in the URL is asking for a blank window, and quietly
+        // selecting the newest conversation made its row carry the active colour
+        // while a different — empty — window was on screen. The highlight says
+        // "this is the one you are reading", and on a fresh window none of them is.
         if (this.activeIdState() === null) {
           this.openConversation(mostRecent.id);
         }
@@ -382,7 +399,7 @@ export class ConversationService {
    */
   refreshSummaries(): void {
     this.api
-      .getConversations(this.identity.clientId())
+      .getConversations()
       .pipe(
         catchError((error: unknown) => {
           console.error('Could not refresh conversations', error);
@@ -415,7 +432,7 @@ export class ConversationService {
     this.missingState.set(null);
 
     this.api
-      .getConversation(conversationId, this.identity.clientId())
+      .getConversation(conversationId)
       .pipe(
         catchError((error: unknown) => {
           // A conversation that is gone is not worth retrying, and it is not worth
@@ -482,6 +499,7 @@ export class ConversationService {
         status: 'answered',
         sources: [],
         documentCount: 0,
+        confidence: null,
       },
       {
         id: `${pairId}-assistant`,
@@ -491,6 +509,7 @@ export class ConversationService {
         status: 'pending',
         sources: [],
         documentCount: 0,
+        confidence: null,
       },
     ]);
 
@@ -510,16 +529,14 @@ export class ConversationService {
    * it. A message that never gets that far is left with none, which is honest: an
    * answer that was interrupted was never shown to be grounded in anything.
    */
-  resolveMessage(
-    messageId: string,
-    answer: { text: string; status: 'answered' | 'not-found'; sources: Message['sources'] },
-  ): void {
+  resolveMessage(messageId: string, answer: ResolvedAnswer): void {
     this.patchMessage(messageId, (message) => ({
       ...message,
       text: answer.text,
       status: answer.status,
       sources: answer.sources,
       documentCount: new Set(answer.sources.map((source) => source.document)).size,
+      confidence: answer.confidence,
     }));
   }
 
@@ -535,6 +552,7 @@ export class ConversationService {
       status: 'failed',
       sources: [],
       documentCount: 0,
+      confidence: null,
     }));
   }
 
@@ -546,12 +564,76 @@ export class ConversationService {
       status: 'pending',
       sources: [],
       documentCount: 0,
+      confidence: null,
     }));
   }
 
   /** The message with an id, or undefined when it is not in the open thread. */
   messageAt(messageId: string): Message | undefined {
     return this.messagesState().find((message) => message.id === messageId);
+  }
+
+  /**
+   * Adds an answer slot under a question that is already on screen.
+   *
+   * `appendExchange` cannot be used for this: it adds a question of its own, and a
+   * corrected question has already been written. The exchange is then a question the
+   * reader can see and an answer arriving under it, which is the pair the thread
+   * renders everywhere else.
+   */
+  appendAnswer(): string {
+    const id = `${newLocalId()}-assistant`;
+
+    this.messagesState.update((messages) => [
+      ...messages,
+      {
+        id,
+        role: 'assistant',
+        text: '',
+        createdAt: new Date().toISOString(),
+        status: 'pending',
+        sources: [],
+        documentCount: 0,
+        confidence: null,
+      },
+    ]);
+
+    return id;
+  }
+
+  /**
+   * Writes a corrected question onto the message already showing it.
+   *
+   * The id is kept, so the thread is not rebuilt around it and the reader's position
+   * in the conversation survives. Only the words change.
+   */
+  applyEdit(messageId: string, content: string): void {
+    this.patchMessage(messageId, (message) => ({ ...message, text: content }));
+  }
+
+  /**
+   * Drops the assistant messages answering one question.
+   *
+   * The mirror of what the backend does when a question is edited, so the thread on
+   * screen matches what was stored without a refetch: the answer to the old wording
+   * is removed, and a follow-up asked after it is left alone.
+   */
+  removeAnswerTo(messageId: string): void {
+    this.messagesState.update((messages) => {
+      const index = messages.findIndex((message) => message.id === messageId);
+
+      if (index === -1) {
+        return messages;
+      }
+
+      let end = index + 1;
+
+      while (end < messages.length && messages[end].role === 'assistant') {
+        end += 1;
+      }
+
+      return [...messages.slice(0, index + 1), ...messages.slice(end)];
+    });
   }
 
   /**
@@ -625,7 +707,7 @@ export class ConversationService {
     this.forget(conversationId);
 
     this.api
-      .deleteConversation(conversationId, this.identity.clientId())
+      .deleteConversation(conversationId)
       .pipe(
         catchError((error: unknown) => {
           console.error('Could not delete the conversation', error);

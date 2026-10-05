@@ -8,7 +8,6 @@ import { QuestionInputComponent } from '../../features/ask/components/question-i
 import { ViewHeaderComponent } from '../../features/chat/components/view-header/view-header.component';
 import { AnswerPendingComponent } from '../../features/response/components/answer-pending/answer-pending.component';
 import { ChatThreadComponent } from '../../features/response/components/chat-thread/chat-thread.component';
-import { SkeletonComponent } from '../../shared/components/skeleton/skeleton.component';
 
 /**
  * Shows one conversation: its whole thread and the composer for follow-up
@@ -26,7 +25,6 @@ import { SkeletonComponent } from '../../shared/components/skeleton/skeleton.com
     AnswerPendingComponent,
     ChatThreadComponent,
     QuestionInputComponent,
-    SkeletonComponent,
     ViewHeaderComponent,
   ],
   host: { class: 'flex min-h-0 flex-1 flex-col' },
@@ -36,29 +34,22 @@ import { SkeletonComponent } from '../../shared/components/skeleton/skeleton.com
     <app-view-header [title]="chat.threadTitle()" />
 
     @if (chat.isResolving()) {
-      <!-- A conversation is on its way, so the placeholder is shaped like one: the
-           question that was asked above the answer card that is arriving. This is
-           the same skeleton a pending answer uses, because a refresh and a slow
-           answer are the same wait from the reader's side. Nothing here is a real
-           message, so it is hidden from assistive tech and the live region says
-           what is happening once. -->
-      <div class="mx-auto w-full max-w-thread flex-1 space-y-5 px-4 py-6 sm:px-6 lg:px-8">
-        <!--
-          Shaped from MessageBubbleComponent: the same rounded-br-sm corner, the same
-          padding, and a bar the height of one line of body text. The old placeholder
-          used the top-right corner and a muted fill, so the real bubble arrived with a
-          different shape and a different colour and the page visibly corrected itself.
-        -->
-        <div class="flex justify-end" aria-hidden="true">
-          <div class="max-w-[320px] rounded-lg rounded-br-sm bg-primary/15 px-4 py-3">
-            <app-skeleton class="h-5 w-full rounded bg-primary/25" />
-          </div>
+      <!--
+        A conversation is on its way. One card saying so, rather than a skeleton of a
+        question above a skeleton of an answer: nothing here is being read or worked
+        out, so the card says the true thing instead of imitating work.
+
+        The wording is overridden because this wait is a fetch, not a question being
+        answered, and "Thinking" would claim work that is not happening.
+      -->
+      <div class="mx-auto w-full max-w-thread flex-1 px-4 py-6 sm:px-6 lg:px-8">
+        <div class="max-w-[520px]">
+          <app-answer-pending
+            label="Loading conversation"
+            announcement="Loading this conversation."
+          />
         </div>
-
-        <app-answer-pending />
       </div>
-
-      <span class="sr-only" role="status">Loading this conversation.</span>
     } @else if (chat.isMissing()) {
       <!-- A link to a conversation that is gone: deleted, or belonging to another
            client. Said plainly, rather than as an empty thread, which would read
@@ -82,8 +73,9 @@ import { SkeletonComponent } from '../../shared/components/skeleton/skeleton.com
       <app-chat-thread
         [messages]="chat.messages()"
         [isBusy]="chat.isLoading()"
-        [isPreparing]="chat.isPreparing()"
+        [canEdit]="!chat.isLoading()"
         (retry)="onRetry($event)"
+        (edited)="onEdited($event)"
       />
     }
 
@@ -134,5 +126,16 @@ export class ResponseViewComponent {
   /** Asks a failed message's question again. */
   protected onRetry(messageId: string): void {
     this.chat.retry(messageId);
+  }
+
+  /**
+   * Corrects a question and asks it again.
+   *
+   * The service owns the sequence — store the correction, drop the answer written for
+   * the old wording, ask the new one — because getting that order wrong would leave
+   * the thread showing an answer to words that are no longer on screen.
+   */
+  protected onEdited(edit: { id: string; content: string }): void {
+    this.chat.editQuestion(edit.id, edit.content);
   }
 }
