@@ -55,7 +55,7 @@ describe('apiProxy', () => {
     upstreamOrigin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
 
     const app = express();
-    app.use(apiProxy('/api', new URL(upstreamOrigin)));
+    app.use(apiProxy('/api', () => new URL(upstreamOrigin)));
     app.get('/login', (_req, res) => res.sendStatus(200));
 
     front = createServer(app);
@@ -165,6 +165,32 @@ describe('apiProxy', () => {
 });
 
 describe('apiOrigin', () => {
+  it('is not consulted until a request actually needs it', () => {
+    // The deployment that matters does not use this proxy at all: the browser calls
+    // the backend directly, named in `config.json`. Resolving `API_ORIGIN` when the
+    // handler was built meant a production deployment with no proxy configured and
+    // no `API_ORIGIN` threw during startup, so the server never booted and the whole
+    // app was down over a feature it was not using.
+    const app = express();
+    app.use(
+      apiProxy('/api', () => {
+        throw new Error('API_ORIGIN is not set');
+      }),
+    );
+
+    expect(() => app.listen(0)).not.toThrow();
+  });
+
+  it('reports the problem when a request really does need it', () => {
+    const handler = apiProxy('/api', () => {
+      throw new Error('API_ORIGIN is not set');
+    });
+
+    expect(() =>
+      handler({ url: '/api/auth/me', headers: {} } as never, {} as never, () => {}),
+    ).toThrow(/API_ORIGIN is not set/);
+  });
+
   it('defaults to the port the rest of the project runs the backend on', () => {
     // 8000: the README, every curl example and the backend's Dockerfile. This said
     // 8099 for a while, which was what the frontend had hardcoded before the API

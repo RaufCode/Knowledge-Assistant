@@ -7,7 +7,7 @@ import {
 import express from 'express';
 import { join } from 'node:path';
 
-import { apiOrigin, apiProxy } from './server/api-proxy';
+import { apiProxy } from './server/api-proxy';
 
 const browserDistFolder = join(import.meta.dirname, '../browser');
 
@@ -32,14 +32,14 @@ const angularApp = new AngularNodeAppEngine({
  * the session" on others, depending only on how that browser treats cookies it
  * did not set itself.
  *
- * `API_ORIGIN` says where the backend is. It defaults to the local one, and on
- * Render it is set in the blueprint.
- *
- * Mounted without an Express path prefix on purpose: `app.use('/api', …)` rewrites
- * `req.url` to what follows the mount, which would send `/auth/login` to a backend
- * that routes on `/api/auth/login`.
+ * `API_ORIGIN` says where the backend is, and is only needed by this: the browser
+ * calls the backend on its own origin by default, named in `config.json`. It is
+ * resolved when a request needs it rather than here, because a deployment that does
+ * not use the proxy has no reason to have it — and reading it at startup took the
+ * whole app down with `API_ORIGIN is not set` on every request path, including the
+ * sign-in screen.
  */
-app.use(apiProxy('/api', apiOrigin()));
+app.use(apiProxy('/api'));
 
 /**
  * Serve static files from /browser

@@ -110,8 +110,7 @@ export function apiOrigin(env: NodeJS.ProcessEnv = process.env): URL {
   return parsed;
 }
 
-/**
- * Builds the handler that forwards `prefix` to the backend.
+/** Builds the handler that forwards `prefix` to the backend.
  *
  * `prefix` is matched against the *full* request path rather than used as an Express
  * mount point. `app.use('/api', handler)` rewrites `req.url` to what follows the
@@ -119,11 +118,21 @@ export function apiOrigin(env: NodeJS.ProcessEnv = process.env): URL {
  * `/api/auth/login`, and every call 404s — which reads as the API being down rather
  * than as a path being lost in the proxy.
  *
+ * `resolveOrigin` is called per request rather than once at startup, and that is
+ * deliberate. The default deployment does not use this proxy at all — the browser
+ * calls the backend directly, named in `config.json` — so reading `API_ORIGIN` at
+ * startup meant a deployment with no proxy configured and no `API_ORIGIN` refused to
+ * boot at all, taking the whole app down over a feature it was not using. Resolved
+ * lazily, a missing value can only affect a request that actually needed it.
+ *
  * The query string is left exactly as it arrived, because routes read it.
  */
-export function apiProxy(prefix: string, origin: URL): RequestHandler {
-  const send = origin.protocol === 'https:' ? httpsRequest : httpRequest;
-  const basePath = origin.pathname.replace(/\/$/, '');
+export function apiProxy(
+  prefix: string,
+  resolveOrigin: () => URL = () => apiOrigin(),
+): RequestHandler {
+  let cached: URL | undefined;
+  const origin = (): URL => (cached ??= resolveOrigin());
 
   return (req: IncomingMessage, res: ServerResponse, next: (error?: unknown) => void) => {
     const path = req.url ?? '/';
@@ -133,6 +142,11 @@ export function apiProxy(prefix: string, origin: URL): RequestHandler {
 
       return;
     }
+
+    // Resolved here rather than when this handler was built: see above.
+    const api = origin();
+    const send = api.protocol === 'https:' ? httpsRequest : httpRequest;
+    const basePath = api.pathname.replace(/\/$/, '');
 
     const headers: Record<string, string | string[]> = {};
 
@@ -162,13 +176,13 @@ export function apiProxy(prefix: string, origin: URL): RequestHandler {
     // `ika_csrf` cookie to copy into a header — the cookies are `SameSite=Lax`, so
     // they are not attached to a cross-site write in the first place. The `Origin`
     // check remains in place for anything reaching the backend directly.
-    headers['origin'] = origin.origin;
+    headers['origin'] = api.origin;
 
     const upstream = send(
       {
-        protocol: origin.protocol,
-        hostname: origin.hostname,
-        port: origin.port || (origin.protocol === 'https:' ? 443 : 80),
+        protocol: api.protocol,
+        hostname: api.hostname,
+        port: api.port || (api.protocol === 'https:' ? 443 : 80),
         method: req.method,
         // Taken apart and put back together rather than resolved through `URL`, so
         // that a path carrying its own encoded characters arrives encoded.
