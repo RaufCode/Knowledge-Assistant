@@ -263,14 +263,44 @@ export class LoginViewComponent {
 
     this.auth.login(this.form.controls.email.value, this.form.controls.password.value).subscribe({
       next: (user) => {
-        this.isSubmitting.set(false);
-
         // `null` is the server's "your account exists and is waiting to be approved".
         // A separate screen, because nothing is wrong and a 401 here would send
         // somebody to reset a password that is fine.
-        void this.router.navigate(
-          user === null ? ['/pending-approval'] : [this.returnUrl()],
-        );
+        if (user === null) {
+          this.isSubmitting.set(false);
+          void this.router.navigate(['/pending-approval']);
+
+          return;
+        }
+
+        // Proved before navigating: a correct password is not yet a usable
+        // session, because the session lives in cookies the browser has to keep.
+        // When it does not keep them, navigating in anyway ends seconds later
+        // back on this screen with nothing said — so the check happens here,
+        // where the reason can still be named. A check that never answers is a
+        // backend that cannot be reached, not a session that failed, and the
+        // guards and the data calls ahead say that plainer than this screen can.
+        this.auth.verifySession().subscribe({
+          next: (persists) => {
+            this.isSubmitting.set(false);
+
+            if (persists) {
+              void this.router.navigate([this.returnUrl()]);
+
+              return;
+            }
+
+            this.auth.clear();
+            this.notice.set(
+              'You signed in, but this browser did not keep the session. ' +
+                'Allow cookies for this site and try again.',
+            );
+          },
+          error: () => {
+            this.isSubmitting.set(false);
+            void this.router.navigate([this.returnUrl()]);
+          },
+        });
       },
       error: (error: unknown) => {
         this.isSubmitting.set(false);

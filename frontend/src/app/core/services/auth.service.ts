@@ -1,5 +1,5 @@
 import { isPlatformBrowser } from '@angular/common';
-import { HttpClient } from '@angular/common/http';
+import { HttpBackend, HttpClient } from '@angular/common/http';
 import { Injectable, PLATFORM_ID, computed, inject, signal } from '@angular/core';
 import { Observable, catchError, firstValueFrom, map, of, tap, throwError } from 'rxjs';
 
@@ -90,6 +90,15 @@ export class AuthService {
   private readonly http = inject(HttpClient);
   private readonly isBrowser = isPlatformBrowser(inject(PLATFORM_ID));
   private readonly config = inject(ConfigService);
+
+  /**
+   * The backend without the interceptor.
+   *
+   * Used only for checks that must not trigger session machinery: proving the
+   * cookies round-trip must neither refresh nor end the session it is
+   * inspecting, which is exactly what the interceptor would do with a 401.
+   */
+  private readonly raw = new HttpClient(inject(HttpBackend));
 
   private readonly userState = signal<UserDto | null>(null);
   private readonly statusState = signal<AuthStatus>('unknown');
@@ -297,6 +306,39 @@ export class AuthService {
     }
 
     return user;
+  }
+
+  /**
+   * Proves the session cookies round-trip, right after signing in.
+   *
+   * A successful sign-in only proves the password was right: the session itself
+   * lives in cookies the browser has to keep and send back, and on some setups
+   * it does neither — third-party cookies blocked, for instance. Without this
+   * check the app navigates in as though everything worked and is bounced back
+   * to the sign-in screen seconds later, when the first authenticated call
+   * finds no session to speak of. Emits false in exactly that case, so the
+   * caller can say what is wrong instead of looping.
+   *
+   * Asked past the interceptor on purpose: a refusal here must not refresh or
+   * end the session it is inspecting, which is what the interceptor would do
+   * with it. Anything that is not a refusal — the backend unreachable — is left
+   * for the caller to decide, because a failed check is not a failed session.
+   */
+  verifySession(): Observable<boolean> {
+    if (!this.isBrowser) {
+      return of(false);
+    }
+
+    return this.raw
+      .get<UserDto>(`${this.baseUrl}/api/auth/me`, this.credentials())
+      .pipe(
+        map(() => true),
+        catchError((error: unknown) =>
+          (error as { status?: number } | null)?.status === 401
+            ? of(false)
+            : throwError(() => error),
+        ),
+      );
   }
 
   /**

@@ -198,6 +198,11 @@ describe('LoginViewComponent', () => {
     http
       .expectOne(`${API_BASE_URL}/api/auth/login`)
       .flush({ user: { id: 'u1', name: 'Ama Mensah', email: 'a@b.test', role: 'employee' } });
+    // The session is proved to stick before navigating: sign-in only proved the
+    // password, and the session lives in cookies the browser has to keep.
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/me`)
+      .flush({ id: 'u1', name: 'Ama Mensah', email: 'a@b.test', role: 'employee' });
     await render();
 
     expect(navigate).toHaveBeenCalledWith(['/']);
@@ -210,6 +215,9 @@ describe('LoginViewComponent', () => {
     http
       .expectOne(`${API_BASE_URL}/api/auth/login`)
       .flush({ user: { id: 'u1', name: 'Kwame Osei', email: 'kwame@acmetech.example', role: 'admin' } });
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/me`)
+      .flush({ id: 'u1', name: 'Kwame Osei', email: 'kwame@acmetech.example', role: 'admin' });
     await render();
 
     // An administrator's job starts on the dashboard. Sending them to the assistant
@@ -227,11 +235,51 @@ describe('LoginViewComponent', () => {
     http
       .expectOne(`${API_BASE_URL}/api/auth/login`)
       .flush({ user: { id: 'u1', name: 'Kwame Osei', email: 'kwame@acmetech.example', role: 'admin' } });
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/me`)
+      .flush({ id: 'u1', name: 'Kwame Osei', email: 'kwame@acmetech.example', role: 'admin' });
     await render();
 
     // The dashboard is home after signing in; Ask stays one click away rather
     // than being the screen an administrator is dropped into.
     expect(navigate).toHaveBeenCalledWith(['/admin']);
+  });
+
+  it('stays and says why when the browser did not keep the session', async () => {
+    // The password was right and a session was issued, but the follow-up check
+    // found no session to speak of — the browser dropped the cookies. Navigating
+    // in anyway would end seconds later back on this screen with nothing said,
+    // so it stays here and names the reason instead.
+    const navigate = vi.spyOn(router, 'navigate');
+    await signIn();
+
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush({ user: { id: 'u1', name: 'Ama Mensah', email: 'a@b.test', role: 'employee' } });
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/me`)
+      .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
+    await render();
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(element().textContent).toContain('did not keep the session');
+    expect(element().textContent).not.toContain('Signing in…');
+  });
+
+  it('navigates anyway when the proof itself cannot be had', async () => {
+    // A check that never answers is a backend that cannot be reached, not a
+    // session that failed. Holding the sign-in for it would punish a blip, and
+    // the guards and data calls ahead report an outage plainer than this screen.
+    const navigate = vi.spyOn(router, 'navigate');
+    await signIn();
+
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush({ user: { id: 'u1', name: 'Ama Mensah', email: 'a@b.test', role: 'employee' } });
+    http.expectOne(`${API_BASE_URL}/api/auth/me`).error(new ProgressEvent('error'));
+    await render();
+
+    expect(navigate).toHaveBeenCalledWith(['/']);
   });
 
   it('shows the waiting screen when the account is not approved yet', async () => {

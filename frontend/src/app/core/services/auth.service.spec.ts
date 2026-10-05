@@ -206,8 +206,43 @@ describe('AuthService', () => {
     });
   });
 
-  describe('refresh', () => {
-    /** A session, established the way a guard would find it. */
+    describe('verifySession', () => {
+    it('is true when the cookies round-trip', async () => {
+      let proven: boolean | null = null;
+      auth.verifySession().subscribe((value) => (proven = value));
+
+      http.expectOne(ME).flush({ id: 'u1', name: 'Ama', email: 'a@acmetech.example', role: 'employee' });
+
+      await Promise.resolve();
+      expect(proven).toBe(true);
+    });
+
+    it('is false when the browser kept no session, without touching the user', async () => {
+      // A pure check: it neither signs anybody in nor out, so the caller decides
+      // what a missing session means on its own screen.
+      let proven: boolean | null = null;
+      auth.verifySession().subscribe((value) => (proven = value));
+
+      http
+        .expectOne(ME)
+        .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
+
+      await Promise.resolve();
+      expect(proven).toBe(false);
+    });
+
+    it('rethrows what never reached the backend', async () => {
+      let failure: unknown;
+      auth.verifySession().subscribe({ error: (error: unknown) => (failure = error) });
+
+      http.expectOne(ME).error(new ProgressEvent('error'));
+
+      await Promise.resolve();
+      expect(failure).toBeTruthy();
+    });
+  });
+
+  describe('refresh', () => {    /** A session, established the way a guard would find it. */
     const establish = async (): Promise<void> => {
       withHint();
 
