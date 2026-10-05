@@ -452,6 +452,92 @@ class TokenAndCookieTest(AuthTestCase):
         finally:
             settings.environment = original
 
+    def test_cookies_are_lax_by_default_so_they_are_first_party(self) -> None:
+        """`SameSite=lax`, because the app and the API share one origin.
+
+        The frontend serves its own `/api` reverse proxy, so every browser request
+        is same-site and the cookies are first-party. `lax` is what makes that
+        sufficient.
+
+        `none` is the value that breaks it: it makes the cookies third-party, which
+        is what browsers are progressively refusing to send, so a deployment using
+        it works in a desktop browser and fails in a mobile one with nothing in the
+        app changed to account for it.
+        """
+        original_samesite = settings.auth_cookie_samesite
+        original_secure = settings.auth_cookie_secure
+        try:
+            # Absent from the environment, which is how most deployments run it.
+            settings.auth_cookie_samesite = ""
+            settings.auth_cookie_secure = False
+            self.assertEqual(settings.cookie_samesite, "lax")
+
+            # Set the way a copy from an older cross-origin deployment would set it,
+            # case and all. Only honoured alongside `Secure`, which is the condition
+            # browsers actually impose.
+            settings.auth_cookie_samesite = "None"
+            settings.auth_cookie_secure = True
+            self.assertEqual(settings.cookie_samesite, "none")
+
+            # An unrecognised value falls back rather than issuing cookies whose
+            # attributes nothing can predict.
+            settings.auth_cookie_samesite = "something-else"
+            self.assertEqual(settings.cookie_samesite, "lax")
+        finally:
+            settings.auth_cookie_samesite = original_samesite
+            settings.auth_cookie_secure = original_secure
+
+    def test_samesite_none_without_secure_falls_back_to_lax(self) -> None:
+        """Every browser drops a `SameSite=None` cookie that is not also `Secure`.
+
+        Silently, and with a 200 to show for it — so without this the cookies would
+        be issued, stored nowhere, and sign-in would report that the browser had
+        not kept the session.
+        """
+        original_samesite = settings.auth_cookie_samesite
+        original_secure = settings.auth_cookie_secure
+        settings.auth_cookie_samesite = "none"
+        settings.auth_cookie_secure = False
+        settings.environment = "development"
+        try:
+            self.assertEqual(settings.cookie_samesite, "lax")
+        finally:
+            settings.auth_cookie_samesite = original_samesite
+            settings.auth_cookie_secure = original_secure
+
+    def test_a_refused_origin_is_named_in_the_refusal(self) -> None:
+        """A 403 about the wrong origin has to say which origin it was.
+
+        `SameSite` and origins are the two ways a session silently fails to attach,
+        and a bare "not from an allowed origin" is indistinguishable from a CSRF
+        token problem — so it sends people to look at the interceptor instead of
+        at the one setting that is wrong.
+
+        Tried on `POST /api/conversations` rather than on a sign-in route, because
+        every route reached before a session exists is exempt from the origin check
+        (there are no cookies to ride at that point) — which is also why a wrong
+        origin used to show up as a silent sign-in failure rather than as this 403.
+        """
+        client = self.new_client()
+        self.invite_and_accept(client, f"ama@{COMPANY}")
+
+        headers = self.csrf_headers(client)
+        headers["Origin"] = "https://somewhere-else.example"
+
+        response = client.post(
+            "/api/conversations",
+            json={"client_id": "1" * 12},
+            headers=headers,
+        )
+
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertIn("somewhere-else.example", response.json()["detail"])
+        self.assertIn("CSRF_TRUSTED_ORIGINS", response.json()["detail"])
+
+        # And it must not be mistaken for the retryable CSRF-token refusal, or the
+        # interceptor would loop on a request that is never going to be accepted.
+        self.assertNotIn("CSRF token", response.json()["detail"])
+
     def test_the_csrf_cookie_is_the_only_one_javascript_may_read(self) -> None:
         csrf_header = self.cookie_header(self.new_client().get("/api/auth/csrf"), CSRF_COOKIE)
 

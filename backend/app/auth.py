@@ -118,15 +118,12 @@ def _bearer_cookie_kwargs(max_age: int) -> dict:
 
     `httponly` keeps the value out of reach of JavaScript, which is the single most
     important line here. `secure` stops the browser sending it over plain http, and
-    production forces it on regardless of the setting. `samesite` is `"none"` in
-    production (cross-subdomain frontend/backend on `*.onrender.com` are cross-site,
-    so `lax` withholds the cookies from every `fetch` and sign-in never sticks)
-    and `"lax"` for local http, where `none` without `secure` would be rejected.
+    production forces it on regardless of the setting.
     """
     return {
         "httponly": True,
         "secure": settings.cookies_are_secure,
-        "samesite": "none" if settings.cookies_are_secure else "lax",
+        "samesite": settings.cookie_samesite,
         "path": "/",
         "max_age": max_age,
     }
@@ -173,7 +170,7 @@ def set_session_cookies(
         "1",
         httponly=False,
         secure=settings.cookies_are_secure,
-        samesite="none" if settings.cookies_are_secure else "lax",
+        samesite=settings.cookie_samesite,
         path="/",
         max_age=settings.refresh_token_ttl_seconds,
     )
@@ -190,13 +187,13 @@ def clear_session_cookies(response: Response) -> None:
         ACCESS_COOKIE,
         path="/",
         secure=settings.cookies_are_secure,
-        samesite="none" if settings.cookies_are_secure else "lax",
+        samesite=settings.cookie_samesite,
     )
     response.delete_cookie(
         REFRESH_COOKIE,
         path="/",
         secure=settings.cookies_are_secure,
-        samesite="none" if settings.cookies_are_secure else "lax",
+        samesite=settings.cookie_samesite,
     )
     # Cleared with the rest, so signing out does not leave the app believing it is
     # still worth asking about a session.
@@ -204,7 +201,7 @@ def clear_session_cookies(response: Response) -> None:
         SESSION_HINT_COOKIE,
         path="/",
         secure=settings.cookies_are_secure,
-        samesite="none" if settings.cookies_are_secure else "lax",
+        samesite=settings.cookie_samesite,
     )
 
 
@@ -225,7 +222,7 @@ def set_csrf_cookie(response: Response, token: str | None = None) -> str:
         # Readable by script on purpose; see above.
         httponly=False,
         secure=settings.cookies_are_secure,
-        samesite="none" if settings.cookies_are_secure else "lax",
+        samesite=settings.cookie_samesite,
         path="/",
         # A session, not a week: it is reissued on every sign-in and every refresh.
         max_age=settings.refresh_token_ttl_seconds,

@@ -187,7 +187,15 @@ def require_csrf(request: Request) -> None:
         logger.warning("rejected cross-origin request to %s", request.url.path)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This request did not come from an allowed origin.",
+            # Naming the origin is what makes this diagnosable. It used to be a bare
+            # "not from an allowed origin", which looks identical to a CSRF token
+            # problem and sends people looking at the interceptor instead — while
+            # the actual cause is one forgotten entry in a deployment setting.
+            detail=(
+                f"This request came from {request.headers.get('origin')!r}, which is not an "
+                "allowed origin. Add it to CSRF_TRUSTED_ORIGINS (or ALLOWED_ORIGINS), "
+                "spelled exactly as the browser sends it: scheme, host, no trailing slash."
+            ),
         )
 
     cookie_token = request.cookies.get(CSRF_COOKIE, "")

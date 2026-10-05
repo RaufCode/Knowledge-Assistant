@@ -6,7 +6,16 @@ export interface AppConfig {
   apiBaseUrl: string;
 }
 
-const DEFAULT_API_BASE_URL = 'http://localhost:8099';
+/**
+ * Empty, so the app calls the API on its own origin and the session cookies are
+ * first-party. See `api.config.ts` for why that is the only arrangement that
+ * works the same way on a phone, a laptop and every browser.
+ *
+ * Kept in step with `API_BASE_URL` deliberately rather than referring to it: this
+ * module runs before any injection context exists, and the constant is the
+ * documented default for the whole app.
+ */
+const DEFAULT_API_BASE_URL = '';
 
 @Injectable({ providedIn: 'root' })
 export class ConfigService {

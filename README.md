@@ -106,6 +106,49 @@ Everyone else joins by invitation: sign in as an administrator and use
 `POST /api/auth/invite`. It returns the invitation link, because no mail service is
 configured — an administrator copies it and sends it themselves.
 
+### Opening the app from a phone
+
+The backend runs on `127.0.0.1:8099` and the app on `4200`. To use the app on a
+phone, serve the app on your wifi and open it by your machine's LAN address:
+
+```bash
+npm run start:dev -- --host 0.0.0.0 --port 4200
+```
+
+Then on the phone, `http://<your-machine-ip>:4200`. The dev-server proxy forwards
+`/api` to the backend, so the phone only ever talks to one origin and needs no
+extra configuration. Add that address to `ALLOWED_ORIGINS` and
+`CSRF_TRUSTED_ORIGINS` in `backend/.env`, spelled exactly as the browser sends it:
+
+```bash
+ALLOWED_ORIGINS=http://localhost:4200,http://192.168.1.20:4200
+CSRF_TRUSTED_ORIGINS=http://localhost:4200,http://192.168.1.20:4200
+```
+
+A refusal names the origin it did not recognise, so a mistyped address is a 403
+that tells you what to fix rather than one that looks like a broken interceptor.
+
+### Why the app serves the API itself
+
+The app serves `/api` from its own origin — through the dev-server proxy in
+development, and through a reverse proxy in `src/server.ts` in production. That is
+deliberate, and it is the reason sign-in works on a phone as well as on a laptop.
+
+The session is two `httpOnly` cookies. Whether a browser attaches them to an API
+call is decided from the *site* that call goes to, and it is not something the app
+can influence. Call the API from its own origin and the cookies are first-party by
+construction, so no third-party cookie policy and no `SameSite` attribute can
+withhold them. Call it from another origin and each browser applies its own rules —
+Safari and Chrome block or partition third-party cookies, and `SameSite=Lax`
+withholds the cookies from any cross-site `fetch`.
+
+The failure is indistinguishable from a wrong password: the sign-in request answers
+`200`, the cookies are stored, and the very next call answers `401`. It appears and
+disappears with the browser and the device rather than with the code, which is why
+it reported as "you signed in, but this browser did not keep the session" on a
+phone while the same build worked on a laptop. Serving the API through the app
+removes the decision from the browser entirely.
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
@@ -120,7 +163,7 @@ configured — an administrator copies it and sends it themselves.
 | `LLM_MAX_ATTEMPTS` | No | `3` | Attempts before a 429/5xx is given up on |
 | `EMBED_MODEL` | No | `nvidia/nemotron-3-embed-1b` | Model used for retrieval embeddings |
 | `DATABASE_URL` | No | `postgresql://user:password@localhost:5432/knowledge_assistant` | PostgreSQL connection string |
-| `ALLOWED_ORIGINS` | No | `*` | Comma-separated CORS origins. Must be listed explicitly in production: cookies are not sent to a wildcard. |
+| `ALLOWED_ORIGINS` | No | `*` | Comma-separated CORS origins. Needed in production because the CSRF origin check compares against it. The browser itself reaches the API through the app's own `/api` proxy, so this no longer governs whether cookies are sent |
 | `ENVIRONMENT` | No | `development` | `production` forces `Secure` cookies and refuses the seeded admin |
 | `AUTH_SECRET_KEY` | Yes | — | Signs both token types. At least 32 characters |
 | `COMPANY_EMAIL_DOMAIN` | No | `acmetech.example` | The only domain an account may be created against |
@@ -129,7 +172,8 @@ configured — an administrator copies it and sends it themselves.
 | `INVITE_TTL_SECONDS` | No | `259200` | How long an invitation can be opened (72 hours) |
 | `BCRYPT_ROUNDS` | No | `12` | Password hashing cost |
 | `AUTH_COOKIE_SECURE` | No | `true` | `false` only for local http. Production forces it on regardless |
-| `CSRF_TRUSTED_ORIGINS` | No | falls back to `ALLOWED_ORIGINS` | Origins allowed to make cookie-authenticated writes. Must match the app's origin exactly — `localhost` and `127.0.0.1` are different, and a mismatch shows up as a 403 rather than an error |
+| `AUTH_COOKIE_SAMESITE` | No | `lax` | `SameSite` on the session cookies. `lax` is correct here because the app serves its own `/api` reverse proxy, so every request is same-site. `none` is only for an API the browser must call on another origin, and it makes the cookies third-party — which is what browsers increasingly refuse to send |
+| `CSRF_TRUSTED_ORIGINS` | No | falls back to `ALLOWED_ORIGINS` | Origins allowed to make cookie-authenticated writes. Must match the app's origin exactly — `localhost` and `127.0.0.1` are different, and a mismatch shows up as a 403 that names the origin it refused |
 | `FRONTEND_BASE_URL` | No | `http://localhost:4200` | Where an invitation link points |
 | `AUTH_BOOTSTRAP_KEY` | No | — | Guards the one route that can create the first administrator. Prefer `python -m app.bootstrap_admin` |
 | `AUTH_SEED_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | No | — | Seeds an administrator at startup. Ignored when `ENVIRONMENT=production` |
@@ -511,11 +555,26 @@ curl http://localhost:8000/history/test-session-123
 
 ## Deployment (Render)
 
-The `render.yaml` at the repo root configures both the web service and PostgreSQL database automatically.
+The `render.yaml` at the repo root configures both services automatically: the
+FastAPI backend and the Angular app, server-rendered by its own Express server.
 
-1. Connect the `employee-intelligence/knowledge-assistant` repo to Render
-2. Set `NVIDIA_API_KEY` and `NVIDIA_EMBEDDING_API_KEY` in the Render dashboard
-3. Render provisions the database and injects `DATABASE_URL` automatically
+1. Connect the `knowledge-assistant` repo to Render
+2. Set `NVIDIA_API_KEY`, `NVIDIA_EMBEDING_API_KEY`, `AUTH_SECRET_KEY`,
+   `AUTH_BOOTSTRAP_KEY` and `DATABASE_URL` in the Render dashboard — everything
+   else in the blueprint is already set
+3. Create the first administrator with `python -m app.bootstrap_admin`, then remove
+   `AUTH_BOOTSTRAP_KEY`
+
+The blueprint sets `API_ORIGIN` on the app so its `/api` proxy knows where the
+backend is, which is what keeps the session cookies first-party in production. If
+you deploy the two services yourself, set it on whatever serves the app. Leaving it
+unset points the proxy at `http://127.0.0.1:8099`, which is correct locally and
+nowhere else.
+
+`ALLOWED_ORIGINS`, `CSRF_TRUSTED_ORIGINS` and `FRONTEND_BASE_URL` all have to name
+the app's real origin. Note that `render.yaml` leaves the app's own name to Render
+to generate, so read the URL off the service page after the first deploy rather
+than assuming it — and keep the three settings in step with it.
 
 ## API Docs
 

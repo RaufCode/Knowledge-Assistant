@@ -7,12 +7,39 @@ import {
 import express from 'express';
 import { join } from 'node:path';
 
+import { apiOrigin, apiProxy } from './server/api-proxy';
+
 const browserDistFolder = join(import.meta.dirname, '../browser');
 
 const app = express();
 const angularApp = new AngularNodeAppEngine({
   trustProxyHeaders: true,
 });
+
+/**
+ * The API, served from this process under its own path.
+ *
+ * Mounted before everything else, including the static files, because `/api` is
+ * the one prefix this server does not answer itself.
+ *
+ * This is what makes the session work on a phone as well as on a laptop, and in
+ * every browser, and the reason is a cookie rather than a line of code: the
+ * session is two `httpOnly` cookies, and whether the browser attaches them to an
+ * API call is decided by the site the call goes to. Forwarded through here, every
+ * call is same-site by construction, so no browser's third-party cookie policy and
+ * no `SameSite` attribute can withhold them. Called directly on another origin,
+ * the same app signs in on some devices and reports "this browser did not keep
+ * the session" on others, depending only on how that browser treats cookies it
+ * did not set itself.
+ *
+ * `API_ORIGIN` says where the backend is. It defaults to the local one, and on
+ * Render it is set in the blueprint.
+ *
+ * Mounted without an Express path prefix on purpose: `app.use('/api', …)` rewrites
+ * `req.url` to what follows the mount, which would send `/auth/login` to a backend
+ * that routes on `/api/auth/login`.
+ */
+app.use(apiProxy('/api', apiOrigin()));
 
 /**
  * Serve static files from /browser
@@ -32,20 +59,24 @@ app.use(
 /**
  * Renders the app for every other request.
  *
- * No cookie check, and no redirect to the sign-in screen — deliberately. A previous
- * version redirected any request without an `ika_access` cookie, and that check
- * could never pass in production: the session cookies are set by the API on the
- * API's host, while this server answers on the app's host, so the browser never
- * sends them here. Every refresh of a protected page therefore 302'd to sign-in,
- * and the client — whose credentialed `GET /me` had succeeded — bounced straight
- * back. That round trip is the "sign-in flashes before the real page" bug.
+ * No cookie check, and no redirect to the sign-in screen.
  *
- * Nothing is given up by not checking. Whether a session exists is decided in the
- * browser by `authGuard`/`guestGuard` against `GET /api/auth/me`, and every route
- * behind them is refused by the backend with 401/403 regardless of what this
- * process renders. A render here produces the shell and no company data, so
- * serving it to a signed-out visitor discloses nothing and a signed-in one never
- * leaves the page they asked for.
+ * There used to be one — any request without an `ika_access` cookie was redirected
+ * to sign-in — and it could never pass: the cookies were set by the API on the
+ * API's host while this server answered on the app's host, so the browser never
+ * sent them here. Every refresh of a protected page therefore 302'd to sign-in, and
+ * the client — whose credentialed `GET /me` had succeeded — bounced straight back.
+ * That round trip was the "sign-in flashes before the real page" bug.
+ *
+ * The proxy above is what makes such a check possible again, since the cookies now
+ * belong to this origin. It is still not here, because it would buy nothing: the
+ * browser holds a token this process cannot validate, and a redirect decided here
+ * would be a guess. Whether a session exists is settled in the browser by
+ * `authGuard`/`guestGuard` against `GET /api/auth/me`, and every route behind them
+ * is refused by the backend with 401/403 regardless of what this process renders. A
+ * render here produces the shell and no company data, so serving it to a
+ * signed-out visitor discloses nothing and a signed-in one never leaves the page
+ * they asked for.
  */
 app.use((req, res, next) => {
   angularApp

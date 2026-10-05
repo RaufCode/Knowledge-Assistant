@@ -3,30 +3,41 @@ import { inject } from '@angular/core';
 import { ConfigService } from './config.service';
 
 /**
- * Single source for the backend origin. Every HTTP call is built from this
- * constant, so pointing the app at a different deployment is a one-line change.
+ * Single source for the backend origin. Every HTTP call is built from this, so
+ * pointing the app at a different deployment is a one-line change.
  *
- * The backend serves CORS with a wildcard origin, so the browser calls it
- * directly and no dev-server proxy is involved.
+ * Empty, which means "the origin this page was served from". The API is reached
+ * through the server that serves the app — the dev-server proxy in development
+ * and the Express reverse proxy in production — so the browser is only ever making
+ * same-origin requests.
  *
- * Paths are appended by `ApiService`, which builds them from this origin, so the
- * `/api` prefix that the routes live under is not part of it.
+ * THAT IS THE POINT, and it is worth understanding before changing it.
  *
- * THE HOST MUST MATCH THE ONE THE APP IS SERVED FROM, exactly.
+ * The session is two `httpOnly` cookies. Whether the browser attaches them to an
+ * API call is decided by the browser, from the *site* the call goes to, and not by
+ * anything this app does. Call the API from its own origin and every browser
+ * treats the cookies as first-party, with no third-party cookie policy and no
+ * `SameSite` attribute able to withhold them. Call it from another origin and each
+ * browser applies its own rules: Safari and Chrome block or partition third-party
+ * cookies, and `SameSite=Lax` withholds the cookies from every cross-site `fetch`.
  *
- * Not a style point. The session cookies are `SameSite=Lax`, and "site" is decided
- * by the host, so a page at `127.0.0.1:4201` calling `localhost:8099` is a
- * cross-site request and the browser will not attach the cookies to it — sign-in
- * then appears to succeed, the cookies are stored, and every subsequent call comes
- * back 401. The ports are irrelevant; `localhost` and `127.0.0.1` are different
- * hosts and that is enough. The same applies in production, where it decides
- * whether the deployed frontend and the deployed API are one site or two.
+ * The failure is indistinguishable from a broken password. The sign-in request
+ * returns 200, the cookies are stored, and the very next call answers 401 — so the
+ * app reports "you signed in, but this browser did not keep the session". It comes
+ * and goes with the browser and the device rather than with the code: working on a
+ * laptop, failing on a phone, working in one browser and not the next, and
+ * changing if you type `localhost` where you meant `127.0.0.1`, because those are
+ * different sites.
  *
- * For local work, use `127.0.0.1` rather than `localhost` on both sides: `ng serve`
- * only permits `127.0.0.1` by default, so a `localhost` page is refused with a 400
- * before any of this matters.
+ * Setting this to an absolute URL puts that back. Do it only for a deployment that
+ * genuinely cannot serve the API itself, and then the cookies need
+ * `SameSite=None; Secure` (`AUTH_COOKIE_SAMESITE=none` on the backend) or sign-in
+ * will not stick at all.
+ *
+ * `ConfigService` can override this at runtime from `config.json`, for a build that
+ * has to point somewhere else without being rebuilt.
  */
-export const API_BASE_URL = 'http://localhost:8099';
+export const API_BASE_URL = '';
 
 /**
  * Returns the configured API base URL at runtime, or the default constant when

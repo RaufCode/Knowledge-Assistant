@@ -1,4 +1,8 @@
+import logging
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -81,6 +85,18 @@ class Settings(BaseSettings):
     # than quietly issuing them without the flag.
     auth_cookie_secure: bool = True
 
+    # `SameSite` on the auth cookies. `lax` is right whenever the app and the API
+    # share an origin, which is how both are set up here: the frontend serves its
+    # own `/api` reverse proxy, so every browser request is same-site and the
+    # cookies are first-party.
+    #
+    # `none` is for the case where the API really is on an origin of its own and
+    # the browser calls it directly. It makes the cookies third-party, and browsers
+    # increasingly refuse to send those at all, so a deployment using it tends to
+    # work on a laptop and fail on a phone with no change in the code to explain
+    # it. See `cookie_samesite`.
+    auth_cookie_samesite: str = "lax"
+
     # The double-submit CSRF token is bound to nothing, so its origin check has
     # nothing to trust but this list. Every browser request carries an Origin, and
     # in development the API is a different origin from the app by design.
@@ -146,6 +162,40 @@ class Settings(BaseSettings):
     def cookies_are_secure(self) -> bool:
         """Whether auth cookies carry `Secure`, which production always requires."""
         return self.auth_cookie_secure or self.is_production
+
+    @property
+    def cookie_samesite(self) -> str:
+        """The `SameSite` attribute on the auth cookies.
+
+        `lax` by default, which is what a deployment that serves the API itself
+        wants: the app and the API share an origin, so every request is same-site
+        and the browser has no reason to withhold the cookies.
+
+        `none` is only for a deployment that genuinely cannot do that — the API on
+        an origin of its own, reached by the browser directly. It makes the cookies
+        third-party, which is what browsers are progressively refusing to send at
+        all, so it fixes cross-origin sign-in at the cost of making it fragile
+        again. Prefer routing the API through the app's own server, which is what
+        the frontend's `/api` reverse proxy does.
+        """
+        configured = self.auth_cookie_samesite.strip().lower()
+
+        if configured not in {"lax", "strict", "none"}:
+            return "lax"
+
+        # `SameSite=None` is rejected by every browser unless the cookie is also
+        # `Secure`, so asking for one without the other produces cookies that are
+        # silently dropped — the failure that is hardest to see from here.
+        if configured == "none" and not self.cookies_are_secure:
+            logger.warning(
+                "AUTH_COOKIE_SAMESITE=none without secure cookies: every browser "
+                "will drop them. Set AUTH_COOKIE_SECURE=true, or use 'lax' with the "
+                "API served from the app's own origin."
+            )
+
+            return "lax"
+
+        return configured
 
     @property
     def auth_is_usable(self) -> bool:

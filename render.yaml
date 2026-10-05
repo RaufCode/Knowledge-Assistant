@@ -76,6 +76,11 @@ services:
       # The deployed Angular frontend. Listed explicitly (no wildcard) so
       # credentialed CORS responses carry a concrete `Access-Control-Allow-Origin`
       # and the CSRF origin check has something real to compare against.
+      #
+      # The browser reaches the API through the frontend's own `/api` proxy rather
+      # than calling this service directly, so this list is no longer what makes
+      # sign-in work. It is still needed, because the proxy forwards the browser's
+      # `Origin` and the CSRF check compares it against the same value.
       - key: ALLOWED_ORIGINS
         value: "https://knowledge-assistant-chatbot-app.onrender.com"
 
@@ -118,3 +123,17 @@ services:
       # so it is not declared here.
       - key: NODE_VERSION
         value: "24"
+
+      # Where the API is. This server answers `/api` itself, forwarding to the
+      # backend named here.
+      #
+      # It is what makes sign-in work on a phone as well as on a laptop, and the
+      # reason is a cookie rather than a line of code: the session is two `httpOnly`
+      # cookies, and the browser decides whether to attach them from the site the
+      # request goes to. Served through this server, every API call is same-site by
+      # construction, so no browser's third-party cookie policy can withhold them.
+      # The browser calling the backend's own host directly tends to work in a
+      # desktop browser and fail in a mobile one, with nothing in the app changed
+      # to explain the difference.
+      - key: API_ORIGIN
+        value: "https://knowledge-assistant-backend.onrender.com"
