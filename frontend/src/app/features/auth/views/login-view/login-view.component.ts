@@ -20,6 +20,9 @@ import { GENERIC_REFUSAL, readRefusalOr } from '../../utils/read-backend-refusal
  */
 const REMEMBERED_EMAIL_KEY = 'knowledge-assistant.remembered-email';
 
+/** Routes that are only useful before a session exists. */
+const SIGNED_OUT_ROUTES = new Set(['/login', '/register', '/accept-invite', '/pending-approval']);
+
 /**
  * The signed-out landing screen: collects a work email and a password and asks the
  * backend to start a session.
@@ -367,11 +370,22 @@ export class LoginViewComponent {
 
     const requested = this.route.snapshot.queryParamMap.get('returnUrl');
 
-    if (requested && requested.startsWith('/') && !requested.startsWith('//')) {
+    if (
+      requested &&
+      requested.startsWith('/') &&
+      !requested.startsWith('//') &&
+      !this.isSignedOutRoute(requested)
+    ) {
       return requested;
     }
 
     return this.auth.landingPath();
+  }
+
+  private isSignedOutRoute(path: string): boolean {
+    const cleanPath = path.split(/[?#]/, 1)[0].replace(/\/+$/, '') || '/';
+
+    return SIGNED_OUT_ROUTES.has(cleanPath);
   }
 }
 

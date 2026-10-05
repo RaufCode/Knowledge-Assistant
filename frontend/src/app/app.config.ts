@@ -6,6 +6,12 @@ import { provideRouter, withComponentInputBinding, withInMemoryScrolling } from 
 import { routes } from './app.routes';
 import { authInterceptor } from './core/interceptors/auth.interceptor';
 import { ConfigService, loadConfig } from './core/config.service';
+import { AuthService } from './core/services/auth.service';
+
+const initializeApp = (configService: ConfigService, authService: AuthService) => async () => {
+  await loadConfig(configService)();
+  await authService.maybeBootstrap();
+};
 
 export const appConfig: ApplicationConfig = {
   providers: [
@@ -29,8 +35,8 @@ export const appConfig: ApplicationConfig = {
     ConfigService,
     {
       provide: APP_INITIALIZER,
-      useFactory: loadConfig,
-      deps: [ConfigService],
+      useFactory: initializeApp,
+      deps: [ConfigService, AuthService],
       multi: true,
     },
   ],

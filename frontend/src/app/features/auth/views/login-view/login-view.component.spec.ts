@@ -245,6 +245,36 @@ describe('LoginViewComponent', () => {
     expect(navigate).toHaveBeenCalledWith(['/admin']);
   });
 
+  it('does not send a signed-in employee back to registration from returnUrl', async () => {
+    const navigate = vi.spyOn(router, 'navigate');
+    await router.navigate(['/login'], { queryParams: { returnUrl: '/register' } });
+    await render();
+    await signIn();
+
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush({
+        user: {
+          id: 'u1',
+          name: 'Ama Mensah',
+          email: 'ama.mensah@acmetech.example',
+          role: 'employee',
+        },
+      });
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/me`)
+      .flush({
+        id: 'u1',
+        name: 'Ama Mensah',
+        email: 'ama.mensah@acmetech.example',
+        role: 'employee',
+      });
+    await render();
+
+    expect(navigate).toHaveBeenCalledWith(['/']);
+    expect(navigate).not.toHaveBeenCalledWith(['/register']);
+  });
+
   it('stays and says why when the browser did not keep the session', async () => {
     // The password was right and a session was issued, but the follow-up check
     // found no session to speak of — the browser dropped the cookies. Navigating
