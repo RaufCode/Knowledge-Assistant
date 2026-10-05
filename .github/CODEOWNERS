@@ -1,0 +1,24 @@
+# Global owners - default reviewers for everything
+*                       @RaufCode @emaowusu 
+
+# Frontend code
+/frontend/*.js          @employee-intelligence/frontend-team
+/frontend/*.ts          @employee-intelligence/frontend-team
+*.css                   @employee-intelligence/frontend-team
+
+# Backend code 
+*.py                    @employee-intelligence/backend-team
+/backend/*.js           @employee-intelligence/backend-team
+/backend/*.ts           @employee-intelligence/backend-team
+
+# GitHub Actions
+/.github/*              @employee-intelligence/devops-team
+
+# Containerization
+/backend/Dockerfile     @employee-intelligence/devops-team
+/frontend/Dockerfile    @employee-intelligence/devops-team
+/frontend/*.conf        @employee-intelligence/devops-team
+
+# Documentation
+*.md                    @employee-intelligence/frontend-team @employee-intelligence/backend-team @employee-intelligence/devops-team
+/docs/*                 @employee-intelligence/frontend-team @employee-intelligence/backend-team @employee-intelligence/devops-team
