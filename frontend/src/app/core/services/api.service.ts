@@ -1,6 +1,6 @@
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
-import { Observable, catchError, map, throwError, timeout } from 'rxjs';
+import { Observable, catchError, firstValueFrom, map, throwError, timeout } from 'rxjs';
 
 import { ConfigService } from '../config.service';
 import { API_TIMEOUT_MS } from '../api.config';
@@ -249,6 +249,14 @@ export class ApiService {
     abort: AbortSignal,
     onEvent: (event: ChatStreamEventDto) => void,
   ): Promise<void> {
+    if (!this.auth.readCsrfToken()) {
+      // No token to send (fresh browser, cleared cookies): fetch one before the
+      // question rather than spending the first attempt learning it is missing.
+      // A failed attempt still records the question server-side, so skipping it
+      // also spares the thread a duplicate.
+      await firstValueFrom(this.auth.refreshCsrfToken());
+    }
+
     let response = await this.postStream(conversationId, body, abort);
 
     // The access token may have run out between page load and the first question.
@@ -261,6 +269,16 @@ export class ApiService {
       if (user) {
         response = await this.postStream(conversationId, body, abort);
       }
+    }
+
+    if (response.status === 403 && (await this.isCsrfRefusal(response))) {
+      // The token the tab holds is stale (rotated by a refresh elsewhere, a
+      // sign-in in another tab): fetch a fresh one and ask once more. The
+      // interceptor does this for every `HttpClient` request; streams go through
+      // `fetch` and have to recover for themselves. Once, and only for this exact
+      // refusal: anything else a 403 says is not fixed by trying again.
+      await firstValueFrom(this.auth.refreshCsrfToken());
+      response = await this.postStream(conversationId, body, abort);
     }
 
     if (!response.ok) {
@@ -298,6 +316,17 @@ export class ApiService {
         buffer = buffer.slice(boundary + 2);
         boundary = buffer.indexOf('\n\n');
       }
+    }
+  }
+
+  /** Whether a refusal is about the CSRF token rather than about permission. */
+  private async isCsrfRefusal(response: Response): Promise<boolean> {
+    try {
+      const body = (await response.clone().json()) as { detail?: unknown };
+
+      return typeof body?.detail === 'string' && body.detail.includes('CSRF token');
+    } catch {
+      return false;
     }
   }
 
