@@ -640,21 +640,18 @@ export class ChatSidebarComponent {
   /**
    * Ends the session, here and on the server.
    *
-   * The order matters: the sign-out request goes first, so the refresh cookie is
-   * revoked while the browser still holds it, and the navigation happens whether it
-   * succeeds or not. Navigating first would race the request against a page that no
-   * longer sends it, and the session would survive on the server for as long as the
-   * cookie's own lifetime.
+   * The local session ends first and the navigation follows it immediately, so
+   * the button answers at once even if the network does not: on a cold or slow
+   * connection the revocation request can hang long enough that waiting on it
+   * reads as a dead button. The revocation still goes out in the background and
+   * still carries the cookies, so the server session dies as usual — the page
+   * just does not wait around to watch it happen.
    */
   protected signOut(): void {
     this.layout.closeAfterNavigation();
-
-    this.auth.logout().subscribe({
-      next: () => void this.router.navigate(['/login']),
-      // `logout` ends the local session either way, so there is nothing to report
-      // to a user who has already asked to be signed out.
-      error: () => void this.router.navigate(['/login']),
-    });
+    this.auth.clear();
+    void this.router.navigate(['/login']);
+    this.auth.logout().subscribe();
   }
 
   /** Opens the account card, or closes it if it is already open. */
