@@ -60,16 +60,10 @@ import { ChatThreadComponent } from '../../features/response/components/chat-thr
           This conversation is not in this browser's list. It may have been deleted.
         </p>
       </div>
-    } @else if (chat.isEmpty()) {
-      <!-- An empty conversation is one waiting for a question, which is a different
-           thing from a conversation that could not be found. -->
-      <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-4 text-center">
-        <h2 class="font-headings text-lg font-semibold text-foreground">No questions yet</h2>
-        <p class="max-w-sm text-sm leading-relaxed text-muted-foreground">
-          Ask a question about company policy and the answer will appear here.
-        </p>
-      </div>
     } @else {
+      <!-- The thread, empty or not. A conversation waiting for its first
+           question shows the composer and nothing else: there is no page to show
+           for nothing asked yet. -->
       <app-chat-thread
         [messages]="chat.messages()"
         [isBusy]="chat.isLoading()"
