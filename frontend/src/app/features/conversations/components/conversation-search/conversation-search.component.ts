@@ -23,6 +23,11 @@ import { IconComponent } from '../../../../shared/components/icon/icon.component
  * - One-way data flow. The text on screen is always exactly the search term the
  *   service holds — never a value the field picked up on its own — because the
  *   field owns no state of its own to diverge with.
+ * - Anything containing `@` is dropped rather than emitted. No conversation
+ *   title contains one — titles are natural-language summaries — while every
+ *   unwanted fill observed here was an address. A filler writes the whole value
+ *   at once rather than typing it, and the field is restored to the search term
+ *   instead, so nothing lingers on screen either.
  */
 @Component({
   selector: 'app-conversation-search',
@@ -50,7 +55,7 @@ import { IconComponent } from '../../../../shared/components/icon/icon.component
         [attr.aria-label]="ariaLabel()"
         (focus)="box.removeAttribute('readonly')"
         (blur)="box.setAttribute('readonly', '')"
-        (input)="valueChange.emit(box.value)"
+        (input)="onInput(box)"
       />
       @if (value()) {
         <button
@@ -79,4 +84,22 @@ export class ConversationSearchComponent {
 
   /** Accessible name of the field. */
   readonly ariaLabel = input('Search conversations');
+
+  /**
+   * Forwards typed text, dropping filler text instead.
+   *
+   * A filler writes an address into the field in one go; a person types it a
+   * key at a time and never produces `@` on the way to a conversation title.
+   * The dropped text is replaced with the search term rather than emitted, so
+   * the field stays empty — and the list unfiltered — until the user fills it.
+   */
+  protected onInput(box: HTMLInputElement): void {
+    if (box.value.includes('@')) {
+      box.value = this.value();
+
+      return;
+    }
+
+    this.valueChange.emit(box.value);
+  }
 }
