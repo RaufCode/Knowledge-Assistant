@@ -33,7 +33,9 @@ describe('authInterceptor', () => {
   beforeEach(async () => {
     // Cleared between tests, because `document.cookie` outlives the injector and a
     // token left behind by one test would silently satisfy the next one's assertion.
+    // The remembered session in storage outlives it too, for the same reason.
     document.cookie = 'ika_csrf=; path=/; max-age=0';
+    localStorage.clear();
 
     await TestBed.configureTestingModule({
       providers: [
@@ -234,9 +236,34 @@ describe('authInterceptor', () => {
     await settle();
 
     // The session is over, so whatever was on screen belonged to it and is no
-    // longer visible.
-    expect(navigate).toHaveBeenCalledWith(['/login']);
+    // longer visible. Where they were going is carried along, so signing in
+    // again continues there rather than dropping them on the dashboard.
+    expect(navigate).toHaveBeenCalledWith(['/login'], { queryParams: { returnUrl: '/' } });
     expect(TestBed.inject(AuthService).isAuthenticated()).toBe(false);
+  });
+
+  it('does not sign out when the refresh never reached the backend', async () => {
+    // A backend that is asleep or unreachable is not a session that ended. The
+    // request fails transiently and the session stands, so the next attempt —
+    // against a backend that has woken up since — can still refresh it.
+    setCsrfCookie('a-token');
+    await establishSession();
+
+    const navigate = vi.spyOn(router, 'navigate').mockResolvedValue(true);
+    let failure: unknown;
+    client
+      .get(`${API_BASE_URL}/api/conversations?client_id=1`)
+      .subscribe({ error: (error: unknown) => (failure = error) });
+
+    http
+      .expectOne(`${API_BASE_URL}/api/conversations?client_id=1`)
+      .flush({ detail: 'expired' }, { status: 401, statusText: 'Unauthorized' });
+    http.expectOne(`${API_BASE_URL}/api/auth/refresh`).error(new ProgressEvent('error'));
+    await settle();
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(TestBed.inject(AuthService).isAuthenticated()).toBe(true);
+    expect(failure).toBeTruthy();
   });
 
   it('does not try to refresh a 401 from a request made while signed out', () => {

@@ -54,8 +54,10 @@ describe('AuthService', () => {
 
   beforeEach(async () => {
     // `document.cookie` outlives the injector, so a hint left by one test would make
-    // the next one believe it had a session.
+    // the next one believe it had a session. The remembered session in storage
+    // outlives it too, for the same reason.
     document.cookie = 'ika_session=; path=/; max-age=0';
+    localStorage.clear();
 
     await TestBed.configureTestingModule({
       providers: [provideHttpClientTesting()],
@@ -169,6 +171,74 @@ describe('AuthService', () => {
       answerWithNobody();
 
       expect(await settle(settled)).toBeNull();
+    });
+  });
+
+  describe('remembered session', () => {
+    it('asks when a session was established here, even with no readable hint', async () => {
+      // The hint cookie lives on the API's host, which frontend JavaScript can
+      // never read on a cross-site deploy. The remembered flag lives on this
+      // origin instead, so a reload still asks rather than concluding signed out.
+      localStorage.setItem('knowledge-assistant.session', '1');
+
+      const settled = auth.maybeBootstrap();
+      answerWithUser('employee');
+
+      expect((await settle(settled))?.email).toBe('ama@acmetech.example');
+      expect(auth.isAuthenticated()).toBe(true);
+    });
+
+    it('forgets the session with the user, so a later visit asks nobody', async () => {
+      // Models a reload after signing out on a cross-site deploy: no readable
+      // hint cookie (there never is one across sites), only the remembered flag —
+      // which signing out must have removed along with the user.
+      localStorage.setItem('knowledge-assistant.session', '1');
+
+      const signedIn = auth.maybeBootstrap();
+      answerWithUser('employee');
+      await settle(signedIn);
+
+      auth.clear();
+
+      expect(localStorage.getItem('knowledge-assistant.session')).toBeNull();
+      expect(await auth.maybeBootstrap()).toBeNull();
+      http.verify();
+    });
+  });
+
+  describe('refresh', () => {
+    /** A session, established the way a guard would find it. */
+    const establish = async (): Promise<void> => {
+      withHint();
+
+      const signedIn = auth.maybeBootstrap();
+      answerWithUser('employee');
+      await settle(signedIn);
+    };
+
+    it('ends the session when the backend refuses it', async () => {
+      await establish();
+
+      const refused = auth.refresh();
+      http
+        .expectOne(`${API_BASE_URL}/api/auth/refresh`)
+        .flush({ detail: 'No active session.' }, { status: 401, statusText: 'Unauthorized' });
+
+      await expect(refused).resolves.toBeNull();
+      expect(auth.isAuthenticated()).toBe(false);
+    });
+
+    it('rethrows what never reached the backend instead of signing out', async () => {
+      // A backend that is asleep or unreachable has said nothing about the
+      // session. Converting that silence into a logout signed people out for
+      // trying to use the app while it was waking up.
+      await establish();
+
+      const pending = auth.refresh();
+      http.expectOne(`${API_BASE_URL}/api/auth/refresh`).error(new ProgressEvent('error'));
+
+      await expect(pending).rejects.toThrow();
+      expect(auth.isAuthenticated()).toBe(true);
     });
   });
 });

@@ -68,8 +68,10 @@ describe('auth guards', () => {
 
   beforeEach(async () => {
     // Cleared between tests: `document.cookie` outlives the injector, so a hint left
-    // behind by one test would make the next one believe it had a session.
+    // behind by one test would make the next one believe it had a session. The
+    // remembered session in storage outlives it too, for the same reason.
     document.cookie = 'ika_session=; path=/; max-age=0';
+    localStorage.clear();
 
     await TestBed.configureTestingModule({
       providers: [
@@ -112,6 +114,19 @@ describe('auth guards', () => {
       // Without this a guard would send everybody to the dashboard, and following a
       // deep link would end in the wrong place after signing in.
       expect(redirectedTo(allowed)).toContain('returnUrl');
+    });
+
+    it('still redirects, rather than failing, when the backend cannot be reached', async () => {
+      // A sleeping backend is not a signed-out visitor. The guard cannot answer,
+      // so it falls back to the last known state instead of rejecting — a
+      // rejection would leave the navigation hanging rather than landing anywhere.
+      withSessionHint();
+      const result = run(authGuard);
+
+      http.expectOne(`${API_BASE_URL}/api/auth/me`).error(new ProgressEvent('error'));
+      http.expectOne(`${API_BASE_URL}/api/auth/refresh`).error(new ProgressEvent('error'));
+
+      expect(redirectedTo(await result)).toContain('/login');
     });
 
     it('asks only once however many guards run', async () => {

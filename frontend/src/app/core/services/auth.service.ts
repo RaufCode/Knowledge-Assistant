@@ -1,7 +1,7 @@
 import { isPlatformBrowser } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { Injectable, PLATFORM_ID, computed, inject, signal } from '@angular/core';
-import { Observable, catchError, firstValueFrom, map, of, tap } from 'rxjs';
+import { Observable, catchError, firstValueFrom, map, of, tap, throwError } from 'rxjs';
 
 import { ConfigService } from '../config.service';
 import { IdentityService } from './identity.service';
@@ -43,6 +43,22 @@ const SESSION_HINT_COOKIE = 'ika_session';
 
 /** Header the CSRF cookie's value has to come back in. */
 export const CSRF_HEADER = 'X-CSRF-Token';
+
+/**
+ * Remembers, on this origin, that a session was established here.
+ *
+ * The readable hint cookie cannot do this job on its own: it is set on the
+ * API's host, and frontend JavaScript on another host can never see it — which
+ * is every production deploy, where app and API are different sites. Without
+ * this flag, every page reload concluded "no session" without asking and sent
+ * a signed-in person back to the sign-in screen, even with a perfectly good
+ * session sitting in the cookie jar.
+ *
+ * A flag, not a credential: its only effect is licensing one `GET /me`, whose
+ * answer is what decides. Setting it wrongly buys nothing but a refused
+ * request, and a refused request settles back to signed out on its own.
+ */
+const KNOWN_SESSION_KEY = 'knowledge-assistant.session';
 
 /**
  * Where the app stands on authentication, which is not the same as not being signed
@@ -145,9 +161,13 @@ export class AuthService {
   /**
    * Whether this browser looks like it has a session, judged without a request.
    *
-   * Reads the readable hint cookie the backend sets beside the session cookies. It
-   * proves nothing on its own — it is a flag, not a credential — so the answer here
-   * is only ever "worth asking", never "signed in".
+   * Two hints, because neither covers every deploy. The readable cookie the
+   * backend sets beside the session cookies answers on a same-host setup, where
+   * frontend JavaScript can actually read the API's cookies. The remembered flag
+   * in storage answers everywhere else: it is written on this origin the moment
+   * a session is established, so a cross-site deploy still asks rather than
+   * concluding "signed out" on every reload. Both prove nothing on their own —
+   * the answer here is only ever "worth asking", never "signed in".
    *
    * Why this exists: without it, every signed-out visit to the sign-in screen had to
    * call `GET /api/auth/me` in order to be told it was not signed in. That is a
@@ -160,9 +180,33 @@ export class AuthService {
       return false;
     }
 
+    if (this.hasKnownSession()) {
+      return true;
+    }
+
     return document.cookie
       .split(';')
       .some((pair) => pair.trim().startsWith(`${SESSION_HINT_COOKIE}=`));
+  }
+
+  /**
+   * Whether a session was established in this browser, as remembered here.
+   *
+   * Storage, not cookies, because this origin's storage is readable on every
+   * deploy while the API's cookies are only readable same-host. Best effort: a
+   * browser that refuses storage simply loses this hint, exactly as if no
+   * session had been established.
+   */
+  private hasKnownSession(): boolean {
+    if (!this.isBrowser) {
+      return false;
+    }
+
+    try {
+      return localStorage.getItem(KNOWN_SESSION_KEY) !== null;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -646,9 +690,13 @@ export class AuthService {
   /**
    * `POST /api/auth/refresh`. Trades the refresh cookie for a new pair.
    *
-   * Returns null rather than throwing when the refresh is refused: a refresh that
-   * fails means the session is over, which the caller handles by sending the person
-   * to the sign-in screen, not by surfacing an error they could do anything about.
+   * Returns null rather than throwing when the refresh is refused: a refused
+   * refresh means the session is over, which the caller handles by sending the
+   * person to the sign-in screen, not by surfacing an error they could do
+   * anything about. Anything else — the backend unreachable, asleep, or
+   * erroring — is rethrown untouched: a network failure is not a session that
+   * ended, and treating it as one signed people out for trying to use the app
+   * while the backend was waking up.
    */
   refresh(): Promise<UserDto | null> {
     if (this.refreshPromise) {
@@ -661,9 +709,13 @@ export class AuthService {
         .pipe(
           map((response) => response.user),
           tap((user) => this.setUser(user)),
-          catchError(() => {
-            this.setUser(null);
-            return of(null);
+          catchError((error: unknown) => {
+            if (isSessionRefusal(error)) {
+              this.setUser(null);
+              return of(null);
+            }
+
+            return throwError(() => error);
           }),
         ),
     ).finally(() => {
@@ -746,11 +798,37 @@ export class AuthService {
     // account's own id (or back at the anonymous one) so no account ever opens
     // another's conversations on a shared browser.
     this.identity.bindToAccount(user?.id ?? null);
+    this.rememberSession(user !== null);
 
     if (!user) {
       this.bootstrapPromise = null;
       // A token from the previous session would only mismatch the next one.
       this.csrfMemory = null;
+    }
+  }
+
+  /**
+   * Records whether a session was established in this browser.
+   *
+   * Written the moment anybody is set and removed the moment nobody is, so a
+   * reload asks the backend instead of guessing — including on a cross-site
+   * deploy where the hint cookie is unreadable. Best effort, like every other
+   * use of storage here: losing the flag only costs one avoided question.
+   */
+  private rememberSession(established: boolean): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    try {
+      if (established) {
+        localStorage.setItem(KNOWN_SESSION_KEY, '1');
+      } else {
+        localStorage.removeItem(KNOWN_SESSION_KEY);
+      }
+    } catch {
+      // Remembering is a courtesy. A browser that refuses storage still gets the
+      // right answer from the server; it just always pays a request for it.
     }
   }
 
@@ -813,4 +891,18 @@ export class AuthService {
   private credentials(): { withCredentials: boolean } {
     return { withCredentials: true };
   }
+}
+
+/**
+ * Whether a failed refresh means the session is over.
+ *
+ * Only a refusal does — 401 from the refresh route, 403 defensively. Anything
+ * else (unreachable backend, timeout, 5xx) says nothing about the session, so
+ * it must travel back to the caller as the transient failure it is rather
+ * than being converted into a logout.
+ */
+function isSessionRefusal(error: unknown): boolean {
+  const status = (error as { status?: number } | null)?.status;
+
+  return status === 401 || status === 403;
 }

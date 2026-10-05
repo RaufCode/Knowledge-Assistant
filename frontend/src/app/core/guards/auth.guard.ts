@@ -16,6 +16,11 @@ type Decision = boolean | UrlTree;
  * The service is resolved before the first `await` on purpose. `inject()` only works
  * synchronously inside the context a guard is called in, so reaching for it after a
  * pause has already lost that context and throws.
+ *
+ * When the backend cannot be reached at all, the last known state stands rather
+ * than a guess: a failed request is not a session that ended, so it must not send
+ * a signed-in person to the sign-in screen. The route's own data calls will
+ * surface the outage as the retryable failures they are.
  */
 async function hasSession(): Promise<boolean> {
   const auth = inject(AuthService);
@@ -30,7 +35,11 @@ async function hasSession(): Promise<boolean> {
   // Asked through the hint-aware path, so a visitor with no session is told so
   // without a request. That matters most on the signed-out screens, where the
   // question is usually answered by the absence of a cookie.
-  await auth.maybeBootstrap();
+  try {
+    await auth.maybeBootstrap();
+  } catch {
+    return auth.isAuthenticated();
+  }
 
   return auth.isAuthenticated();
 }

@@ -132,7 +132,9 @@ function authHeaders(auth: AuthService): Record<string, string> {
 function endSession(auth: AuthService, router: Router, error: unknown): Observable<never> {
   auth.clear();
 
-  void router.navigate(['/login']);
+  // Where they were going is carried along, so signing in again continues to
+  // where they were heading rather than dropping them on the dashboard.
+  void router.navigate(['/login'], { queryParams: { returnUrl: router.url } });
 
   return throwError(() => error);
 }
