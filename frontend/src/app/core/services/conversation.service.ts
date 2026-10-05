@@ -388,11 +388,20 @@ export class ConversationService {
    * yet, and the list is re-read once the answer lands, at which point there is
    * something in it to list.
    *
+   * The search is cleared here, so a filter typed before asking cannot hide the
+   * conversation that was just started: a fresh question asked under an old search
+   * term would otherwise land in a conversation the filter does not match, and the
+   * sidebar would keep showing the filtered list until the search was cleared by
+   * hand. Follow-ups keep the filter — only a new conversation lifts it.
+   *
    * De-duplicated: two callers asking at once share one request, so a double click
    * on "Send" leaves one conversation rather than two.
    */
   createConversation(): Observable<Conversation> {
     if (!this.pendingCreate) {
+      // A new conversation must be visible, whatever the sidebar was filtering.
+      this.clearSearch();
+
       this.pendingCreate = this.api.createConversation(this.identity.clientId()).pipe(
         map((response) => {
           const conversation: Conversation = {
