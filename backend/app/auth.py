@@ -178,11 +178,26 @@ def clear_session_cookies(response: Response) -> None:
     it as a different cookie and leaves the original in place. `max_age=0` is what
     actually deletes one; the empty value is belt to that braces.
     """
-    response.delete_cookie(ACCESS_COOKIE, path="/")
-    response.delete_cookie(REFRESH_COOKIE, path="/")
+    response.delete_cookie(
+        ACCESS_COOKIE,
+        path="/",
+        secure=settings.cookies_are_secure,
+        samesite="none" if settings.cookies_are_secure else "lax",
+    )
+    response.delete_cookie(
+        REFRESH_COOKIE,
+        path="/",
+        secure=settings.cookies_are_secure,
+        samesite="none" if settings.cookies_are_secure else "lax",
+    )
     # Cleared with the rest, so signing out does not leave the app believing it is
     # still worth asking about a session.
-    response.delete_cookie(SESSION_HINT_COOKIE, path="/")
+    response.delete_cookie(
+        SESSION_HINT_COOKIE,
+        path="/",
+        secure=settings.cookies_are_secure,
+        samesite="none" if settings.cookies_are_secure else "lax",
+    )
 
 
 def set_csrf_cookie(response: Response, token: str | None = None) -> str:
