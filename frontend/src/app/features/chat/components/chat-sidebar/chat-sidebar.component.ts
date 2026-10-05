@@ -802,6 +802,14 @@ export class ChatSidebarComponent {
       return;
     }
 
+    // No request is made when nothing would change: the backend would refuse a
+    // password that is already the current one, so saying so here saves the
+    // round trip rather than spending it to be told.
+    if (this.ownPassword() === this.ownCurrentPassword()) {
+      this.ownPasswordNotice.set('Your new password must be different from the current one.');
+      return;
+    }
+
     this.isBusy.set(true);
     this.ownPasswordNotice.set('');
 

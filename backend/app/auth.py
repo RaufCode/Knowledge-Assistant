@@ -449,6 +449,12 @@ def change_own_password(
             detail="Your current password is not correct.",
         )
 
+    if verify_password(req.new_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Choose a password you have not used here.",
+        )
+
     current_user.password_hash = hash_password(req.new_password)
     current_user.updated_at = datetime.now(timezone.utc)
 

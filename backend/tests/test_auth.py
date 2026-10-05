@@ -1742,6 +1742,26 @@ class ChangeOwnPasswordTest(AuthTestCase):
 
         self.assertEqual(self.change(employee, new="short").status_code, 422)
 
+    def test_same_password_is_refused_and_changes_nothing(self) -> None:
+        self.signed_in_admin()
+        employee = self.new_client()
+        self.invite_and_accept(employee, f"ama@{COMPANY}")
+
+        response = self.change(employee, current=PASSWORD, new=PASSWORD)
+
+        self.assertEqual(response.status_code, 422, response.text)
+
+        # Still the same password: the refused attempt changed nothing.
+        self.assertEqual(
+            self.new_client()
+            .post(
+                "/api/auth/login",
+                json={"email": f"ama@{COMPANY}", "password": PASSWORD},
+            )
+            .status_code,
+            200,
+        )
+
     def test_signed_out_is_refused(self) -> None:
         response = self.new_client().post(
             "/api/auth/me/password",
