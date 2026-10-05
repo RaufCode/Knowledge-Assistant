@@ -11,15 +11,36 @@ import { toSignal } from '@angular/core/rxjs-interop';
 import {
   ActivatedRouteSnapshot,
   NavigationEnd,
+  NavigationError,
   NavigationSkipped,
   Router,
   RouterOutlet,
 } from '@angular/router';
-import { scan, startWith } from 'rxjs';
+import { filter, scan, startWith } from 'rxjs';
 
 import { ChatSidebarComponent } from './features/chat/components/chat-sidebar/chat-sidebar.component';
 import { AuthService } from './core/services/auth.service';
 import { LayoutService } from './core/services/layout.service';
+
+/** Marked in the tab once a stale-bundle reload has been attempted. */
+const STALE_BUNDLE_RELOAD_KEY = 'ika.reloadedForStaleBundle';
+
+/**
+ * Whether a failed navigation means the running code is older than its chunks.
+ *
+ * Deploys replace the hashed chunk files, so a tab opened before one that only
+ * navigates after it fetches files that no longer exist — and the server answers
+ * those with the app shell instead of JavaScript. The button that was clicked
+ * then does nothing, with the real cause only in the console. The recovery is a
+ * single full reload, which fetches the current shell and its matching chunks.
+ */
+function isStaleBundleError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+
+  return /Failed to fetch dynamically imported module|Loading chunk [\w-]+ failed/i.test(
+    message,
+  );
+}
 
 /** Elements that can hold focus, used by the drawer's focus trap. */
 const FOCUSABLE_SELECTOR =
@@ -260,6 +281,25 @@ export class AppComponent {
   private wasDrawerModal = false;
 
   constructor() {
+    // A navigation that dies on a missing chunk recovers with one full reload.
+    // Seen in the wild as buttons that go nowhere after a deploy replaced the
+    // hashed files underneath an open tab. Once per tab, so a genuinely broken
+    // deployment cannot trap the browser in a reload loop.
+    this.router.events
+      .pipe(filter((event): event is NavigationError => event instanceof NavigationError))
+      .subscribe((event) => {
+        if (typeof window === 'undefined' || typeof sessionStorage === 'undefined') {
+          return;
+        }
+
+        if (!isStaleBundleError(event.error) || sessionStorage.getItem(STALE_BUNDLE_RELOAD_KEY)) {
+          return;
+        }
+
+        sessionStorage.setItem(STALE_BUNDLE_RELOAD_KEY, '1');
+        window.location.reload();
+      });
+
     // A modal drawer has to take focus, or the trap below never engages: it only
     // rewrites Tab at the drawer's first and last control, which focus never
     // reaches if it is still out in the content behind the backdrop. Closing it
