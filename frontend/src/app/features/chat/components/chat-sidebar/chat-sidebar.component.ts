@@ -1,0 +1,525 @@
+import {
+  ChangeDetectionStrategy,
+  Component,
+  HostListener,
+  computed,
+  inject,
+  signal,
+} from '@angular/core';
+import { Router, RouterLink, RouterLinkActive } from '@angular/router';
+
+import { AuthService } from '../../../../core/services/auth.service';
+import { ChatService } from '../../../../core/services/chat.service';
+import { ConversationService } from '../../../../core/services/conversation.service';
+import { LayoutService } from '../../../../core/services/layout.service';
+import { SectionService } from '../../../../core/services/section.service';
+import { toInitials } from '../../../../shared/utils/initials.util';
+import { AvatarComponent } from '../../../../shared/components/avatar/avatar.component';
+import { ButtonComponent } from '../../../../shared/components/button/button.component';
+import { ConfirmDialogComponent } from '../../../../shared/components/confirm-dialog/confirm-dialog.component';
+import { IconComponent, type IconName } from '../../../../shared/components/icon/icon.component';
+import { InputComponent } from '../../../../shared/components/input/input.component';
+import { ConversationItemComponent } from '../../../conversations/components/conversation-item/conversation-item.component';
+import { BrandLogoComponent } from '../brand-logo/brand-logo.component';
+
+/**
+ * One destination in the administrator's navigation.
+ *
+ * Declared here rather than read from the route table, because a link is a choice
+ * about what an administrator is shown, not a fact about what exists. The
+ * question-log and access-request routes still resolve; neither is offered,
+ * because the sidebar is the only navigation an administrator has and a screen
+ * reachable only by typing its URL is not part of the product.
+ */
+interface AdminNavItem {
+  label: string;
+  path: string;
+  icon: IconName;
+}
+
+/**
+ * What an administrator can reach, in the order they would look for it.
+ *
+ * Three destinations, and each is a job rather than a screen: the overview, the
+ * documents the assistant answers from, and giving somebody access.
+ */
+const ADMIN_NAV: AdminNavItem[] = [
+  { label: 'Dashboard', path: '/admin', icon: 'layout-dashboard' },
+  { label: 'Documents', path: '/admin/documents', icon: 'file-text' },
+  { label: 'Add a user', path: '/admin/invite', icon: 'user-plus' },
+];
+
+/**
+ * The shell's navigation: brand, new conversation, conversation search and recent
+ * conversations, plus the administration links for an administrator.
+ *
+ * One row per conversation, never one per question. That is the distinction the
+ * whole list turns on: asking a follow-up extends the conversation it belongs to
+ * and leaves this list alone, so the number of rows is the number of threads the
+ * user has started rather than the number of questions they have asked.
+ *
+ * The administration links sit in the footer rather than above the conversations,
+ * so an employee's sidebar and an administrator's differ only by what is below the
+ * list: an employee who is not an administrator sees no administration section at
+ * all, rather than one that is present and disabled.
+ *
+ * This component renders content only. Every decision about *how* the sidebar
+ * is presented lives in `LayoutService`, so this sidebar, the header toggle
+ * and the content offset can never disagree about what is on screen.
+ */
+@Component({
+  selector: 'app-chat-sidebar',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [
+    AvatarComponent,
+    BrandLogoComponent,
+    ButtonComponent,
+    ConfirmDialogComponent,
+    ConversationItemComponent,
+    IconComponent,
+    InputComponent,
+    RouterLink,
+    RouterLinkActive,
+  ],
+  host: { class: 'relative flex h-full flex-col overflow-hidden bg-sidebar' },
+  template: `
+    @if (layout.isRail()) {
+      <!--
+        The rail is the expanded column with the labels taken off, not a different
+        sidebar. Everything below mirrors it: which controls are there, what order
+        they are in, and where the section switch sits. A rail that showed the
+        conversation list while the expanded column was showing the administration
+        links was offering a different set of destinations at a different height, so
+        collapsing the sidebar changed what the sidebar was for.
+      -->
+      <div class="flex h-full flex-col items-center px-3 pt-5 pb-4">
+        <app-brand-logo [showWordmark]="false" />
+
+        @if (showsAdminNav()) {
+          <!--
+            Administration, where the expanded column puts it. The heading is dropped
+            along with the labels, which is the only thing lost by collapsing: the
+            icons and their titles carry it.
+          -->
+          <nav class="mt-6 flex flex-col items-center gap-2" aria-label="Administration">
+            @for (item of adminNav; track item.path) {
+              <a
+                app-button
+                variant="ghost"
+                tone="dark"
+                size="rail"
+                [routerLink]="item.path"
+                [attr.aria-label]="item.label"
+                [title]="item.label"
+                (click)="layout.closeAfterNavigation()"
+              >
+                <app-icon [name]="item.icon" [size]="18" />
+              </a>
+            }
+          </nav>
+        } @else {
+          <button
+            app-button
+            type="button"
+            size="rail"
+            class="mt-6"
+            aria-label="New Conversation"
+            (click)="onNewConversation()"
+          >
+            <app-icon name="plus" [size]="18" />
+          </button>
+
+          <button
+            app-button
+            type="button"
+            variant="ghost"
+            tone="dark"
+            size="rail"
+            class="mt-4"
+            aria-label="Search conversations"
+            (click)="layout.openSidebar()"
+          >
+            <app-icon name="search" [size]="18" />
+          </button>
+
+          <div class="mt-4 flex flex-col items-center gap-2">
+            @for (conversation of conversations.conversations(); track conversation.id) {
+              <app-conversation-item
+                appearance="rail"
+                [conversation]="conversation"
+                [isSelected]="conversation.id === conversations.activeId()"
+                (selected)="openConversation($event)"
+              />
+            }
+          </div>
+        }
+
+        <!--
+          The section switch, in the same place as the expanded column's: pinned to
+          the bottom, immediately above the account. It was previously grouped with
+          the administration links at the top, which put it nowhere near where the
+          reader had just seen it and made the rail a different arrangement from the
+          column it is the collapsed form of.
+        -->
+        <div class="mt-auto flex flex-col items-center gap-3 pt-4">
+          @if (auth.isAdmin()) {
+            <a
+              app-button
+              variant="ghost"
+              tone="dark"
+              size="rail"
+              [routerLink]="showsAdminNav() ? '/' : '/admin'"
+              [attr.aria-label]="showsAdminNav() ? 'Ask' : 'View as admin'"
+              [title]="showsAdminNav() ? 'Ask' : 'View as admin'"
+              (click)="layout.closeAfterNavigation()"
+            >
+              <app-icon [name]="showsAdminNav() ? 'bot' : 'layout-dashboard'" [size]="18" />
+            </a>
+          }
+
+          <app-avatar
+            [initials]="initials()"
+            tone="outline"
+            [size]="32"
+            [label]="auth.user()?.name ?? ''"
+          />
+        </div>
+      </div>
+    } @else {
+      <!--
+        The administrator's section replaces the conversation controls outright
+        rather than sitting above them. Uploading a document and asking a question
+        about one are different jobs, and a column offering both at once leaves the
+        reader deciding which half of it applies to the screen they are on.
+      -->
+      @if (showsAdminNav()) {
+        <nav class="flex flex-col gap-1 px-4 pt-5" aria-label="Administration">
+          <p class="px-2 pb-2 text-xs font-medium text-sidebar-muted">Administration</p>
+
+          @for (item of adminNav; track item.path) {
+            <a
+              app-button
+              variant="ghost"
+              tone="dark"
+              size="md"
+              [fullWidth]="true"
+              [alignStart]="true"
+              [routerLink]="item.path"
+              routerLinkActive="bg-white/10 text-sidebar-foreground"
+              [routerLinkActiveOptions]="{ exact: item.path === '/admin' }"
+              (click)="layout.closeAfterNavigation()"
+            >
+              <app-icon [name]="item.icon" [size]="16" />
+              <span>{{ item.label }}</span>
+            </a>
+          }
+        </nav>
+      } @else {
+        <!-- The expanded column carries no mark: the view header names the
+             product instead, so the two never compete for the same corner. -->
+        <div class="px-4 pt-5">
+          <button
+            app-button
+            type="button"
+            size="lg"
+            [fullWidth]="true"
+            (click)="onNewConversation()"
+          >
+            <app-icon name="plus" [size]="16" />
+            <span>New Conversation</span>
+          </button>
+
+          <div class="mt-3">
+            <app-input
+              [value]="conversations.searchTerm()"
+              (valueChange)="conversations.setSearchTerm($event)"
+              placeholder="Search conversations"
+              ariaLabel="Search conversations"
+            />
+          </div>
+        </div>
+      }
+
+      @if (!showsAdminNav()) {
+        <nav
+          class="scrollbar-thin mt-4 min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2"
+          aria-label="Your conversations"
+        >
+          <div class="flex flex-col gap-1 pb-2">
+            @for (group of conversations.groups(); track group.bucket) {
+              <div class="px-3 pt-3 pb-1 text-xs font-medium text-sidebar-muted first:pt-0">
+                {{ group.bucket }}
+              </div>
+              @for (conversation of group.conversations; track conversation.id) {
+                <app-conversation-item
+                  appearance="sidebar"
+                  [conversation]="conversation"
+                  [isSelected]="conversation.id === conversations.activeId()"
+                  (selected)="openConversation($event)"
+                />
+              }
+            } @empty {
+              <p class="px-3 py-2 text-xs leading-relaxed text-sidebar-muted">
+                {{ emptyMessage() }}
+              </p>
+            }
+          </div>
+        </nav>
+      }
+
+      <!--
+        Pinned to the bottom of the column, below the conversations, so the account is
+        where every signed-in person expects to find it rather than moving about
+        depending on how many conversations there are.
+      -->
+      <div class="mt-auto">
+        <!--
+          The way to the other half of the app, sitting immediately above the account
+          row and above the rule that separates the two.
+
+          It is not inside the account card because it is not an account action. An
+          administrator switches between running the knowledge base and using it as
+          often as they sign in, and burying that behind a profile menu would make the
+          commoner of the two the harder one. Which label it carries depends on the
+          section: Ask from the dashboard, View as admin from a conversation, never
+          both.
+        -->
+        @if (auth.isAdmin()) {
+          <!--
+            Inset to match the administration links above it and the rail's own icons,
+            rather than the footer's own padding. The switch belongs to the navigation
+            it continues; only the account row below the rule is inset differently.
+          -->
+          <div class="px-4 pb-3">
+            <a
+              app-button
+              variant="ghost"
+              tone="dark"
+              size="md"
+              [fullWidth]="true"
+              [alignStart]="true"
+              [routerLink]="showsAdminNav() ? '/' : '/admin'"
+              (click)="layout.closeAfterNavigation()"
+            >
+              <app-icon [name]="showsAdminNav() ? 'bot' : 'layout-dashboard'" [size]="16" />
+              <span>{{ showsAdminNav() ? 'Ask' : 'View as admin' }}</span>
+            </a>
+          </div>
+        }
+
+        <div class="border-t border-white/10 p-3">
+          <!--
+            The positioning context for the card, and nothing more. It has to wrap the
+            row rather than the column: the card opens upwards from the name, and an
+            offset measured against the sidebar's own height puts it at the top of the
+            screen instead of beside the thing that opened it.
+          -->
+          <div class="relative">
+            <!--
+              The name is the control, not the decoration. It carries the account's
+              only action behind it, so an avatar alone would be a button whose effect
+              could not be guessed at, and a lone sign-out icon beside it would be a
+              destructive action one mis-click away with nothing to confirm it.
+            -->
+            <button
+              app-button
+              type="button"
+              variant="ghost"
+              tone="dark"
+              size="md"
+              [fullWidth]="true"
+              [alignStart]="true"
+              aria-haspopup="menu"
+              [attr.aria-expanded]="isAccountOpen()"
+              aria-label="Account menu"
+              (click)="toggleAccount()"
+            >
+              <app-avatar [initials]="initials()" tone="outline" [size]="28" />
+
+              <span class="min-w-0 flex-1 truncate text-left">{{ auth.user()?.name ?? '' }}</span>
+
+              <app-icon
+                name="chevron-down"
+                [size]="14"
+                class="shrink-0 transition-transform"
+                [class.rotate-180]="isAccountOpen()"
+              />
+            </button>
+
+            @if (isAccountOpen()) {
+              <!--
+                Dismissed by clicking anywhere outside it, and by Escape. The overlay
+                is a sibling of the card rather than a document listener, so the click
+                that opened the card cannot also be the one that closes it, and a click
+                inside the card is never mistaken for one outside it.
+              -->
+              <button
+                type="button"
+                class="fixed inset-0 z-40 cursor-default"
+                tabindex="-1"
+                aria-hidden="true"
+                (click)="closeAccount()"
+              ></button>
+
+              <div
+                class="animate-panel-rise absolute right-0 bottom-full left-0 z-50 mb-2
+                  overflow-hidden rounded-lg border border-border bg-card shadow-raised"
+                role="menu"
+                aria-label="Account"
+              >
+                <div class="flex items-center gap-2 px-3 py-3">
+                  <app-avatar [initials]="initials()" tone="muted" [size]="28" />
+
+                  <span class="min-w-0 flex-1">
+                    <span class="block truncate text-sm font-medium text-foreground">
+                      {{ auth.user()?.name ?? '' }}
+                    </span>
+                    <span class="block truncate text-xs text-muted-foreground">
+                      {{ auth.user()?.email ?? '' }}
+                    </span>
+                  </span>
+                </div>
+
+                <div class="border-t border-border"></div>
+
+                <button
+                  app-button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  class="w-full justify-start rounded-none text-left"
+                  role="menuitem"
+                  (click)="askToSignOut()"
+                >
+                  <app-icon name="log-out" [size]="15" />
+                  <span>Sign out</span>
+                </button>
+              </div>
+            }
+          </div>
+        </div>
+      </div>
+
+      <app-confirm-dialog
+        [isOpen]="isSignOutOpen()"
+        icon="log-out"
+        title="Sign out?"
+        message="You will be asked to sign in again. Your conversations stay saved to this browser."
+        confirmLabel="Sign out"
+        (confirmed)="signOut()"
+      />
+    }
+  `,
+})
+export class ChatSidebarComponent {
+  /** Layout state: breakpoint bucket, collapse preference and drawer. */
+  protected readonly layout = inject(LayoutService);
+
+  /** The conversation list and search term, shared with the conversations view. */
+  protected readonly conversations = inject(ConversationService);
+
+  /** Who is signed in, which decides whether the admin links are there at all. */
+  protected readonly auth = inject(AuthService);
+
+  /** The administrator's destinations, hidden from everybody else. */
+  protected readonly adminNav = ADMIN_NAV;
+
+  /** Which of the two sections the signed-in person is currently in. */
+  protected readonly section = inject(SectionService);
+
+  /**
+   * Whether the administration navigation is the sidebar's job right now.
+   *
+   * Only for an administrator, and only while they are on one of their own screens.
+   * An employee never sees it, and an administrator in the assistant is asking a
+   * question — where the conversation list is the navigation, and a section of three
+   * administration links would be competing with it for the same column.
+   */
+  protected readonly showsAdminNav = computed(
+    () => this.auth.isAdmin() && this.section.isAdminSection(),
+  );
+
+  /** The signed-in person's initials, or nothing before they have signed in. */
+  protected readonly initials = computed(() => {
+    const name = this.auth.user()?.name;
+
+    return name ? toInitials(name) : '';
+  });
+
+  /** Whether the sign-out confirmation is open. */
+  protected readonly isSignOutOpen = signal(false);
+
+  /** Whether the account card is open. */
+  protected readonly isAccountOpen = signal(false);
+
+  private readonly chat = inject(ChatService);
+  private readonly router = inject(Router);
+
+  /** Explains an empty list, distinguishing "none yet" from "no matches". */
+  protected readonly emptyMessage = computed(() =>
+    this.conversations.hasNoResults()
+      ? 'No conversations match your search.'
+      : 'No conversations yet. Ask one to get started.',
+  );
+
+  /**
+   * Ends the session, here and on the server.
+   *
+   * The order matters: the sign-out request goes first, so the refresh cookie is
+   * revoked while the browser still holds it, and the navigation happens whether it
+   * succeeds or not. Navigating first would race the request against a page that no
+   * longer sends it, and the session would survive on the server for as long as the
+   * cookie's own lifetime.
+   */
+  protected signOut(): void {
+    this.layout.closeAfterNavigation();
+
+    this.auth.logout().subscribe({
+      next: () => void this.router.navigate(['/login']),
+      // `logout` ends the local session either way, so there is nothing to report
+      // to a user who has already asked to be signed out.
+      error: () => void this.router.navigate(['/login']),
+    });
+  }
+
+  /** Opens the account card, or closes it if it is already open. */
+  protected toggleAccount(): void {
+    this.isAccountOpen.update((open) => !open);
+  }
+
+  /** Closes the account card without acting on anything in it. */
+  protected closeAccount(): void {
+    this.isAccountOpen.set(false);
+  }
+
+  /** Closes the card and asks to sign out, so the confirmation is not behind it. */
+  protected askToSignOut(): void {
+    this.closeAccount();
+    this.isSignOutOpen.set(true);
+  }
+
+  /**
+   * Escape closes the account card.
+   *
+   * On the document rather than the card, so it works wherever focus happens to be:
+   * the card is not a dialog, so nothing traps focus inside it, and the key could
+   * easily be pressed somewhere else on the page.
+   */
+  @HostListener('document:keydown.escape')
+  protected onEscape(): void {
+    this.closeAccount();
+  }
+
+  /** Starts a new conversation and returns to the dashboard. */
+  protected onNewConversation(): void {
+    this.chat.startNewConversation();
+    this.layout.closeAfterNavigation();
+    void this.router.navigate(['/']);
+  }
+
+  /** Opens the conversation a row stands for. */
+  protected openConversation(conversationId: string): void {
+    this.layout.closeAfterNavigation();
+    void this.router.navigate(['/response', conversationId]);
+  }
+}
