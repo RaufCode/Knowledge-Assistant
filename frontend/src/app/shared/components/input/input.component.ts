@@ -23,6 +23,11 @@ const TONE_CLASSES: Record<InputTone, { field: string; text: string; icon: strin
  * A single-line text field with a leading icon and a clear control, used for
  * searching conversations. Presentational: the value is a model, so changes
  * flow back out through it.
+ *
+ * Autofill is switched off with a search-specific name: a bare text field reads
+ * to the browser as an identity field, so it filled this box with the signed-in
+ * address on load — and every fill arrived as an `input` event, which the search
+ * faithfully applied as a filter matching nothing.
  */
 @Component({
   selector: 'app-input',
@@ -39,6 +44,8 @@ const TONE_CLASSES: Record<InputTone, { field: string; text: string; icon: strin
       <app-icon [name]="icon()" [size]="15" [label]="iconLabel()" [class]="iconClasses()" />
       <input
         type="text"
+        name="conversation-search"
+        autocomplete="off"
         class="w-full bg-transparent text-sm focus:outline-none"
         [class]="textClasses()"
         [placeholder]="placeholder()"
