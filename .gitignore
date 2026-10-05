@@ -1,0 +1,47 @@
+# Secrets — never commit. Backend/frontend have their own .gitignore
+# entries too; this is the belt to those braces.
+.env
+**/.env
+!**/.env.example
+*.pem
+*.key
+
+.idea
+.vscode
+node_modules
+history.db
+
+# Local SQLite databases. They hold password hashes and conversation text, so they
+# are never committed; the deployed data lives in Neon.
+*.db
+*.sqlite
+*.sqlite3
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Angular build residue
+frontend/dist/
+frontend/.angular/
+dist/
+out-tsc/
+*.tsbuildinfo
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tool caches
+.cache_ggshield
+.refact/

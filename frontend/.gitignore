@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# An accidental nested install. `npm install` run from inside this directory
+# creates frontend/frontend, which shadows this project and holds a second copy
+# of every dependency. It is build residue rather than a second app, so the
+# whole path is ignored rather than just the node_modules inside it.
+/frontend/
+
+# Build output
+dist/
+.angular/
+out-tsc/
+
+# Caches and logs
+*.tsbuildinfo
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Design mockups, kept out of the repository
+public/frontend_UI/
+
+# Editor and OS files
+.idea/
+# The workspace settings are shared so every contributor formats the same way;
+# anything personal under .vscode is not.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+.DS_Store
+Thumbs.db
