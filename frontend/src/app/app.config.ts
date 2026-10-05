@@ -10,6 +10,17 @@ import { AuthService } from './core/services/auth.service';
 
 const initializeApp = (configService: ConfigService, authService: AuthService) => async () => {
   await loadConfig(configService)();
+
+  // When a snapshot was restored from storage the app already renders the right
+  // page, so blocking the router on a revalidation would only hold a correct
+  // screen on a blank one. Revalidate in the background instead; the guards do
+  // the same, and a failed revalidation clears the user and redirects.
+  if (authService.isAuthenticated()) {
+    void authService.maybeBootstrap().catch(() => undefined);
+
+    return;
+  }
+
   await authService.maybeBootstrap();
 };
 

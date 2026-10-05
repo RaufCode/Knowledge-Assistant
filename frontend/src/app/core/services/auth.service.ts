@@ -61,6 +61,24 @@ export const CSRF_HEADER = 'X-CSRF-Token';
 const KNOWN_SESSION_KEY = 'knowledge-assistant.session';
 
 /**
+ * The last confirmed signed-in person, as plain JSON.
+ *
+ * Only the user object — id, name, email, role — never a token. Tokens live in
+ * `httpOnly` cookies and are never readable here, so there is nothing secret to
+ * steal out of this entry. Its only job is making a reload instant: without it,
+ * every refresh starts from "unknown" and must wait for `GET /me` before the
+ * guards may render, which is the frame where the wrong screen could appear.
+ * With it, the shell renders the right page immediately and the network only
+ * confirms what is already on screen.
+ *
+ * `localStorage`, not `sessionStorage`: a new tab is the same browser with the
+ * same cookies, so it should open signed in rather than ask again. Cleared the
+ * moment the user is cleared, so signing out never leaves a stale snapshot that
+ * a later reload would briefly render as somebody.
+ */
+const CACHED_USER_KEY = 'knowledge-assistant.user';
+
+/**
  * Where the app stands on authentication, which is not the same as not being signed
  * in.
  *
@@ -103,6 +121,22 @@ export class AuthService {
   private readonly userState = signal<UserDto | null>(null);
   private readonly statusState = signal<AuthStatus>('unknown');
   private readonly identity = inject(IdentityService);
+
+  constructor() {
+    // Restored synchronously so the first render already knows who is signed
+    // in. Without this, a refresh always starts from "unknown", blocks the
+    // router on a network round trip, and the sign-in screen can appear for a
+    // frame before the real page arrives. The snapshot is never trusted for
+    // decisions — `maybeBootstrap` still revalidates against the backend, and
+    // the backend still refuses unauthenticated data with 401/403.
+    const cached = this.readCachedUser();
+
+    if (cached) {
+      this.userState.set(cached);
+      this.statusState.set('authenticated');
+      this.identity.bindToAccount(cached.id);
+    }
+  }
 
   private get baseUrl(): string {
     return this.config.getApiBaseUrl();
@@ -190,6 +224,10 @@ export class AuthService {
     }
 
     if (this.hasKnownSession()) {
+      return true;
+    }
+
+    if (this.readCachedUser() !== null) {
       return true;
     }
 
@@ -841,11 +879,71 @@ export class AuthService {
     // another's conversations on a shared browser.
     this.identity.bindToAccount(user?.id ?? null);
     this.rememberSession(user !== null);
+    this.cacheUser(user);
 
     if (!user) {
       this.bootstrapPromise = null;
       // A token from the previous session would only mismatch the next one.
       this.csrfMemory = null;
+    }
+  }
+
+  /**
+   * The snapshot `maybeBootstrap` revalidates, or null when there is none.
+   *
+   * Validated rather than cast: storage is writable by anything on this origin,
+   * so a malformed entry must read as "no snapshot" rather than as a user.
+   * Only the four display fields are kept; anything resembling a token is
+   * ignored by construction because it is never written here.
+   */
+  private readCachedUser(): UserDto | null {
+    if (!this.isBrowser) {
+      return null;
+    }
+
+    try {
+      const raw = localStorage.getItem(CACHED_USER_KEY);
+
+      if (!raw) {
+        return null;
+      }
+
+      const parsed = JSON.parse(raw) as Partial<UserDto> | null;
+
+      if (
+        !parsed ||
+        typeof parsed.id !== 'string' ||
+        typeof parsed.name !== 'string' ||
+        typeof parsed.email !== 'string' ||
+        (parsed.role !== 'employee' && parsed.role !== 'admin')
+      ) {
+        return null;
+      }
+
+      return { id: parsed.id, name: parsed.name, email: parsed.email, role: parsed.role };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Keeps the snapshot in step with the session, or removes it on sign-out. */
+  private cacheUser(user: UserDto | null): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    try {
+      if (user) {
+        localStorage.setItem(
+          CACHED_USER_KEY,
+          JSON.stringify({ id: user.id, name: user.name, email: user.email, role: user.role }),
+        );
+      } else {
+        localStorage.removeItem(CACHED_USER_KEY);
+      }
+    } catch {
+      // Best effort, like every other use of storage here: losing the snapshot
+      // only costs the instant first paint, never correctness.
     }
   }
 

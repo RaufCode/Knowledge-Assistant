@@ -1,3 +1,5 @@
+import { vi } from 'vitest';
+
 import { provideHttpClient } from '@angular/common/http';
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { TestBed } from '@angular/core/testing';
@@ -127,6 +129,71 @@ describe('auth guards', () => {
       http.expectOne(`${API_BASE_URL}/api/auth/refresh`).error(new ProgressEvent('error'));
 
       expect(redirectedTo(await result)).toContain('/login');
+    });
+
+    it('lets a restored session through without waiting for the network', async () => {
+      // The bug this covers: on a refresh the app knew nobody until `/me`
+      // answered, so the sign-in screen could be shown for a frame before the real
+      // page arrived. The snapshot makes the answer available before the first
+      // render, so the guard answers immediately and `/me` only confirms it.
+      localStorage.setItem(
+        'knowledge-assistant.user',
+        JSON.stringify({
+          id: 'u1',
+          name: 'Ama Konadu',
+          email: 'ama@acmetech.example',
+          role: 'employee',
+        }),
+      );
+
+      const result = run(authGuard);
+
+      // Settled without anything being answered first.
+      expect(await result).toBe(true);
+
+      // The revalidation is still on its way, and the CSRF token that follows it.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      http.expectOne(`${API_BASE_URL}/api/auth/me`).flush({
+        id: 'u1',
+        name: 'Ama Konadu',
+        email: 'ama@acmetech.example',
+        role: 'employee',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      http.expectOne(`${API_BASE_URL}/api/auth/csrf`).flush({ csrf_token: 'a-token' });
+      http.verify();
+    });
+
+    it('sends a restored session to the sign-in screen once it is confirmed gone', async () => {
+      // The counterpart: letting the guard through early must not leave a dead
+      // session on a page that can load nothing. Reaching sign-in without a flash
+      // of the app is the whole behaviour.
+      localStorage.setItem(
+        'knowledge-assistant.user',
+        JSON.stringify({
+          id: 'u1',
+          name: 'Ama Konadu',
+          email: 'ama@acmetech.example',
+          role: 'employee',
+        }),
+      );
+
+      const navigate = vi.spyOn(router, 'navigate').mockResolvedValue(true);
+
+      expect(await run(authGuard)).toBe(true);
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      http
+        .expectOne(`${API_BASE_URL}/api/auth/me`)
+        .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      http
+        .expectOne(`${API_BASE_URL}/api/auth/refresh`)
+        .flush({ detail: 'No active session.' }, { status: 401, statusText: 'Unauthorized' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(navigate).toHaveBeenCalled();
+      expect(TestBed.inject(AuthService).isAuthenticated()).toBe(false);
     });
 
     it('asks only once however many guards run', async () => {

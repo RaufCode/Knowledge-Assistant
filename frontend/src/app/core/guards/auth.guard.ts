@@ -24,12 +24,28 @@ type Decision = boolean | UrlTree;
  */
 async function hasSession(): Promise<boolean> {
   const auth = inject(AuthService);
+  const router = inject(Router);
 
   // A server render cannot answer this: the cookies are in the browser and a render
   // has neither them nor the answer. This is also what keeps a prerender from
   // blocking on a call that could not succeed.
   if (!auth.isBrowserOnly()) {
     return false;
+  }
+
+  // Restored from the cached snapshot: the right page is already on screen, so
+  // answering now is what keeps a refresh from flashing the sign-in screen while
+  // the revalidation is still in flight.
+  //
+  // Not a hole. The revalidation still runs, and if it concludes the session is
+  // over it clears the user and this sends them to the sign-in screen — the same
+  // destination a data call's 401 would have produced, just reached without
+  // showing them a page that cannot load. Getting there early is the point;
+  // getting there is not optional.
+  if (auth.isAuthenticated()) {
+    void revalidateOrSignOut(auth, router);
+
+    return true;
   }
 
   // Asked through the hint-aware path, so a visitor with no session is told so
@@ -42,6 +58,28 @@ async function hasSession(): Promise<boolean> {
   }
 
   return auth.isAuthenticated();
+}
+
+/**
+ * Confirms a restored session in the background, and ends it if it is gone.
+ *
+ * A request that never reached the backend is not a session that ended, so it is
+ * swallowed: the page stays, its own data calls surface the outage as the
+ * retryable failures they are, and the next attempt revalidates. Only a settled
+ * "signed out" is a real answer and sends them to the sign-in screen.
+ */
+async function revalidateOrSignOut(auth: AuthService, router: Router): Promise<void> {
+  try {
+    await auth.maybeBootstrap();
+  } catch {
+    return;
+  }
+
+  if (auth.isAuthenticated()) {
+    return;
+  }
+
+  void router.navigate(['/login'], { queryParams: { returnUrl: router.url } });
 }
 
 /**

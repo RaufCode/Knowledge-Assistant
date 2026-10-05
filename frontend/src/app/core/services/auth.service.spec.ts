@@ -206,6 +206,88 @@ describe('AuthService', () => {
     });
   });
 
+  describe('restoring a session from storage', () => {
+    /**
+     * A service built the way a page load builds it.
+     *
+     * A new injector, because the one under test was constructed before the
+     * snapshot was written — and the whole point of the restore is what the
+     * *constructor* sees, not what a later call can be told.
+     */
+    const freshService = async (): Promise<AuthService> => {
+      TestBed.resetTestingModule();
+
+      await TestBed.configureTestingModule({ providers: [provideHttpClientTesting()] });
+
+      return TestBed.inject(AuthService);
+    };
+
+    const snapshot = { id: 'u1', name: 'Ama Konadu', email: 'ama@acmetech.example', role: 'admin' };
+
+    it('knows who is signed in before any request is made', async () => {
+      // The sign-in screen appearing for a frame on every refresh is what this
+      // prevents: the guards may render immediately because the answer is already
+      // here, rather than waiting a round trip to be told what they can see.
+      localStorage.setItem('knowledge-assistant.user', JSON.stringify(snapshot));
+
+      const restored = await freshService();
+
+      expect(restored.isAuthenticated()).toBe(true);
+      expect(restored.user()?.name).toBe('Ama Konadu');
+      expect(restored.isAdmin()).toBe(true);
+    });
+
+    it('revalidates it, rather than trusting the snapshot', async () => {
+      // The snapshot decides what to paint and nothing else. A session revoked
+      // elsewhere has to end on this tab too, which only asking can establish.
+      localStorage.setItem('knowledge-assistant.user', JSON.stringify(snapshot));
+
+      const restored = await freshService();
+      const revalidated = TestBed.inject(HttpTestingController);
+
+      const pending = restored.maybeBootstrap();
+
+      revalidated
+        .expectOne(ME)
+        .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
+      revalidated
+        .expectOne(`${API_BASE_URL}/api/auth/refresh`)
+        .flush({ detail: 'Not authenticated' }, { status: 401, statusText: 'Unauthorized' });
+
+      expect(await pending).toBeNull();
+      expect(restored.isAuthenticated()).toBe(false);
+      expect(localStorage.getItem('knowledge-assistant.user')).toBeNull();
+    });
+
+    it('ignores a snapshot it cannot make sense of', async () => {
+      // Storage is writable by anything on this origin, so a mangled entry has to
+      // read as "nothing remembered" rather than as a half-built user.
+      localStorage.setItem('knowledge-assistant.user', '{"id":"u1","role":"root"}');
+
+      const restored = await freshService();
+
+      expect(restored.isAuthenticated()).toBe(false);
+      expect(restored.looksSignedIn()).toBe(false);
+    });
+
+    it('forgets the snapshot on sign-out, so a later reload starts clean', () => {
+      auth.login('ama@acmetech.example', 'correct-horse-1!').subscribe();
+
+      http
+        .expectOne(`${API_BASE_URL}/api/auth/login`)
+        .flush({ user: snapshot });
+      http.expectOne(`${API_BASE_URL}/api/auth/csrf`).flush({ csrf_token: 'a-token' });
+
+      expect(localStorage.getItem('knowledge-assistant.user')).not.toBeNull();
+
+      auth.clear();
+
+      // A snapshot left behind would be read on the next load as a session, which
+      // is signing out in everything but name.
+      expect(localStorage.getItem('knowledge-assistant.user')).toBeNull();
+    });
+  });
+
     describe('verifySession', () => {
     it('is true when the cookies round-trip', async () => {
       let proven: boolean | null = null;
