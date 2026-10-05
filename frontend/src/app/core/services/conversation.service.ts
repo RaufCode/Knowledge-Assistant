@@ -199,6 +199,11 @@ export class ConversationService {
       // anything else having to ask for it, and disappear again after a sign-out.
       effect(() => this.syncToSession(this.auth.status()));
 
+      // Watching the account is what keeps threads from crossing between accounts
+      // on a shared browser: the id the backend scopes threads by already changed
+      // with it, so anything still on screen belongs to somebody else.
+      effect(() => this.syncToAccount(this.auth.user()?.id ?? null));
+
       return;
     }
 
@@ -211,6 +216,41 @@ export class ConversationService {
     // server's own knowledge and correct for the client, which is about to resolve
     // it. Settling still happens, so anything queueing on `ready()` is released.
     this.markSettled();
+  }
+
+  /** The account the state below was last brought in line with. */
+  private accountSeen: string | null | undefined = undefined;
+
+  /**
+   * Drops everything when the account changes.
+   *
+   * Reads the account rather than the status because signing out and back in as
+   * somebody else passes through the same statuses as staying put, and only the
+   * account says the threads on screen changed hands. Loading is left to the
+   * status sync: a sign-in flips the status and loads from there, so loading
+   * here as well would fetch the same list twice.
+   */
+  private syncToAccount(userId: string | null): void {
+    if (this.accountSeen === undefined) {
+      this.accountSeen = userId;
+
+      return;
+    }
+
+    if (userId === this.accountSeen) {
+      return;
+    }
+
+    this.accountSeen = userId;
+    this.conversationsState.set([]);
+    this.activeIdState.set(null);
+    this.messagesState.set([]);
+    this.missingState.set(null);
+    this.loadingState.set(false);
+    this.threadLoadingState.set(false);
+    // Settled when signed out (there is nothing to load); waiting when signed in
+    // (the status sync's load is on its way).
+    this.loadedState.set(userId === null);
   }
 
   /**

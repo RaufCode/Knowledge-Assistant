@@ -6,39 +6,57 @@ import { CLIENT_ID_STORAGE_KEY } from '../api.config';
 /**
  * Who this browser is, for the backend's purposes.
  *
- * Conversations are owned by a client id rather than a login, and this is the one
- * place that id comes from. It is generated once and kept in `localStorage`, so the
- * same browser keeps the same conversations across reloads and across tabs, and
- * every request that names a conversation carries it.
+ * Conversations are owned by a client id rather than a login, so one browser
+ * with one id would hand every account signed in on it the same threads: an
+ * employee signing in after an administrator would open the administrator's
+ * conversations. The id is therefore kept **per account** — the signed-in
+ * account's own id while signed in, and the anonymous one otherwise — so a
+ * thread is only ever listed, read or deleted beside the account that made it.
  *
- * It is an anonymous id and nothing more: it is not a credential, and the backend
- * uses it only to answer "are these conversations yours". Anyone who learns it can
- * list, read and delete that client's conversations, which is why it is stored
- * under a namespaced key and never sent anywhere the app does not already talk to.
+ * Each id is generated once and kept in `localStorage`, so an account keeps its
+ * own conversations across reloads and tabs. An id is not a credential, and the
+ * backend uses it only to answer "are these conversations yours".
  */
 @Injectable({ providedIn: 'root' })
 export class IdentityService {
   private readonly isBrowser = isPlatformBrowser(inject(PLATFORM_ID));
 
-  private readonly clientIdState = signal<string>(this.read());
+  private readonly clientIdState = signal<string>(this.read(CLIENT_ID_STORAGE_KEY));
 
-  /** The id this browser's conversations belong to. */
+  /** The id this browser's conversations belong to, for the current account. */
   readonly clientId = this.clientIdState.asReadonly();
 
   /**
-   * The existing id, or a new one the first time this browser asks.
+   * Points this browser at an account's own id, or back at the anonymous one.
+   *
+   * Called whenever the signed-in account changes, so threads never cross from
+   * one account to another on a shared browser. Switching back to an account
+   * restores the id it had before, so its threads come back with it.
+   */
+  bindToAccount(userId: string | null): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    this.clientIdState.set(
+      this.read(userId === null ? CLIENT_ID_STORAGE_KEY : `${CLIENT_ID_STORAGE_KEY}.${userId}`),
+    );
+  }
+
+  /**
+   * The existing id under this key, or a new one the first time it is asked for.
    *
    * Generated lazily rather than in the constructor so a server render does not
    * mint an id per request: a different id on every request would put a server
    * render's conversations somewhere no client can ever find them.
    */
-  private read(): string {
+  private read(key: string): string {
     if (!this.isBrowser) {
       return '';
     }
 
     try {
-      const stored = localStorage.getItem(CLIENT_ID_STORAGE_KEY);
+      const stored = localStorage.getItem(key);
 
       if (stored) {
         return stored;
@@ -50,14 +68,14 @@ export class IdentityService {
     }
 
     const created = newClientId();
-    this.persist(created);
+    this.persist(key, created);
 
     return created;
   }
 
-  private persist(clientId: string): void {
+  private persist(key: string, clientId: string): void {
     try {
-      localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId);
+      localStorage.setItem(key, clientId);
     } catch {
       // As above: the id works for this page either way.
     }

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
@@ -24,6 +24,7 @@ from app.database import (
     create_conversation,
     get_owned_conversation,
     init_db,
+    list_owned_conversations,
     touch,
 )
 from app.dependencies import get_current_user, get_db, open_db, require_csrf
@@ -178,18 +179,16 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 
 def owned_conversation_or_404(
-    db: Session, conversation_id: str, client_id: str | None
+    db: Session, conversation_id: str, user_id: str
 ):
-    """The conversation the caller may touch, or a 404 that leaks nothing.
+    """The conversation this account may touch, or a 404 that leaks nothing.
 
-    Conversations carry no shared secret, so a missing id and an id owned by
-    someone else answer the same way. The client_id always comes from the
-    caller, never from the conversation, so one client cannot read or delete
-    another's by guessing ids.
+    Conversations carry no shared secret, so a missing id and an id belonging to
+    somebody else answer the same way. The owner is taken from the session and never
+    from the request, so one account cannot read or delete another's by guessing ids
+    or by sending a `client_id` that happens to match.
     """
-    if client_id is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    conversation = get_owned_conversation(db, conversation_id, client_id)
+    conversation = get_owned_conversation(db, conversation_id, user_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conversation
@@ -216,61 +215,51 @@ def documents():
 @app.post("/api/conversations", response_model=ConversationCreateResponse)
 def create_conversation_endpoint(
     req: ConversationCreateRequest,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ):
-    """Opens a conversation for a client.
+    """Opens a conversation for the signed-in account.
 
     The only place a conversation is created, and it only runs on an explicit
     "New conversation": a message posted to a conversation id appends to that
-    conversation and never creates one. `client_id` marks who the conversation
-    belongs to, so every other route scopes its lookup by the same value the
-    client sends.
+    conversation and never creates one.
 
-    Signed-in only. The `client_id` below is still an anonymous browser id and
-    still decides ownership; this dependency is the outer wall, so an unauthenticated
-    caller cannot create, list or read conversations at all.
+    Owned by the account from the moment it exists. `client_id` is recorded beside
+    the owner because the client sends it and the sidebar groups by it, but it grants
+    nothing — an account's threads are found by its session, so they follow the
+    person to another browser and cannot be reached by another account on this one.
     """
-    conversation = create_conversation(db, req.client_id)
-    logger.info("created conversation %s for client %s", conversation.id, req.client_id)
+    conversation = create_conversation(db, req.client_id, user.id)
+    logger.info("created conversation %s for user %s", conversation.id, user.id)
     return conversation
 
 
 @app.get("/api/conversations", response_model=ConversationListResponse)
 def list_conversations(
-    client_id: str = Query(min_length=8, max_length=64),
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """The client's conversations, most recently active first.
+    """This account's conversations, most recently active first.
 
-    The whole sidebar: one entry per conversation, not per message, so starting
-    a new conversation adds one row and asking follow-ups never does.
+    The whole sidebar: one entry per conversation, not per message, so starting a new
+    conversation adds one row and asking follow-ups never does.
 
-    Only conversations holding at least one message are listed. A row exists from
-    the moment a conversation is created and its first question is committed, so a
-    conversation created and then abandoned — a closed tab, a failed send — would
-    otherwise appear here forever as an empty thread nobody asked for. Hiding it at
-    the source means no client has to decide what counts as a real conversation.
+    Takes no `client_id`: the account is the whole scope, so this cannot be widened
+    by anything the caller sends. A `?client_id` an older client still appends is
+    ignored rather than rejected, so both ship shapes keep working.
     """
-    conversations = db.scalars(
-        select(Conversation)
-        .where(Conversation.client_id == client_id, Conversation.messages.any())
-        .order_by(Conversation.updated_at.desc())
-    ).all()
-    return {"conversations": conversations}
+    return {"conversations": list_owned_conversations(db, user.id)}
 
 
 @app.get("/api/conversations/{conversation_id}", response_model=ConversationDetailResponse)
 def get_conversation(
     conversation_id: str,
-    client_id: str = Query(min_length=8, max_length=64),
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """One conversation's full thread, oldest message first."""
-    conversation = owned_conversation_or_404(db, conversation_id, client_id)
+    conversation = owned_conversation_or_404(db, conversation_id, user.id)
     return {
         "id": conversation.id,
         "title": conversation.title,
@@ -282,13 +271,13 @@ def get_conversation(
 def rename_conversation(
     conversation_id: str,
     req: ConversationRenameRequest,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ):
     """Renames a conversation. The generated title is only a default."""
 
-    conversation = owned_conversation_or_404(db, conversation_id, req.client_id)
+    conversation = owned_conversation_or_404(db, conversation_id, user.id)
     conversation.title = req.title.strip()
     touch(db, conversation)
     return conversation
@@ -297,13 +286,12 @@ def rename_conversation(
 @app.delete("/api/conversations/{conversation_id}")
 def delete_conversation(
     conversation_id: str,
-    client_id: str = Query(min_length=8, max_length=64),
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ):
-    """Removes a conversation and its messages from the client's list."""
-    conversation = owned_conversation_or_404(db, conversation_id, client_id)
+    """Removes a conversation and every message in it."""
+    conversation = owned_conversation_or_404(db, conversation_id, user.id)
     db.delete(conversation)
     db.commit()
     return {"status": "deleted"}
@@ -313,13 +301,13 @@ def delete_conversation(
 def send_message(
     conversation_id: str,
     req: MessageSendRequest,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     _csrf: None = Depends(require_csrf),
     db: Session = Depends(get_db),
 ):
     """Asks inside an existing conversation, as a stream.
 
-    The conversation must already exist and belong to the calling client; a
+    The conversation must already exist and belong to the calling account; a
     message never creates one, so a stale id surfaces as a plain 404 rather than
     silently starting a new conversation. The user message is recorded before
     the stream opens and the assistant's answer when it finishes, so a stream
@@ -330,7 +318,7 @@ def send_message(
     citations. After the very first exchange the stream also ends with a `title`
     event naming the conversation, and that title replaces the placeholder.
     """
-    conversation = owned_conversation_or_404(db, conversation_id, req.client_id)
+    conversation = owned_conversation_or_404(db, conversation_id, user.id)
 
     was_empty = (
         db.scalar(

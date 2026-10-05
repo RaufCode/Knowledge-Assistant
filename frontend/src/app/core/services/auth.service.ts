@@ -4,6 +4,7 @@ import { Injectable, PLATFORM_ID, computed, inject, signal } from '@angular/core
 import { Observable, catchError, firstValueFrom, map, of, tap } from 'rxjs';
 
 import { ConfigService } from '../config.service';
+import { IdentityService } from './identity.service';
 import {
   AccessRequestDecisionDto,
   AccessRequestDecisionRequestDto,
@@ -73,6 +74,7 @@ export class AuthService {
 
   private readonly userState = signal<UserDto | null>(null);
   private readonly statusState = signal<AuthStatus>('unknown');
+  private readonly identity = inject(IdentityService);
 
   private get baseUrl(): string {
     return this.config.getApiBaseUrl();
@@ -681,6 +683,10 @@ export class AuthService {
   private setUser(user: UserDto | null): void {
     this.userState.set(user);
     this.statusState.set(user ? 'authenticated' : 'anonymous');
+    // Threads belong to the account that made them: point the browser at this
+    // account's own id (or back at the anonymous one) so no account ever opens
+    // another's conversations on a shared browser.
+    this.identity.bindToAccount(user?.id ?? null);
 
     if (!user) {
       this.bootstrapPromise = null;

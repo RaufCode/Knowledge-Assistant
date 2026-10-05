@@ -30,6 +30,20 @@ class Conversation(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     client_id: Mapped[str] = mapped_column(String(64), index=True)
+    # The account that owns it, and the only thing that decides that.
+    #
+    # Ownership used to be `client_id` alone, which is a value the browser
+    # supplies and the server never checks against anything. Two accounts on one
+    # browser therefore opened each other's threads. The account is known to the
+    # server from the session, so it is what a conversation belongs to;
+    # `client_id` is still recorded beside it because the client sends it and
+    # the sidebar groups by it, but it grants nothing.
+    #
+    # Nullable only so rows written before this column existed still open; they
+    # are readable by nobody, because a conversation with no known owner cannot
+    # be shown to a caller without guessing. There is nothing to migrate them
+    # onto. Added to live tables by `_ensure_missing_columns` on startup.
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None, index=True)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
@@ -208,8 +222,8 @@ class AccessRequest(Base):
 Index("ix_refresh_sessions_user_live", RefreshSession.user_id, RefreshSession.revoked_at)
 
 
-def create_conversation(db: SessionLocal, client_id: str) -> Conversation:
-    conversation = Conversation(id=uuid4().hex, client_id=client_id)
+def create_conversation(db: SessionLocal, client_id: str, user_id: str) -> Conversation:
+    conversation = Conversation(id=uuid4().hex, client_id=client_id, user_id=user_id)
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
@@ -217,18 +231,34 @@ def create_conversation(db: SessionLocal, client_id: str) -> Conversation:
 
 
 def get_owned_conversation(
-    db: SessionLocal, conversation_id: str, client_id: str
+    db: SessionLocal, conversation_id: str, user_id: str
 ) -> Conversation | None:
-    """The conversation, but only if it belongs to the calling client.
+    """The conversation, but only if it belongs to the calling account.
 
     Conversations carry no shared secret, so ownership is the whole boundary:
-    a client that knows an id it does not own is answered exactly like a client
+    an account that knows an id it does not own is answered exactly like one
     that guessed an id that never existed, instead of being told it exists.
     """
     conversation = db.get(Conversation, conversation_id)
-    if conversation is None or conversation.client_id != client_id:
+    if conversation is None or conversation.user_id != user_id:
         return None
     return conversation
+
+
+def list_owned_conversations(db: SessionLocal, user_id: str) -> list[Conversation]:
+    """This account's conversations with something in them, most recently active first.
+
+    Only conversations holding at least one message are listed: a row exists from
+    the moment it is created, so an abandoned one would otherwise sit in the
+    sidebar forever as a thread nobody asked for.
+    """
+    return list(
+        db.scalars(
+            select(Conversation)
+            .where(Conversation.user_id == user_id, Conversation.messages.any())
+            .order_by(Conversation.updated_at.desc())
+        ).all()
+    )
 
 
 def touch(db: SessionLocal, conversation: Conversation) -> None:
