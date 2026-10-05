@@ -1,4 +1,3 @@
-import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -11,15 +10,11 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
-    inspect,
     select,
-    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 from app.config import settings
-
-logger = logging.getLogger(__name__)
 
 _args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(settings.database_url, connect_args=_args, pool_pre_ping=True)
@@ -34,23 +29,7 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    # The browser this conversation was started from. Kept for continuity — it is
-    # what the client sends and what the sidebar groups by — but NOT what decides
-    # who may read it. See `user_id`.
     client_id: Mapped[str] = mapped_column(String(64), index=True)
-    # The account that owns it, and the only thing that decides that.
-    #
-    # Ownership used to be `client_id` alone, which is a value the browser supplies
-    # and the server never checks against anything. That is a bearer token with no
-    # expiry: two people sharing a browser profile, a copied localStorage value or a
-    # single sign-on that hands the same id to two accounts all see each other's
-    # threads, and one of them can delete them. The account is known to the server
-    # from the session cookie, so it is the account the conversation belongs to.
-    #
-    # Nullable only so that rows written before this column existed still open; they
-    # are not readable by anybody, because a conversation with no known owner cannot
-    # be shown to a caller without guessing. There is nothing to migrate them onto.
-    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None, index=True)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
@@ -76,14 +55,6 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(16))
     content: Mapped[str] = mapped_column(Text)
     sources: Mapped[list | None] = mapped_column(JSON, nullable=True, default=None)
-    # How the assistant answered, on an assistant message and null on a question.
-    #
-    # Stored rather than re-derived, because four different replies carry no sources
-    # at all: a grounded answer, a greeting, a confidentiality notice and a genuine
-    # gap in the corpus. Sources alone cannot tell those apart, so a thread reopened
-    # from the database would render a greeting as a failed document search — the
-    # same answer shown two different ways depending on when it was read.
-    status: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -192,10 +163,9 @@ class AccessRequest(Base):
     because a domain check only proves they typed it, and a request form with no
     approval step is the same thing with more typing.
 
-    A row here is a *request*. It is not authority over anything: it carries the role
-    the person asked for so an administrator can see and change it, and the role
-    that is actually granted is the one on the approval, which only an administrator
-    sends. Asking for `admin` is not a smaller step towards `admin`.
+    A row here is a *request*, not a half-made account. No user row exists until an
+    administrator approves one, so a request cannot be logged into and cannot be
+    escalated by asking for a role nobody granted.
     """
 
     __tablename__ = "access_requests"
@@ -203,11 +173,6 @@ class AccessRequest(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
     email: Mapped[str] = mapped_column(String(255), index=True)
-    # What the person asked for. Advisory only, and shown to the administrator as
-    # the thing to check rather than the thing to grant.
-    requested_role: Mapped[str | None] = mapped_column(
-        String(16), nullable=True, default=None
-    )
     # `pending` until an administrator decides. Kept as a plain string rather than
     # an enum so the column can grow a state without a migration.
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
@@ -227,6 +192,13 @@ class AccessRequest(Base):
     invite_token: Mapped[str | None] = mapped_column(
         String(64), nullable=True, default=None
     )
+    # bcrypt hash of the password chosen at registration. Set for every request
+    # made since the register form grew password fields; null for older rows,
+    # which fall back to the invitation flow on approval. Never the plaintext:
+    # a queue an administrator reads must not contain a password anybody could.
+    password_hash: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, default=None
+    )
 
 
 # Refresh tokens are looked up by user when a family is revoked, and by family
@@ -236,8 +208,8 @@ class AccessRequest(Base):
 Index("ix_refresh_sessions_user_live", RefreshSession.user_id, RefreshSession.revoked_at)
 
 
-def create_conversation(db: SessionLocal, client_id: str, user_id: str) -> Conversation:
-    conversation = Conversation(id=uuid4().hex, client_id=client_id, user_id=user_id)
+def create_conversation(db: SessionLocal, client_id: str) -> Conversation:
+    conversation = Conversation(id=uuid4().hex, client_id=client_id)
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
@@ -245,68 +217,23 @@ def create_conversation(db: SessionLocal, client_id: str, user_id: str) -> Conve
 
 
 def get_owned_conversation(
-    db: SessionLocal, conversation_id: str, user_id: str
+    db: SessionLocal, conversation_id: str, client_id: str
 ) -> Conversation | None:
-    """The conversation, but only if the signed-in account owns it.
+    """The conversation, but only if it belongs to the calling client.
 
-    Scoped on the account and nothing else. `client_id` used to decide this, which
-    meant the caller's own browser id was the boundary: a value the caller supplies,
-    never verified, and identical for every account using that browser.
-
-    A conversation carries no shared secret, so a miss is answered exactly like an id
-    that never existed, rather than confirming that it does.
+    Conversations carry no shared secret, so ownership is the whole boundary:
+    a client that knows an id it does not own is answered exactly like a client
+    that guessed an id that never existed, instead of being told it exists.
     """
     conversation = db.get(Conversation, conversation_id)
-    if conversation is None or conversation.user_id != user_id:
+    if conversation is None or conversation.client_id != client_id:
         return None
     return conversation
-
-
-def list_owned_conversations(db: SessionLocal, user_id: str) -> list[Conversation]:
-    """Every conversation this account owns, most recently active first.
-
-    The account's own threads and nothing else, so signing in on a second machine
-    brings the conversation list with it rather than leaving it on whichever browser
-    happened to ask the question.
-    """
-    return list(
-        db.scalars(
-            select(Conversation)
-            .where(Conversation.user_id == user_id)
-            .order_by(Conversation.updated_at.desc())
-        ).all()
-    )
 
 
 def touch(db: SessionLocal, conversation: Conversation) -> None:
     conversation.updated_at = datetime.now(timezone.utc)
     db.commit()
-
-
-def revoke_all_sessions(db: SessionLocal, user_id: str) -> int:
-    """Ends every live session for an account, and says how many it ended.
-
-    Used when a password is reset and when an account is deleted. In both cases a
-    session that survived would defeat the point: a reset that leaves the old
-    sessions running resets nothing, because whoever prompted it — or whoever copied
-    the cookie — is still signed in.
-
-    Revoked rather than deleted, so the rows remain as a record that a session once
-    existed and was ended deliberately.
-    """
-    now = datetime.now(timezone.utc)
-    live = db.scalars(
-        select(RefreshSession).where(
-            RefreshSession.user_id == user_id, RefreshSession.revoked_at.is_(None)
-        )
-    ).all()
-
-    for session in live:
-        session.revoked_at = now
-
-    db.commit()
-
-    return len(live)
 
 
 def get_user(db: SessionLocal, user_id: str) -> User | None:
@@ -370,58 +297,103 @@ def revoke_family(db: SessionLocal, family_id: str) -> int:
 
 
 def init_db() -> None:
-    """Create anything missing, then bring existing tables up to the models.
-
-    Two steps because they do different jobs. `create_all` makes tables that do not
-    exist; it will not touch one that already does, so a column added to a model
-    afterwards is simply absent from a database created before it. The second step
-    closes that gap by adding the columns the models now declare and the table does
-    not have.
-    """
     Base.metadata.create_all(engine)
-    add_missing_columns()
+    _ensure_missing_columns()
+    _ensure_missing_indexes()
 
 
-def add_missing_columns() -> None:
-    """Add any column the models declare that an existing table is missing.
+def _ensure_missing_columns() -> None:
+    """Adds columns that `create_all` cannot.
 
-    Additive only, and only for nullable columns, which is the safe half of what a
-    schema change can be: nothing is dropped, renamed or retyped, so there is no
-    data to lose and no row to rewrite. A column that would need a backfill or a
-    non-null constraint is left alone and logged, because inventing a default for
-    somebody's data is a decision this function must not make on its own.
+    `create_all` only creates tables that do not exist yet; it never alters a
+    table that is already there. The deployed database was created before the
+    auth tables (and the `name` column on `users`) existed, so a deploy that
+    only calls `create_all` leaves a stale `users` table behind and every
+    sign-in fails with `UndefinedColumn: column users.name does not exist`.
 
-    Worth being plain about the limit: this is not a migration framework. It brings
-    a database up to date with *added* columns and will say so loudly when it cannot.
-    Renames and type changes still need a human, because there is no safe mechanical
-    answer to "is this the old `hashed_password` or a new empty one".
+    This walks every mapped table, compares the model's columns against the
+    ones the database actually has, and adds whatever is missing with a plain
+    `ADD COLUMN`. Columns are added nullable (no `NOT NULL` constraint) even
+    when the model declares them required, because adding a `NOT NULL` column
+    without a default to a non-empty table fails on PostgreSQL — and a stale
+    row with a `NULL` there is a data problem, not a reason to refuse startup.
+    Idempotent: a column that already exists is skipped. The `try/except`
+    around the `ALTER` covers the race where two workers start at once and
+    both see the column as missing — the loser treats "already exists" as
+    success rather than crashing startup.
     """
+    import logging
+
+    from sqlalchemy import inspect, text
+    from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError
+
+    logger = logging.getLogger(__name__)
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
 
-    for table in Base.metadata.sorted_tables:
+    for table in Base.metadata.tables.values():
         if table.name not in existing_tables:
-            continue
-
-        present = {column["name"] for column in inspector.get_columns(table.name)}
-
+            continue  # `create_all` just created it with the full shape.
+        existing_columns = {
+            column["name"] for column in inspector.get_columns(table.name)
+        }
         for column in table.columns:
-            if column.name in present:
+            if column.name in existing_columns:
                 continue
+            column_type = column.type.compile(dialect=engine.dialect)
+            try:
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            f'ALTER TABLE "{table.name}" '
+                            f'ADD COLUMN "{column.name}" {column_type}'
+                        )
+                    )
+            except (OperationalError, ProgrammingError, DBAPIError) as exc:
+                # Re-read: if the column is there now, another worker won the
+                # race — that is success. Anything else is re-raised.
+                refreshed = {
+                    c["name"]
+                    for c in inspect(engine).get_columns(table.name)
+                }
+                if column.name in refreshed:
+                    continue
+                raise RuntimeError(
+                    f"could not add missing column "
+                    f"{table.name}.{column.name}: {exc}"
+                ) from exc
+            logger.warning(
+                "migrated table %s: added missing column %s",
+                table.name,
+                column.name,
+            )
 
-            if not column.nullable:
-                logger.warning(
-                    "not adding %s.%s: it is NOT NULL and needs a backfilled default",
-                    table.name,
-                    column.name,
-                )
-                continue
 
-            ddl = column.type.compile(dialect=engine.dialect)
+def _ensure_missing_indexes() -> None:
+    """Creates indexes that `create_all` skipped on pre-existing tables.
 
+    Like columns, an index on a table that already existed is never created by
+    `create_all` — the table is left exactly as it was. A missing index cannot
+    cause a 500 (the query still runs, just slower), but a missing index on a
+    hot lookup (`users.email`, `refresh_sessions.family_id`,
+    `conversations.client_id`, …) turns every sign-in into a full table scan,
+    so they are created here. `IF NOT EXISTS` makes this idempotent and safe
+    under concurrent startup on both PostgreSQL and SQLite.
+    """
+    import logging
+
+    from sqlalchemy import text
+
+    logger = logging.getLogger(__name__)
+    for table in Base.metadata.tables.values():
+        for index in table.indexes:
+            # `index.name` is always set: SQLAlchemy generates one
+            # (`ix_<table>_<column>`) for every `index=True` column.
+            column_list = ", ".join(f'"{c.name}"' for c in index.columns)
+            statement = (
+                f'CREATE INDEX IF NOT EXISTS "{index.name}" '
+                f'ON "{table.name}" ({column_list})'
+            )
             with engine.begin() as connection:
-                connection.execute(
-                    text(f'ALTER TABLE {table.name} ADD COLUMN "{column.name}" {ddl}')
-                )
-
-            logger.info("added missing column %s.%s", table.name, column.name)
+                connection.execute(text(statement))
+                logger.debug("ensured index %s", index.name)

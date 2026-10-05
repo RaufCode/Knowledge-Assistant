@@ -147,29 +147,6 @@ class ConversationTestCase(unittest.TestCase):
         """The double-submit header, which every state-changing route now needs."""
         return {"X-CSRF-Token": self.csrf_token}
 
-    def sign_in_as(self, user_id: str, email: str, name: str, role: str = "employee") -> None:
-        """Makes this client a different account.
-
-        Ownership is decided by the account in the session cookie, so testing it
-        needs two accounts rather than two `client_id` values. Changing the cookie is
-        the whole of it — which is the point: `client_id` is now recorded beside the
-        owner and grants nothing.
-        """
-        other = User(
-            id=user_id,
-            email=email,
-            name=name,
-            role=role,
-            password_hash=hash_password("another-password"),
-            is_active=True,
-        )
-        self.db.add(other)
-        self.db.commit()
-
-        token, _ = create_access_token(other.id, other.role)
-        self.client.cookies.set(ACCESS_COOKIE, token)
-        self.addCleanup(self.client.cookies.delete, ACCESS_COOKIE)
-
     def new_conversation(self, client_id: str = CLIENT_A) -> str:
         """Creates a conversation through the endpoint, as a client would."""
         response = self.client.post(
@@ -272,255 +249,63 @@ class OneConversationPerThreadTest(ConversationTestCase):
 
 
 class OwnershipTest(ConversationTestCase):
-    """One account's conversations are invisible to every other account.
-
-    Two accounts rather than two `client_id` values, because that is what ownership
-    is decided on now. Before that, `client_id` was the boundary: a value the caller
-    supplied and the server never checked, so a second account presenting the same
-    one could read a thread and delete it. These are the tests that would have caught
-    that, written against the two-account case that exposes it.
-    """
-
-    OTHER_ID = "test-employee-two"
-    OTHER_EMAIL = f"kwame.osei@{settings.email_domain}"
-
-    def setUp(self) -> None:
-        super().setUp()
-        self.conversation_id = self.new_conversation(CLIENT_A)
-        self.assertEqual(self.ask(self.conversation_id, "How much leave?").status_code, 200)
-
-    def as_another_account(self) -> None:
-        self.sign_in_as(self.OTHER_ID, self.OTHER_EMAIL, "Kwame Osei")
-
-    def test_another_account_cannot_read_a_conversation_it_does_not_own(self):
-        self.as_another_account()
-
-        response = self.client.get(f"/api/conversations/{self.conversation_id}")
-
-        # A missing id and someone else's id answer the same way, so ownership cannot
-        # be probed by the shape of the error.
-        self.assertEqual(response.status_code, 404, response.text)
-
-    def test_the_same_client_id_does_not_grant_access_to_another_account(self):
-        # The exact shape of the leak this replaced. `client_id` is still recorded and
-        # still sent, and it must now decide nothing at all.
-        self.as_another_account()
+    def test_another_client_cannot_read_a_conversation_it_does_not_own(self):
+        conversation_id = self.new_conversation(CLIENT_A)
+        self.ask(conversation_id, "How much leave?")
 
         response = self.client.get(
-            f"/api/conversations/{self.conversation_id}", params={"client_id": CLIENT_A}
+            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_B}
         )
 
+        # A missing id and someone else's id answer the same way, so ownership
+        # cannot be probed by the shape of the error.
         self.assertEqual(response.status_code, 404, response.text)
 
-    def test_each_account_sees_only_its_own_conversations(self):
-        listed = [
-            item["id"]
-            for item in self.client.get("/api/conversations").json()["conversations"]
-        ]
-        self.assertEqual(listed, [self.conversation_id])
+    def test_each_client_sees_only_its_own_conversations(self):
+        mine = self.new_conversation(CLIENT_A)
+        self.assertEqual(self.ask(mine, "In mine?").status_code, 200)
 
-        self.as_another_account()
+        theirs = self.new_conversation(CLIENT_B)
+        # Asked as CLIENT_B, which the ownership check on the endpoint requires. Asking
+        # as the other client is a 404, and an unasked conversation is not listed, so
+        # the status is asserted rather than left to show up as an empty list later.
+        self.assertEqual(self.ask(theirs, "In theirs?", CLIENT_B).status_code, 200)
 
-        # Same browser, same client_id, different account: an empty list, not the
-        # first account's conversation.
         self.assertEqual(
-            self.client.get("/api/conversations").json()["conversations"], []
+            [item["id"] for item in self.client.get(
+                "/api/conversations", params={"client_id": CLIENT_A}
+            ).json()["conversations"]],
+            [mine],
+        )
+        self.assertEqual(
+            [item["id"] for item in self.client.get(
+                "/api/conversations", params={"client_id": CLIENT_B}
+            ).json()["conversations"]],
+            [theirs],
         )
 
-    def test_another_account_cannot_delete_a_conversation_it_does_not_own(self):
-        self.as_another_account()
+    def test_another_client_cannot_delete_a_conversation_it_does_not_own(self):
+        conversation_id = self.new_conversation(CLIENT_A)
 
         response = self.client.delete(
-            f"/api/conversations/{self.conversation_id}", headers=self.csrf_headers()
+            f"/api/conversations/{conversation_id}",
+            params={"client_id": CLIENT_B},
+            headers=self.csrf_headers(),
         )
 
         self.assertEqual(response.status_code, 404, response.text)
-        self.assertEqual(self.conversations_in_db(), [self.conversation_id])
+        self.assertEqual(self.conversations_in_db(), [conversation_id])
 
-    def test_another_account_cannot_rename_a_conversation_it_does_not_own(self):
-        self.as_another_account()
+    def test_another_client_cannot_rename_a_conversation_it_does_not_own(self):
+        conversation_id = self.new_conversation(CLIENT_A)
 
         response = self.client.patch(
-            f"/api/conversations/{self.conversation_id}",
+            f"/api/conversations/{conversation_id}",
             json={"client_id": CLIENT_B, "title": "Stolen"},
             headers=self.csrf_headers(),
         )
 
         self.assertEqual(response.status_code, 404, response.text)
-
-    def test_another_account_cannot_post_into_a_conversation_it_does_not_own(self):
-        self.as_another_account()
-
-        response = self.ask(self.conversation_id, "In here?", CLIENT_B)
-
-        self.assertEqual(response.status_code, 404, response.text)
-
-    def test_another_account_cannot_edit_a_question_it_does_not_own(self):
-        question = self.messages_in_db(self.conversation_id)[0]
-
-        self.as_another_account()
-
-        response = self.client.patch(
-            f"/api/conversations/{self.conversation_id}/messages/{question.id}",
-            json={"client_id": CLIENT_B, "content": "Rewritten by somebody else?"},
-            headers=self.csrf_headers(),
-        )
-
-        self.assertEqual(response.status_code, 404, response.text)
-        self.assertEqual(self.messages_in_db(self.conversation_id)[0].content, "How much leave?")
-
-    def test_the_same_account_sees_its_conversation_from_a_second_browser(self):
-        # The other side of moving ownership onto the account: a person signing in on
-        # another machine brings their threads with them, instead of finding an empty
-        # sidebar because the conversations were filed under the first browser's id.
-        listed = [
-            item["id"]
-            for item in self.client.get("/api/conversations").json()["conversations"]
-        ]
-        self.assertEqual(listed, [self.conversation_id])
-
-        conversation_id = self.new_conversation(CLIENT_B)
-        self.assertEqual(self.ask(conversation_id, "In mine?").status_code, 200)
-
-        # Both are listed, because both belong to this account.
-        self.assertEqual(
-            sorted(
-                item["id"]
-                for item in self.client.get("/api/conversations").json()["conversations"]
-            ),
-            sorted([self.conversation_id, conversation_id]),
-        )
-
-
-class EditMessageTest(ConversationTestCase):
-    """Correcting a question already asked."""
-
-    def ask_exchange(self, question: str) -> tuple[str, str]:
-        """Asks one question, returning the ids of the question and its answer."""
-        conversation_id = self.new_conversation()
-        self.assertEqual(self.ask(conversation_id, question).status_code, 200)
-
-        messages = self.messages_in_db(conversation_id)
-
-        return conversation_id, messages[0].id
-
-    def edit(self, conversation_id: str, message_id: str, content: str, client_id: str = CLIENT_A):
-        return self.client.patch(
-            f"/api/conversations/{conversation_id}/messages/{message_id}",
-            json={"client_id": client_id, "content": content},
-            headers=self.csrf_headers(),
-        )
-
-    def test_a_question_can_be_corrected(self):
-        conversation_id, question_id = self.ask_exchange("How much leave?")
-
-        response = self.edit(conversation_id, question_id, "How much annual leave do I get?")
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["content"], "How much annual leave do I get?")
-        self.assertEqual(self.messages_in_db(conversation_id)[0].content, "How much annual leave do I get?")
-
-    def test_the_answer_generated_from_the_old_wording_is_removed(self):
-        # An answer to words that are no longer on screen would be an answer to a
-        # question nobody asked. The client re-asks the corrected text, so what the
-        # reader ends up with was written for the question actually shown.
-        conversation_id, question_id = self.ask_exchange("How much leave?")
-
-        self.edit(conversation_id, question_id, "How much annual leave do I get?")
-
-        messages = self.messages_in_db(conversation_id)
-        self.assertEqual([m.role for m in messages], ["user"])
-        self.assertEqual(messages[0].content, "How much annual leave do I get?")
-
-    def test_only_the_exchange_is_removed_and_a_follow_up_survives(self):
-        conversation_id = self.new_conversation()
-        self.assertEqual(self.ask(conversation_id, "First?").status_code, 200)
-        self.assertEqual(self.ask(conversation_id, "Second?").status_code, 200)
-
-        messages = self.messages_in_db(conversation_id)
-        self.assertEqual(len(messages), 4)
-        first_question = messages[0].id
-
-        self.edit(conversation_id, first_question, "First, corrected?")
-
-        # The corrected question is left unanswered, which is the truth: its answer was
-        # written for the words that were just replaced. The follow-up was asked with
-        # this exchange in view, so discarding it would take away something the person
-        # can still see — its answer survives with it.
-        remaining = self.messages_in_db(conversation_id)
-        self.assertEqual(
-            [(m.role, m.content) for m in remaining],
-            [
-                ("user", "First, corrected?"),
-                ("user", "Second?"),
-                ("assistant", remaining[2].content),
-            ],
-        )
-        self.assertNotEqual(remaining[2].content, "")
-
-    def test_the_assistants_own_answer_cannot_be_edited(self):
-        conversation_id = self.new_conversation()
-        self.assertEqual(self.ask(conversation_id, "How much leave?").status_code, 200)
-
-        answer = self.messages_in_db(conversation_id)[1]
-
-        response = self.edit(conversation_id, answer.id, "A different answer.")
-
-        # Rewriting generated text would put words in the assistant's mouth that it
-        # never said and cannot be cited for.
-        self.assertEqual(response.status_code, 400, response.text)
-        self.assertEqual(self.messages_in_db(conversation_id)[1].content, answer.content)
-
-    def test_a_message_in_another_conversation_is_not_found(self):
-        _, question_id = self.ask_exchange("How much leave?")
-        other = self.new_conversation()
-
-        response = self.edit(other, question_id, "Wrong conversation?")
-
-        self.assertEqual(response.status_code, 404, response.text)
-
-    def test_a_message_id_that_does_not_exist_is_not_found(self):
-        conversation_id, _ = self.ask_exchange("How much leave?")
-
-        self.assertEqual(self.edit(conversation_id, "no-such-message", "Hello?").status_code, 404)
-
-    def test_a_rejected_correction_leaves_the_question_alone(self):
-        conversation_id, question_id = self.ask_exchange("How much leave?")
-
-        # The same bounds as asking a question, so a correction cannot be the one
-        # message that skips them.
-        response = self.edit(conversation_id, question_id, "no")
-
-        self.assertEqual(response.status_code, 422, response.text)
-        self.assertEqual(self.messages_in_db(conversation_id)[0].content, "How much leave?")
-
-    def test_editing_needs_the_csrf_header(self):
-        conversation_id, question_id = self.ask_exchange("How much leave?")
-
-        response = self.client.patch(
-            f"/api/conversations/{conversation_id}/messages/{question_id}",
-            json={"client_id": CLIENT_A, "content": "How much annual leave?"},
-        )
-
-        self.assertEqual(response.status_code, 403, response.text)
-
-    def test_editing_asks_for_a_new_answer_rather_than_only_renaming(self):
-        # Touching the conversation is what lifts it to the top of the sidebar, and a
-        # correction is activity: it should sort as the most recent thing said.
-        conversation_id = self.new_conversation()
-        self.assertEqual(self.ask(conversation_id, "First?").status_code, 200)
-        self.assertEqual(self.ask(conversation_id, "Second?").status_code, 200)
-
-        other = self.new_conversation()
-        self.assertEqual(self.ask(other, "Elsewhere?").status_code, 200)
-
-        messages = self.messages_in_db(conversation_id)
-        self.edit(conversation_id, messages[0].id, "First, corrected?")
-
-        listed = [
-            item["id"] for item in self.client.get("/api/conversations").json()["conversations"]
-        ]
-        self.assertEqual(listed[0], conversation_id)
 
 
 class EmptyConversationTest(ConversationTestCase):
@@ -589,7 +374,7 @@ class EmptyConversationTest(ConversationTestCase):
         self.say(conversation_id)
 
         listed = self.client.get(
-            "/api/conversations"
+            "/api/conversations", params={"client_id": CLIENT_A}
         ).json()["conversations"]
 
         self.assertEqual(len(listed), 1)
@@ -619,7 +404,7 @@ class ConversationLifecycleTest(ConversationTestCase):
             return [
                 item["id"]
                 for item in self.client.get(
-                    "/api/conversations"
+                    "/api/conversations", params={"client_id": CLIENT_A}
                 ).json()["conversations"]
             ]
 
@@ -651,7 +436,7 @@ class ConversationLifecycleTest(ConversationTestCase):
         self.assertEqual(detail["title"], "Leave questions")
 
         listed = self.client.get(
-            "/api/conversations"
+            "/api/conversations", params={"client_id": CLIENT_A}
         ).json()["conversations"]
         self.assertEqual(listed[0]["title"], "Leave questions")
 
@@ -697,7 +482,7 @@ class TitleGenerationTest(ConversationTestCase):
         # joins the list when it has something in it rather than when it is created.
         self.assertEqual(
             self.client.get(
-                "/api/conversations"
+                "/api/conversations", params={"client_id": CLIENT_A}
             ).json()["conversations"],
             [],
         )
@@ -705,7 +490,7 @@ class TitleGenerationTest(ConversationTestCase):
         self.ask(conversation_id, "How much leave do I have?")
 
         listed = self.client.get(
-            "/api/conversations"
+            "/api/conversations", params={"client_id": CLIENT_A}
         ).json()["conversations"]
         self.assertIn("About:", listed[0]["title"])
 
@@ -718,7 +503,7 @@ class TitleGenerationTest(ConversationTestCase):
         self.ask(conversation_id, "How much leave do I have?")
 
         listed = self.client.get(
-            "/api/conversations"
+            "/api/conversations", params={"client_id": CLIENT_A}
         ).json()["conversations"]
         self.assertEqual(len(listed), 1)
 
@@ -805,7 +590,7 @@ class NoExpiryTest(ConversationTestCase):
         self.assertEqual(response.status_code, 200, response.text)
 
         listed = self.client.get(
-            "/api/conversations"
+            "/api/conversations", params={"client_id": CLIENT_A}
         ).json()["conversations"]
         self.assertEqual([item["id"] for item in listed], [conversation_id])
 

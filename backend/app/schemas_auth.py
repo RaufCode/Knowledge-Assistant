@@ -24,10 +24,9 @@ Role = Literal["employee", "admin"]
 # it measures what will actually be stored rather than what arrived over the wire.
 NameStr = Annotated[str, Field(min_length=1, max_length=120)]
 
-# bcrypt reads at most 72 bytes, and every one of them counts towards the cost, so a
-# limit well under that is what stops a long password from being quietly truncated to
-# its first 72 bytes — which would make two different passwords the same password.
-MIN_PASSWORD_LENGTH = 8
+# bcrypt reads at most 72 bytes; the policy floor is 6 characters and there are
+# no character-class requirements.
+MIN_PASSWORD_LENGTH = 6
 MAX_PASSWORD_LENGTH = 128
 
 
@@ -55,21 +54,12 @@ def _company_email(value: str) -> str:
 
 
 def check_password_policy(value: str) -> str:
-    """The password policy: length, and nothing else.
+    """The password policy, enforced here rather than in the browser.
 
-    Length is the only rule. The character classes this used to enforce — at least
-    one letter, one digit, one symbol — are gone, because they measure the shape of a
-    password rather than its strength, and every study of the two says the same
-    thing: length is what matters, and composition rules mostly produce `Passw0rd!`.
-
-    They also cost something concrete. A rule demanding a symbol rejects the passphrases
-    people actually remember, and pushes people towards writing the policy on a
-    sticky note. Eight characters is short in absolute terms; it is the floor this
-    application asks for, and the administrator who sets a password for somebody else
-    is the one who can choose a longer one.
-
-    Enforced here rather than in the browser, which checks it too so the reader finds
-    out before the round trip.
+    Length only: anything from 6 to 128 characters is accepted, with no
+    character-class requirements. Registration and `accept-invite` are the two
+    routes that set a password, so these are the two places one can enter the
+    database.
     """
     if len(value) < MIN_PASSWORD_LENGTH:
         raise ValueError(f"Use at least {MIN_PASSWORD_LENGTH} characters")
@@ -90,23 +80,6 @@ class UserDto(BaseModel):
     name: str
     email: str
     role: Role
-
-
-class PendingApprovalResponse(BaseModel):
-    """Sign-in answered with "not yet", rather than with a session.
-
-    Returned only when the password was **correct**. That is what makes it safe to
-    send: the caller has already proved they are the owner of the account by knowing
-    its password, so telling them what state it is in discloses nothing to anybody
-    else. A wrong password still gets the one generic answer, whether the address is
-    unknown, taken, or pending — so this cannot be used to find out who works here.
-    """
-
-    status: Literal["pending"] = "pending"
-    name: str
-    # What they asked for, so the screen can say "waiting to be approved as an
-    # employee" rather than leaving them to wonder which queue they are in.
-    requested_role: Role | None = None
 
 
 class UserResponse(BaseModel):
@@ -252,23 +225,21 @@ class CreateAccountRequest(BaseModel):
 
 
 class AccessRequestRequest(BaseModel):
-    """Somebody registering, and asking for access as they do it.
+    """Somebody registering for an account.
 
-    They say which role they are asking for, and it is recorded as
-    `requested_role` — what they asked for, shown to an administrator as the thing
-    to check. It grants nothing. The role that is actually given is the one on the
-    approval, which only an administrator sends, so asking for `admin` is not a
-    smaller step towards `admin`; it is a sentence in an administrator's queue.
+    No `role`, and that is deliberate rather than an oversight. A requester naming
+    their own role is asking for the one thing an administrator exists to decide, so
+    the field is not on the model at all — a client sending one is ignored, not
+    honoured. The role is chosen by whoever approves it.
 
-    The password is the person's own and is set here rather than through an
-    invitation. That is what lets somebody sign in and be told their request is
-    still pending, instead of being told nothing at all and left to guess.
+    The password is chosen here, stored as a hash on the request, and moved onto
+    the account when an administrator approves it. Nothing can sign in with it
+    until then: no `users` row exists before approval.
     """
 
     name: NameStr
     email: EmailStr
-    role: Role = "employee"
-    password: str
+    password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
 
     @field_validator("name")
     @classmethod
@@ -293,8 +264,6 @@ class AccessRequestDto(BaseModel):
     name: str
     email: str
     status: Literal["pending", "approved", "declined"]
-    # What they asked for. `None` on requests made before this existed.
-    requested_role: Role | None = None
     requested_at: datetime
     decided_at: datetime | None = None
 
@@ -304,10 +273,10 @@ class AccessRequestListResponse(BaseModel):
 
 
 class AccessRequestSubmittedResponse(BaseModel):
-    """The answer to a registration, which says nothing about anybody else's.
+    """The answer to a request, which says nothing about anybody else's.
 
-    Deliberately the same shape whether or not the address already had an account, a
-    pending invitation or an open request. This endpoint is unauthenticated, so a
+    Deliberately the same shape whether or not the address already had an account,
+    a pending invitation or an open request. This endpoint is unauthenticated, so a
     response that varied would be a way to ask it who works here.
     """
 
@@ -333,79 +302,3 @@ class AccessRequestDecisionRequest(BaseModel):
     # Only an approval sets a role, and only an administrator ever sends this, so
     # there is no path here from a requester's own request to a granted admin role.
     role: Role = "employee"
-
-
-# --------------------------------------------------------------------------- #
-# Managing the accounts that exist.                                             #
-# --------------------------------------------------------------------------- #
-
-
-class UserSummaryDto(BaseModel):
-    """One account, as an administrator's list shows it.
-
-    Name, email and role only, because that is all the list has room to say and all
-    it needs to. No password hash, no session, no last-seen: a people list is not the
-    place to carry anything that is not about the person.
-    """
-
-    id: str
-    name: str
-    email: str
-    role: Role
-    is_active: bool
-    created_at: datetime
-
-
-class UserListResponse(BaseModel):
-    """A page of accounts, and enough to render the pager without a second call."""
-
-    users: list[UserSummaryDto]
-    total: int
-    page: int
-    per_page: int
-    # Pages rather than a count, so the control does not have to do the arithmetic
-    # and cannot disagree with the server about how many there are.
-    pages: int
-
-
-class UserUpdateRequest(BaseModel):
-    """An administrator correcting an account.
-
-    Every field optional, because the operations are independent: changing a role
-    must not require retyping an email, and an email change must not require
-    choosing a role. A field that was not sent is left alone.
-
-    An email change is re-validated against the company domain, because the whole
-    value of an account list is that the addresses in it are real and belong here.
-    """
-
-    name: NameStr | None = None
-    email: EmailStr | None = None
-    role: Role | None = None
-    is_active: bool | None = None
-
-    @field_validator("name")
-    @classmethod
-    def clean_name(cls, value: str | None) -> str | None:
-        return None if value is None else _clean_name(value)
-
-    @field_validator("email")
-    @classmethod
-    def check_company_domain(cls, value: str | None) -> str | None:
-        return None if value is None else _company_email(value)
-
-
-class PasswordResetRequest(BaseModel):
-    """An administrator setting a new password for somebody.
-
-    Chosen here rather than mailed, for the same reason the invite flow returns a
-    link instead of sending one: there is no mail service. The administrator hands
-    it over, which is the weaker arrangement and is said so at the call site.
-    """
-
-    password: str
-
-    @field_validator("password")
-    @classmethod
-    def check_policy(cls, value: str) -> str:
-        return check_password_policy(value)

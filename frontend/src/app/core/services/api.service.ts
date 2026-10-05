@@ -131,8 +131,10 @@ export class ApiService {
    * the session, so a person's threads follow them to another browser and cannot be
    * widened by anything sent from here.
    */
-  getConversations(): Observable<Conversation[]> {
-    return this.get<ConversationListResponse>('/api/conversations').pipe(
+  getConversations(clientId: string): Observable<Conversation[]> {
+    const path = `/api/conversations?client_id=${encodeURIComponent(clientId)}`;
+
+    return this.get<ConversationListResponse>(path).pipe(
       map((response) => response.conversations.map((dto) => this.toConversation(dto))),
     );
   }
@@ -144,8 +146,10 @@ export class ApiService {
    * in, so it is used as it arrives. Ownership is the account's, so nothing is sent
    * to widen it.
    */
-  getConversation(conversationId: string): Observable<ConversationThread> {
-    const path = `/api/conversations/${encodeURIComponent(conversationId)}`;
+  getConversation(conversationId: string, clientId: string): Observable<ConversationThread> {
+    const path =
+      `/api/conversations/${encodeURIComponent(conversationId)}` +
+      `?client_id=${encodeURIComponent(clientId)}`;
 
     return this.get<ConversationDetailResponse>(path).pipe(
       map((response) => ({
@@ -214,8 +218,10 @@ export class ApiService {
   }
 
   /** `DELETE /api/conversations/{id}`. Removes a conversation and its messages. */
-  deleteConversation(conversationId: string): Observable<void> {
-    const path = `/api/conversations/${encodeURIComponent(conversationId)}`;
+  deleteConversation(conversationId: string, clientId: string): Observable<void> {
+    const path =
+      `/api/conversations/${encodeURIComponent(conversationId)}` +
+      `?client_id=${encodeURIComponent(clientId)}`;
 
     return this.send(this.http.delete<void>(`${this.baseUrl}${path}`, this.credentials)).pipe(
       map(() => undefined),

@@ -16,7 +16,7 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from jose import JWTError
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
@@ -24,14 +24,11 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import (
     AccessRequest,
-    Conversation,
     Invite,
-    Message,
     RefreshSession,
     User,
     find_open_access_request,
     find_user_by_email,
-    revoke_all_sessions,
     revoke_family,
 )
 from app.dependencies import (
@@ -59,14 +56,9 @@ from app.schemas_auth import (
     InviteRequest,
     InviteResponse,
     LoginRequest,
-    PasswordResetRequest,
-    PendingApprovalResponse,
     StatusResponse,
     UserDto,
-    UserListResponse,
     UserResponse,
-    UserSummaryDto,
-    UserUpdateRequest,
 )
 from app.security import (
     REFRESH_TOKEN_TYPE,
@@ -186,11 +178,26 @@ def clear_session_cookies(response: Response) -> None:
     it as a different cookie and leaves the original in place. `max_age=0` is what
     actually deletes one; the empty value is belt to that braces.
     """
-    response.delete_cookie(ACCESS_COOKIE, path="/")
-    response.delete_cookie(REFRESH_COOKIE, path="/")
+    response.delete_cookie(
+        ACCESS_COOKIE,
+        path="/",
+        secure=settings.cookies_are_secure,
+        samesite="none" if settings.cookies_are_secure else "lax",
+    )
+    response.delete_cookie(
+        REFRESH_COOKIE,
+        path="/",
+        secure=settings.cookies_are_secure,
+        samesite="none" if settings.cookies_are_secure else "lax",
+    )
     # Cleared with the rest, so signing out does not leave the app believing it is
     # still worth asking about a session.
-    response.delete_cookie(SESSION_HINT_COOKIE, path="/")
+    response.delete_cookie(
+        SESSION_HINT_COOKIE,
+        path="/",
+        secure=settings.cookies_are_secure,
+        samesite="none" if settings.cookies_are_secure else "lax",
+    )
 
 
 def set_csrf_cookie(response: Response, token: str | None = None) -> str:
@@ -210,7 +217,7 @@ def set_csrf_cookie(response: Response, token: str | None = None) -> str:
         # Readable by script on purpose; see above.
         httponly=False,
         secure=settings.cookies_are_secure,
-        samesite="lax",
+        samesite="none" if settings.cookies_are_secure else "lax",
         path="/",
         # A session, not a week: it is reissued on every sign-in and every refresh.
         max_age=settings.refresh_token_ttl_seconds,
@@ -229,11 +236,7 @@ def issue_csrf(response: Response) -> CsrfResponse:
     return CsrfResponse(csrf_token=set_csrf_cookie(response))
 
 
-@router.post(
-    "/login",
-    response_model=UserResponse | PendingApprovalResponse,
-    responses={202: {"model": PendingApprovalResponse}},
-)
+@router.post("/login", response_model=UserResponse)
 @limiter.limit(LOGIN_RATE_LIMIT)
 def login(
     request: Request,
@@ -259,38 +262,9 @@ def login(
         logger.info("sign-in attempt for unknown address %s", req.email)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=INVALID_CREDENTIALS)
 
-    # The password is checked before anything is said about the account's state, and
-    # checked even for an inactive one. That ordering is the whole safety of the
-    # pending answer below: only somebody who already knows the password is told
-    # their request is waiting, so the response cannot be used to discover which
-    # addresses exist or what state they are in.
-    if not verify_password(req.password, user.password_hash):
+    if not user.is_active or not verify_password(req.password, user.password_hash):
         logger.info("failed sign-in for %s", user.email)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=INVALID_CREDENTIALS)
-
-    if not user.is_active:
-        # Correct password, account not switched on: waiting for an administrator.
-        # Answered with 202 rather than 401 because nothing is wrong and retrying will
-        # not help, and a 401 here would send the person to reset a password that is
-        # perfectly fine.
-        request_row = db.scalar(
-            select(AccessRequest)
-            .where(AccessRequest.email == user.email, AccessRequest.status == "pending")
-            .order_by(AccessRequest.requested_at.desc())
-        )
-        logger.info("sign-in for %s: still pending approval", user.email)
-
-        # The status is set on the injected response and the body returned as a plain
-        # dict, rather than returning a JSONResponse. A pre-built Response is handed
-        # back as-is by FastAPI only when no response model is declared, and this route
-        # declares one for the OpenAPI schema — so returning one encoded the JSON a
-        # second time and the client read a string where it expected an object.
-        response.status_code = status.HTTP_202_ACCEPTED
-
-        return PendingApprovalResponse(
-            name=user.name,
-            requested_role=request_row.requested_role if request_row else None,
-        )
 
     # A hash made at a lower cost than the current setting is replaced on the way
     # past, which is the only moment a user has already proved they know the
@@ -631,7 +605,7 @@ def request_access(
     db: Session = Depends(get_db),
     _csrf: None = Depends(require_csrf),
 ) -> AccessRequestSubmittedResponse:
-    """Somebody asking for an account, for an administrator to decide on.
+    """Somebody registering for an account, for an administrator to decide on.
 
     This is the middle road between the two shapes that were both wrong. An open
     registration form lets anyone who can type a colleague's company address claim
@@ -642,6 +616,10 @@ def request_access(
     no `users` row exists until an administrator approves one, so nothing here can be
     logged into, and nothing here can set a role — the field is not on the model, so
     a client that sends one has it ignored rather than honoured.
+
+    The password is chosen now and stored as a hash on the request. Approval moves
+    that hash onto the new account and activates it, so the person signs in with
+    the password they already picked rather than through a second invitation link.
 
     No role on the request model is the whole security property. An administrator is
     granted by an administrator.
@@ -656,17 +634,6 @@ def request_access(
             detail="There is already an account for that address. Sign in instead.",
         )
 
-    # A previous registration may have left an inactive account behind, if it was
-    # declined or if an administrator deactivated it. Reusing that row rather than
-    # adding a second one keeps the address unique and lets the person ask again.
-    reusable = find_user_by_email(db, req.email)
-
-    if reusable is not None and not reusable.is_active:
-        reusable.name = req.name
-        reusable.role = req.role
-        reusable.password_hash = hash_password(req.password)
-        reusable.updated_at = datetime.now(timezone.utc)
-
     if find_open_access_request(db, req.email) is not None:
         # Idempotent rather than a duplicate row: asking twice should not put two
         # lines in an administrator's queue for one person.
@@ -675,40 +642,13 @@ def request_access(
             detail="You have already asked for access. An administrator will review it.",
         )
 
-    # The account exists from here so the person can sign in and be told their
-    # request is waiting, which is otherwise indistinguishable from being told
-    # nothing at all. It is switched off, and an inactive account is refused by every
-    # route that matters, so this is a place to record a password rather than a way
-    # in: the password is what lets the person prove the account is theirs when they
-    # come back to check on it.
-    #
-    # The role on the account is `employee`, not the one they asked for.
-    #
-    # The ask is recorded on the request row below, where an administrator reads it,
-    # and is applied by the approval. Writing it onto the account instead would leave
-    # an unapproved stranger holding the administrator role: inert today, because an
-    # inactive account cannot sign in, but only inert as long as every reader of
-    # `role` remembers to check `is_active` as well. Least privilege on an account
-    # nobody has approved needs no such reminder.
-    if reusable is None:
-        db.add(
-            User(
-                id=secrets.token_urlsafe(16),
-                email=req.email,
-                name=req.name,
-                role="employee",
-                password_hash=hash_password(req.password),
-                is_active=False,
-            )
-        )
-
     db.add(
         AccessRequest(
             id=secrets.token_urlsafe(16),
             name=req.name,
             email=req.email,
-            requested_role=req.role,
             status="pending",
+            password_hash=hash_password(req.password),
         )
     )
     db.commit()
@@ -724,7 +664,6 @@ def _access_request_dto(request_row: AccessRequest) -> AccessRequestDto:
         name=request_row.name,
         email=request_row.email,
         status=request_row.status,
-        requested_role=request_row.requested_role,
         requested_at=request_row.requested_at,
         decided_at=request_row.decided_at,
     )
@@ -785,19 +724,25 @@ def approve_access_request(
     admin: User = Depends(require_admin),
     _csrf: None = Depends(require_csrf),
 ) -> AccessRequestDecisionResponse:
-    """Approves a request, which provisions the account and mints its invitation.
+    """Approves a request, which creates the account ready to sign in.
 
     The role comes from this request, not from the person who asked. That is the one
     thing an approval decides that the requester was never allowed to state.
+
+    The password was chosen at registration and stored as a hash on the request, so
+    approval moves it onto the account and activates it: the person signs in with
+    what they already picked, and no invitation link is needed. Requests made before
+    the register form grew password fields carry no hash and fall back to the
+    invitation flow, so old rows in the queue still resolve.
     """
     row = _pending_request_or_409(db, request_id)
 
     existing_user = find_user_by_email(db, row.email)
 
     if existing_user is not None and existing_user.is_active:
-        # The account is already switched on, so this request has been answered by
-        # some other route. Recorded as approved rather than turned into a second
-        # decision on the same person.
+        # Somebody approved the invitation directly while this request sat in the
+        # queue. The account exists, so the request is answered rather than turned
+        # into a second one.
         row.status = "approved"
         row.decided_at = datetime.now(timezone.utc)
         row.decided_by = admin.id
@@ -810,28 +755,40 @@ def approve_access_request(
             expires_at="",
         )
 
-    # Somebody who registered already has a password, so approving them is a matter of
-    # switching the account on with the role this approval chose. Only a request with
-    # no account behind it — one made before registration set a password, or through
-    # the older form — needs an invitation minted.
-    registered = existing_user if existing_user is not None else None
-
-    if registered is not None and registered.password_hash:
-        registered.name = row.name
-        registered.role = req.role
-        registered.is_active = True
-        db.commit()
+    if row.password_hash:
+        user = existing_user
+        if user is None:
+            user = User(
+                id=secrets.token_urlsafe(16),
+                email=row.email,
+                name=row.name,
+                role=req.role,
+                password_hash=row.password_hash,
+                is_active=True,
+            )
+            db.add(user)
+        else:
+            # Invited directly and never accepted: reuse the row so the id an
+            # outstanding invitation points at stays valid, drop that invitation
+            # since there is no longer any link to follow, and activate with the
+            # password they chose themselves.
+            user.name = row.name
+            user.role = req.role
+            user.password_hash = row.password_hash
+            user.is_active = True
+            user.updated_at = datetime.now(timezone.utc)
+            db.query(Invite).filter(
+                Invite.user_id == user.id, Invite.used_at.is_(None)
+            ).delete(synchronize_session=False)
 
         row.status = "approved"
         row.decided_at = datetime.now(timezone.utc)
         row.decided_by = admin.id
+        row.invite_token = None
         db.commit()
+        db.refresh(user)
 
-        logger.info(
-            "approved the registration of %s as %s; they may sign in now",
-            registered.email,
-            registered.role,
-        )
+        logger.info("approved %s as %s; account active with chosen password", user.email, user.role)
 
         return AccessRequestDecisionResponse(
             request=_access_request_dto(row),
@@ -878,16 +835,6 @@ def decline_access_request(
     one.
     """
     row = _pending_request_or_409(db, request_id)
-
-    # The account the registration left behind is removed with it. It granted nothing,
-    # it exists only to hold that request, and leaving it would mean the person could
-    # not ask again: the next registration would collide on their address. Declining is
-    # a real answer, so it has to leave the door open for a later one.
-    orphan = find_user_by_email(db, row.email)
-
-    if orphan is not None and not orphan.is_active:
-        db.delete(orphan)
-
     row.status = "declined"
     row.decided_at = datetime.now(timezone.utc)
     row.decided_by = admin.id
@@ -995,19 +942,7 @@ def bootstrap_admin(
             detail="Bootstrapping is disabled on this deployment.",
         )
 
-    # Only administrators who are switched **on**. A registration that asked for the
-    # administrator role leaves an inactive row behind — it grants nothing, and it is
-    # not an administrator — and counting it here would mean one unapproved request
-    # permanently closed the only route that can create the first administrator, with
-    # no way back. That is a denial of service dressed as a safety check.
-    admins = (
-        db.scalar(
-            select(func.count(User.id)).where(
-                User.role == "admin", User.is_active.is_(True)
-            )
-        )
-        or 0
-    )
+    admins = db.scalar(select(func.count(User.id)).where(User.role == "admin")) or 0
 
     if admins:
         raise HTTPException(
@@ -1062,240 +997,3 @@ def _usable_invite_or_404(db: Session, token: str) -> Invite:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=INVALID_INVITE)
 
     return invite
-
-# --------------------------------------------------------------------------- #
-# Managing the accounts that exist.                                             #
-# --------------------------------------------------------------------------- #
-
-# How many rows one page of the accounts list carries. Fixed rather than sent by the
-# client so the page size is a decision made once, and so a caller cannot ask for
-# every account in the system in one response.
-USERS_PAGE_SIZE = 10
-
-
-@router.get("/users", response_model=UserListResponse)
-def list_users(
-    page: int = Query(default=1, ge=1),
-    _admin: User = Depends(require_admin),
-    _csrf: None = Depends(require_csrf),
-    db: Session = Depends(get_db),
-) -> UserListResponse:
-    """Every account, a page at a time, newest first.
-
-    Administrators only. Name, email and role, which is the whole of what a people
-    list is for: enough to recognise somebody and enough to act on them, and nothing
-    about their sessions or their password.
-
-    Paged rather than returned whole because the list grows with the company and a
-    screen that renders a thousand rows is a screen nobody can use. The page count
-    comes back with it so the control cannot disagree with the server about how many
-    there are.
-    """
-    total = db.scalar(select(func.count(User.id))) or 0
-    pages = max(1, -(-total // USERS_PAGE_SIZE))
-
-    # A page past the end is clamped rather than refused: an administrator deleting
-    # the last row of the last page should land on the new last page, not on an error
-    # that tells them nothing about what happened.
-    current = min(page, pages)
-
-    rows = db.scalars(
-        select(User)
-        .order_by(User.created_at.desc(), User.id)
-        .offset((current - 1) * USERS_PAGE_SIZE)
-        .limit(USERS_PAGE_SIZE)
-    ).all()
-
-    return UserListResponse(
-        users=[
-            UserSummaryDto(
-                id=row.id,
-                name=row.name,
-                email=row.email,
-                role=row.role,
-                is_active=row.is_active,
-                created_at=row.created_at,
-            )
-            for row in rows
-        ],
-        total=total,
-        page=current,
-        per_page=USERS_PAGE_SIZE,
-        pages=pages,
-    )
-
-
-def _user_or_404(db: Session, user_id: str) -> User:
-    """The account an administrator named, or a 404 that leaks nothing."""
-    user = db.get(User, user_id)
-
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="That account no longer exists."
-        )
-
-    return user
-
-
-def _refuse_self(target: User, admin: User, action: str) -> None:
-    """Refuses an administrator acting on their own account.
-
-    Every one of these is survivable on somebody else's account and fatal on your
-    own: deleting yourself, switching your own role to employee, or deactivating
-    yourself all end with nobody able to administer the system, and the only way back
-    is the bootstrap route — which is refused the moment any administrator exists, so
-    in practice the deployment is finished.
-
-    Refused with a 409 rather than quietly ignored, because an administrator who
-    pressed the button and saw nothing happen would press it again.
-    """
-    if target.id != admin.id:
-        return
-
-    raise HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail=f"You cannot {action} your own account. Ask another administrator to do it.",
-    )
-
-
-@router.patch("/users/{user_id}", response_model=UserSummaryDto)
-def update_user(
-    user_id: str,
-    req: UserUpdateRequest,
-    db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
-    _csrf: None = Depends(require_csrf),
-) -> UserSummaryDto:
-    """Corrects an account: its name, its address, its role, or whether it is on.
-
-    Every field is optional and independent, so changing a role does not require
-    retyping an address and an address change does not require choosing a role.
-
-    An address change is refused if it is already somebody else's. Two accounts on
-    one address would make the sign-in ambiguous: the second person to try would be
-    let into the first person's account, which is the worst outcome this endpoint
-    could produce.
-    """
-    user = _user_or_404(db, user_id)
-
-    if req.email is not None and req.email != user.email:
-        clash = find_user_by_email(db, req.email)
-
-        if clash is not None and clash.id != user.id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Another account already uses that address.",
-            )
-
-    # Demoting or deactivating yourself is the same dead end as deleting yourself,
-    # so it is refused by the same guard.
-    if req.role is not None and req.role != "admin":
-        _refuse_self(user, admin, "demote")
-
-    if req.is_active is False:
-        _refuse_self(user, admin, "deactivate")
-
-    if req.name is not None:
-        user.name = req.name
-    if req.email is not None:
-        user.email = req.email
-    if req.role is not None:
-        user.role = req.role
-    if req.is_active is not None:
-        user.is_active = req.is_active
-
-    user.updated_at = datetime.now(timezone.utc)
-    db.commit()
-
-    logger.info(
-        "administrator updated %s (role=%s, active=%s) by %s",
-        user.email,
-        user.role,
-        user.is_active,
-        admin.email,
-    )
-
-    return UserSummaryDto(
-        id=user.id,
-        name=user.name,
-        email=user.email,
-        role=user.role,
-        is_active=user.is_active,
-        created_at=user.created_at,
-    )
-
-
-@router.delete("/users/{user_id}", response_model=StatusResponse)
-def delete_user(
-    user_id: str,
-    db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
-    _csrf: None = Depends(require_csrf),
-) -> StatusResponse:
-    """Removes an account, and everything belonging to it.
-
-    Their conversations go with them rather than being orphaned: a conversation
-    whose owner no longer exists is one nobody can open and nobody can delete, which
-    is a row that stays in the database forever.
-
-    Their session rows are removed rather than revoked. Revoking is what a password
-    reset does, where the account survives and the record of a session is worth
-    keeping; here the account is gone, and a revoked row pointing at a user who no
-    longer exists is clutter that answers no question.
-    """
-    user = _user_or_404(db, user_id)
-    _refuse_self(user, admin, "delete")
-
-    conversations = db.scalars(
-        select(Conversation).where(Conversation.user_id == user.id)
-    ).all()
-
-    for conversation in conversations:
-        db.query(Message).filter(Message.conversation_id == conversation.id).delete(synchronize_session=False)
-        db.delete(conversation)
-
-    db.query(RefreshSession).filter(RefreshSession.user_id == user.id).delete()
-    db.query(Invite).filter(Invite.user_id == user.id).delete()
-    db.query(AccessRequest).filter(AccessRequest.email == user.email).delete()
-
-    email = user.email
-    db.delete(user)
-    db.commit()
-
-    logger.info("administrator deleted the account %s", email)
-
-    return StatusResponse(status="deleted")
-
-
-@router.post("/users/{user_id}/password", response_model=StatusResponse)
-def reset_user_password(
-    user_id: str,
-    req: PasswordResetRequest,
-    db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
-    _csrf: None = Depends(require_csrf),
-) -> StatusResponse:
-    """Sets a new password for somebody who cannot get into their own account.
-
-    The weaker of the two arrangements, and the one this exists for. The
-    administrator now knows the password and could sign in as them, which is exactly
-    what an invitation avoids by having the person choose their own. There is no mail
-    service here to deliver a reset link, so the alternative is handing over nothing
-    and letting somebody stay locked out.
-
-    Every live session is revoked. A password reset that leaves the old sessions
-    running resets nothing: whoever prompted it, or whoever copied the cookie, is
-    still signed in.
-    """
-    user = _user_or_404(db, user_id)
-
-    user.password_hash = hash_password(req.password)
-    user.is_active = True
-    user.updated_at = datetime.now(timezone.utc)
-
-    revoke_all_sessions(db, user.id)
-    db.commit()
-
-    logger.info("administrator reset the password for %s", user.email)
-
-    return StatusResponse(status="password-reset")

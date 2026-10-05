@@ -7,14 +7,7 @@ from llama_index.core.schema import MetadataMode
 from openai import APIConnectionError, APIStatusError, OpenAI, OpenAIError
 
 from app.config import settings
-from app.rag.confidence import confidence_from_scores
-from app.rag.intent import (
-    greeting_reply,
-    PERSONAL_REPLY,
-    RESTRICTED_REPLY,
-    Intent,
-    classify,
-)
+from app.rag.guard import is_personal_question
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +15,11 @@ FALLBACK_MSG = (
     "I couldn't find that in the company documents. "
     "Please contact HR at hr@acmetech.example or +233 30 000 0000."
 )
-
-# The greeting, refusal and personal-record replies live in `app.rag.intent` beside
-# the patterns that recognise them, so the wording of a response and the rule that
-# chose it are read together rather than in two files that have to be kept in step.
+PERSONAL_MSG = (
+    "I can only answer general policy questions and I can't access personal "
+    "records such as leave balances, salaries or payslips. Please check the HR "
+    "self-service portal on the intranet, or contact HR at hr@acmetech.example."
+)
 
 # The rules live in the system message and the retrieved context in the user
 # message, so the model is never asked to treat its own instructions as data.
@@ -279,66 +273,22 @@ class Assistant:
         Emits a `status` saying the answer is being written, one `delta` per piece
         of answer text, and exactly one `done` carrying the final answer.
 
-        The citations and the confidence ride only on that closing `done` event,
-        never on an event of their own part way through. A client that draws
-        citations while the answer is still being written is asserting the sources
-        before it has the text they are supposed to support, and `done` can still
-        replace the answer with `NOT_FOUND` or `PERSONAL`, which cite nothing at
-        all. So `done` is the authority on everything: it decides what the answer
-        was, which sources belong to it and how well they matched, and a client
-        renders the citation block only once it arrives.
-
-        Classification happens first and once. Everything below is a branch on its
-        answer, so the greeting and confidentiality paths cannot be reached by any
-        route that skipped it.
+        The citations ride only on that closing `done` event, never on an event
+        of their own part way through. A client that draws citations while the
+        answer is still being written is asserting the sources before it has the
+        text they are supposed to support, and `done` can still replace the answer
+        with `NOT_FOUND` or `PERSONAL`, which cite nothing at all. So `done` is the
+        authority on everything: it decides what the answer was and which sources
+        belong to it, and a client renders the citation block only once it arrives.
         """
-        classification = classify(question)
-
-        # Small talk. No retrieval, no model call, and reported as answered: the
-        # assistant did answer, and routing it through the not-found path is what
-        # made somebody saying hello get told the documents do not cover it.
-        if classification.intent is Intent.GREETING:
-            yield {
-                "type": "done",
-                "answer": greeting_reply(),
-                "answered": True,
-                "status": "greeting",
-                "confidence": None,
-                "sources": [],
-            }
-            return
-
-        # Restricted. Decided before retrieval, so a document that happens to contain
-        # the answer cannot be read to produce it.
-        if classification.intent is Intent.RESTRICTED:
-            logger.warning("refused a restricted question: %s", classification.reason)
-            reply = (
-                PERSONAL_REPLY
-                if classification.reason
-                and classification.reason.startswith("own record")
-                else RESTRICTED_REPLY
-            )
-            yield {
-                "type": "done",
-                "answer": reply,
-                "answered": False,
-                "status": "restricted",
-                "confidence": None,
-                "sources": [],
-            }
+        if is_personal_question(question):
+            yield {"type": "done", "answer": PERSONAL_MSG, "answered": False, "sources": []}
             return
 
         nodes = self._retrieve(question)
 
         if not nodes:
-            yield {
-                "type": "done",
-                "answer": FALLBACK_MSG,
-                "answered": False,
-                "status": "not-found",
-                "confidence": None,
-                "sources": [],
-            }
+            yield {"type": "done", "answer": FALLBACK_MSG, "answered": False, "sources": []}
             return
 
         sources = [
@@ -372,85 +322,21 @@ class Assistant:
         text = "".join(parts).strip()
         logger.info("answered %r via %s", question, settings.llm_model)
 
-        # The model can still decline a question the classifier passed, and its
-        # refusal is the last word: a confidentiality guard that a longer prompt
-        # could talk past is not one. Both outcomes replace the answer and drop the
-        # citations, because neither is grounded in anything.
         if "PERSONAL" == text:
-            yield {
-                "type": "done",
-                "answer": PERSONAL_REPLY,
-                "answered": False,
-                "status": "restricted",
-                "confidence": None,
-                "sources": [],
-            }
+            yield {"type": "done", "answer": PERSONAL_MSG, "answered": False, "sources": []}
         elif "NOT_FOUND" in text:
-            yield {
-                "type": "done",
-                "answer": FALLBACK_MSG,
-                "answered": False,
-                "status": "not-found",
-                "confidence": None,
-                "sources": [],
-            }
+            yield {"type": "done", "answer": FALLBACK_MSG, "answered": False, "sources": []}
         else:
-            yield {
-                "type": "done",
-                "answer": text,
-                "answered": True,
-                "status": "answered",
-                # Taken from the chunks this answer was actually built from, not
-                # from the model's opinion of itself. See `rag/confidence.py`.
-                "confidence": confidence_from_scores([s["score"] for s in sources]),
-                "sources": sources,
-            }
+            yield {"type": "done", "answer": text, "answered": True, "sources": sources}
 
     def ask(self, question: str) -> dict:
-        """The same three-way routing as `ask_stream`, without the streaming.
-
-        Kept as a separate method rather than as `ask_stream` collected into a
-        string so a caller that genuinely does not want a stream does not have to
-        buffer one, and so the two cannot disagree about which branch a question
-        takes: both ask `classify` first and both fall back to the same replies.
-        """
-        classification = classify(question)
-
-        if classification.intent is Intent.GREETING:
-            return {
-                "answer": greeting_reply(),
-                "answered": True,
-                "status": "greeting",
-                "confidence": None,
-                "sources": [],
-            }
-
-        if classification.intent is Intent.RESTRICTED:
-            logger.warning("refused a restricted question: %s", classification.reason)
-            reply = (
-                PERSONAL_REPLY
-                if classification.reason
-                and classification.reason.startswith("own record")
-                else RESTRICTED_REPLY
-            )
-            return {
-                "answer": reply,
-                "answered": False,
-                "status": "restricted",
-                "confidence": None,
-                "sources": [],
-            }
+        if is_personal_question(question):
+            return {"answer": PERSONAL_MSG, "answered": False, "sources": []}
 
         nodes = self._retrieve(question)
 
         if not nodes:
-            return {
-                "answer": FALLBACK_MSG,
-                "answered": False,
-                "status": "not-found",
-                "confidence": None,
-                "sources": [],
-            }
+            return {"answer": FALLBACK_MSG, "answered": False, "sources": []}
 
         context = "\n\n".join(
             f"({n.metadata['policy_title']} > {n.metadata['section']})\n"
@@ -461,21 +347,9 @@ class Assistant:
         logger.info("answered %r via %s", question, settings.llm_model)
 
         if "PERSONAL" == text:
-            return {
-                "answer": PERSONAL_REPLY,
-                "answered": False,
-                "status": "restricted",
-                "confidence": None,
-                "sources": [],
-            }
+            return {"answer": PERSONAL_MSG, "answered": False, "sources": []}
         if "NOT_FOUND" in text:
-            return {
-                "answer": FALLBACK_MSG,
-                "answered": False,
-                "status": "not-found",
-                "confidence": None,
-                "sources": [],
-            }
+            return {"answer": FALLBACK_MSG, "answered": False, "sources": []}
 
         sources = [
             {
@@ -486,13 +360,7 @@ class Assistant:
             }
             for n in nodes
         ]
-        return {
-            "answer": text,
-            "answered": True,
-            "status": "answered",
-            "confidence": confidence_from_scores([s["score"] for s in sources]),
-            "sources": sources,
-        }
+        return {"answer": text, "answered": True, "sources": sources}
 
     def _retrieve(self, question: str) -> list:
         """The retrieved chunks worth answering from, or none at all.

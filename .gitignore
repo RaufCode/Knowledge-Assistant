@@ -45,3 +45,6 @@ Thumbs.db
 # Tool caches
 .cache_ggshield
 .refact/
+
+# Nested checkout copy, never committed (see README).
+knowledge-assistant/

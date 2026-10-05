@@ -276,7 +276,7 @@ export class ConversationService {
     this.loadingState.set(true);
 
     this.api
-      .getConversations()
+      .getConversations(this.identity.clientId())
       .pipe(
         catchError((error: unknown) => {
           console.error('Could not load conversations', error);
@@ -399,7 +399,7 @@ export class ConversationService {
    */
   refreshSummaries(): void {
     this.api
-      .getConversations()
+      .getConversations(this.identity.clientId())
       .pipe(
         catchError((error: unknown) => {
           console.error('Could not refresh conversations', error);
@@ -432,7 +432,7 @@ export class ConversationService {
     this.missingState.set(null);
 
     this.api
-      .getConversation(conversationId)
+      .getConversation(conversationId, this.identity.clientId())
       .pipe(
         catchError((error: unknown) => {
           // A conversation that is gone is not worth retrying, and it is not worth
@@ -707,7 +707,7 @@ export class ConversationService {
     this.forget(conversationId);
 
     this.api
-      .deleteConversation(conversationId)
+      .deleteConversation(conversationId, this.identity.clientId())
       .pipe(
         catchError((error: unknown) => {
           console.error('Could not delete the conversation', error);
