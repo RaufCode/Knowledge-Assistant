@@ -86,6 +86,16 @@ export class ConversationService {
    */
   private pendingCreate: Observable<Conversation> | null = null;
 
+  /**
+   * Titles that arrived before their conversation is listed.
+   *
+   * A fresh conversation is not added to the sidebar until its first answer
+   * lands, but its title can arrive earlier on the stream. With no row to put it
+   * on yet, the title waits here instead of being dropped, and the answer picks
+   * it up when it lists the conversation.
+   */
+  private readonly pendingTitles = new Map<string, string>();
+
   /** Every conversation, most recently active first. */
   readonly conversations = this.conversationsState.asReadonly();
 
@@ -414,8 +424,9 @@ export class ConversationService {
 
           // Not added to the list. An id alone is not a conversation: with no message
           // in it there is nothing to list, and putting it there would show an
-          // untitled row for as long as the answer took to arrive. `refreshSummaries`
-          // puts it in once the exchange has been recorded.
+          // untitled row for as long as the answer took to arrive.
+          // `upsertAnsweredConversation` puts it in once the exchange has been
+          // recorded.
           this.activeIdState.set(conversation.id);
           this.messagesState.set([]);
 
@@ -435,37 +446,33 @@ export class ConversationService {
   }
 
   /**
-   * Re-reads the list from the backend, leaving the open thread as it is.
+   * Records an answered conversation in the list without refetching it.
    *
-   * Answering a message moves its conversation to the top of the list, which the
-   * backend decides, and the list is ordered by when a conversation was last
-   * active. Following a question up in a conversation from last week has to lift
-   * it to the top of the sidebar as it is answered, not at the next reload.
+   * Re-reading the whole list every time an answer landed rebuilt the sidebar
+   * from under the reader for the sake of one row: scroll position jumped and
+   * every row was replaced, when the only thing that changed was the
+   * conversation just answered. That conversation is by definition the most
+   * recently active one, so it goes to the front with a fresh timestamp and
+   * everything else stays exactly where it was.
    *
-   * A failure here changes nothing: the list already in hand is the one the
-   * backend last confirmed, and replacing it with nothing would take away
-   * conversations that do exist.
+   * A title that arrived before the answer is picked up from the stash; one
+   * arriving after still lands through `applyTitle`, which finds the row here
+   * by then.
    */
-  refreshSummaries(): void {
-    this.api
-      .getConversations(this.identity.clientId())
-      .pipe(
-        catchError((error: unknown) => {
-          console.error('Could not refresh conversations', error);
+  upsertAnsweredConversation(conversationId: string): void {
+    const pending = this.pendingTitles.get(conversationId);
+    this.pendingTitles.delete(conversationId);
 
-          return of<Conversation[] | null>(null);
-        }),
-        takeUntilDestroyed(this.destroyRef),
-      )
-      .subscribe((conversations) => {
-        if (conversations === null) {
-          return;
-        }
+    this.conversationsState.update((conversations) => {
+      const existing = conversations.find((item) => item.id === conversationId);
+      const entry: Conversation = {
+        id: conversationId,
+        title: pending ?? existing?.title ?? null,
+        updatedAt: new Date().toISOString(),
+      };
 
-        this.conversationsState.set(conversations);
-        this.loadingState.set(false);
-        this.loadedState.set(true);
-      });
+      return [entry, ...conversations.filter((item) => item.id !== conversationId)];
+    });
   }
 
   /**
@@ -520,10 +527,18 @@ export class ConversationService {
    *
    * The title is applied wherever the conversation is listed rather than by
    * refetching the list, so the sidebar and the open thread's header are corrected
-   * from the same value at the same moment.
+   * from the same value at the same moment. A conversation with no row yet — a
+   * fresh one whose answer has not landed — has its title stashed instead, and the
+   * answer puts it on the row it adds.
    */
   applyTitle(conversationId: string, title: string): void {
-    this.rememberTitle(conversationId, title);
+    if (this.conversationsState().some((item) => item.id === conversationId)) {
+      this.rememberTitle(conversationId, title);
+
+      return;
+    }
+
+    this.pendingTitles.set(conversationId, title);
   }
 
   /**

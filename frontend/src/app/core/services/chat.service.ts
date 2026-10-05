@@ -345,11 +345,11 @@ export class ChatService {
     return this.stream(conversationId, question, messageId).pipe(
       map((answer) => {
         this.conversations.resolveMessage(messageId, answer);
-        // The backend stamps the conversation as active when it stores the answer,
-        // and the list is ordered by that. Re-reading it here is what lifts a
-        // conversation that was answered now to the top of the sidebar, instead of
-        // leaving it where it was the last time the page loaded.
-        this.conversations.refreshSummaries();
+        // The answered conversation goes to the top of the sidebar from the
+        // state already in hand. Re-reading the whole list here rebuilt every
+        // row for one new one, so a fresh answer arrived with the list jumping
+        // under it; the previous rows are left alone and the new one is added.
+        this.conversations.upsertAnsweredConversation(conversationId);
 
         return null;
       }),
