@@ -26,7 +26,7 @@
 // the same site and the `SameSite=Lax` session cookies are attached; the backend
 // reflects the origin because `ALLOWED_ORIGINS` is `*`, which is what makes a
 // credentialed cross-origin response acceptable to the browser.
-export const API_BASE_URL = 'https://knowledge-assistant-backend-45ob.onrender.com';
+export const API_BASE_URL = 'https://knowledge-assistant-chatbot.onrender.com';
 
 // Local development. The backend runs from `backend/` with
 // `uvicorn app.main:app --host 127.0.0.1 --port 8099`, and its ALLOWED_ORIGINS
