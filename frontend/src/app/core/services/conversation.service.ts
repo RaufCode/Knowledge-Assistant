@@ -760,15 +760,23 @@ export class ConversationService {
   }
 
   /**
-   * Deletes a conversation and, if it was the open one, opens another.
+   * Deletes a conversation and, if it was the open one, leaves a fresh window.
    *
-   * Deleting what the user is reading leaves them looking at nothing, so the next
-   * conversation takes its place. When there was only the one, a new one is
-   * created: an empty conversation is a conversation waiting for a question, which
-   * is a better state than a composer with nowhere to send anything.
+   * Deleting what the user is reading used to open the next conversation, or a
+   * blank thread when there was none — a page with a composer pointing at a
+   * conversation that no longer exists. Now the open thread is reset to unsaved
+   * instead, and the caller routes to the assistant entry, which is a page for
+   * starting a new conversation rather than the remains of a deleted one.
+   * Deleting anything else leaves the open thread alone.
    */
   deleteConversation(conversationId: string): void {
+    const wasOpen = this.activeIdState() === conversationId;
+
     this.forget(conversationId);
+
+    if (wasOpen) {
+      this.startUnsaved();
+    }
 
     this.api
       .deleteConversation(conversationId, this.identity.clientId())
@@ -780,23 +788,7 @@ export class ConversationService {
         }),
         takeUntilDestroyed(this.destroyRef),
       )
-      .subscribe(() => {
-        if (this.activeIdState() !== conversationId) {
-          return;
-        }
-
-        const next = this.conversationsState()[0];
-
-        if (next) {
-          this.openConversation(next.id);
-          return;
-        }
-
-        // The last conversation is gone, so there is nothing to open. The composer is
-        // left with an empty thread rather than being given a new conversation to
-        // fill: the next question asked will create one.
-        this.startUnsaved();
-      });
+      .subscribe();
   }
 
   /** Updates the search term shared by the sidebar and the conversations view. */

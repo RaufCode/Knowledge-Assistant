@@ -880,8 +880,21 @@ export class ChatSidebarComponent {
     const conversationId = this.pendingDeleteId;
     this.pendingDeleteId = null;
 
-    if (conversationId !== null) {
-      this.conversations.deleteConversation(conversationId);
+    if (conversationId === null) {
+      return;
+    }
+
+    // Deleting the conversation on screen has to go somewhere: the service leaves
+    // a fresh unsaved window, and this routes to the assistant entry, which is a
+    // page for starting a new conversation rather than the blank remains of the
+    // deleted one. Anything else stays exactly where it was.
+    const wasOpen = conversationId === this.conversations.activeId();
+
+    this.conversations.deleteConversation(conversationId);
+
+    if (wasOpen) {
+      this.layout.closeAfterNavigation();
+      void this.router.navigateByUrl(this.auth.assistantPath());
     }
   }
 
