@@ -307,11 +307,19 @@ export class LoginViewComponent {
    * is a path on this site — an absolute one would let a crafted link bounce
    * somebody off to somewhere else after they had signed in.
    *
-   * The fallback is the landing path rather than a hardcoded `/`, so an
-   * administrator arrives on the dashboard and an employee on the assistant without
-   * this screen having to know the difference.
+   * Administrators always land on the dashboard: it is their home, with the figures
+   * and the queue, and the assistant stays one click away on Ask. A return address
+   * would drop them into a chat screen instead, past the very overview that tells
+   * them what needs doing.
+   *
+   * The fallback is the landing path rather than a hardcoded `/`, so an employee
+   * still lands on the assistant without this screen having to know the difference.
    */
   private returnUrl(): string {
+    if (this.auth.isAdmin()) {
+      return this.auth.landingPath();
+    }
+
     const requested = this.route.snapshot.queryParamMap.get('returnUrl');
 
     if (requested && requested.startsWith('/') && !requested.startsWith('//')) {

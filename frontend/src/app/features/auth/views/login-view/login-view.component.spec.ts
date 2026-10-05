@@ -218,6 +218,22 @@ describe('LoginViewComponent', () => {
     expect(navigate).toHaveBeenCalledWith(['/admin']);
   });
 
+  it('lands an administrator on the dashboard even when a return address was asked for', async () => {
+    const navigate = vi.spyOn(router, 'navigate');
+    await router.navigate(['/login'], { queryParams: { returnUrl: '/ask' } });
+    await render();
+    await signIn();
+
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush({ user: { id: 'u1', name: 'Kwame Osei', email: 'kwame@acmetech.example', role: 'admin' } });
+    await render();
+
+    // The dashboard is home after signing in; Ask stays one click away rather
+    // than being the screen an administrator is dropped into.
+    expect(navigate).toHaveBeenCalledWith(['/admin']);
+  });
+
   it('shows the waiting screen when the account is not approved yet', async () => {
     const navigate = vi.spyOn(router, 'navigate');
     await signIn();

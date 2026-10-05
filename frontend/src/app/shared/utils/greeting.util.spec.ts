@@ -1,3 +1,5 @@
+import { describe, expect, it } from 'vitest';
+
 import { greetingReply, isGreeting } from './greeting.util';
 
 describe('isGreeting', () => {
