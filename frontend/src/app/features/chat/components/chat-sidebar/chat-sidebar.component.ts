@@ -178,17 +178,20 @@ const ADMIN_NAV: AdminNavItem[] = [
               />
             }
           </div>
-          <button
-            app-button
-            type="button"
-            size="rail"
-            class="mt-6"
-            aria-label="New Conversation"
-            (click)="onNewConversation()"
-          >
-            <app-icon name="plus" [size]="18" />
-          </button>
 
+          <!--
+            The rail's way into the expanded column's search box, so it belongs after
+            the list rather than above it: it does not search anything itself, it
+            hands the conversation list over to the place that can filter it.
+
+            There used to be a second "+" button and a second conversation list below
+            this one, unfiltered and unscrollable. Collapsing the sidebar therefore
+            showed the same navigation twice — once at the top where the controls
+            belong and once again at the bottom, in a different order and ignoring
+            the search — and the two copies drifted out of step, so the one at the
+            bottom kept offering conversations the one at the top had filtered out.
+            Mirroring the expanded column means each control appears once.
+          -->
           <button
             app-button
             type="button"
@@ -201,17 +204,6 @@ const ADMIN_NAV: AdminNavItem[] = [
           >
             <app-icon name="search" [size]="18" />
           </button>
-
-          <div class="mt-4 flex flex-col items-center gap-2">
-            @for (conversation of conversations.conversations(); track conversation.id) {
-              <app-conversation-item
-                appearance="rail"
-                [conversation]="conversation"
-                [isSelected]="isActive(conversation.id)"
-                (selected)="openConversation($event)"
-              />
-            }
-          </div>
         }
 
         <!--
