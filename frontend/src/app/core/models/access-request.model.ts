@@ -127,6 +127,12 @@ export interface PasswordResetRequestDto {
   password: string;
 }
 
+/** `POST /api/auth/me/password` request body: anybody changes their own. */
+export interface ChangeOwnPasswordRequestDto {
+  current_password: string;
+  new_password: string;
+}
+
 /**
  * The answer to a sign-in where the account exists but is not switched on.
  *

@@ -53,6 +53,7 @@ from app.schemas_auth import (
     AccessRequestSubmittedResponse,
     AcceptInviteRequest,
     BootstrapAdminRequest,
+    ChangeOwnPasswordRequest,
     CreateAccountRequest,
     CsrfResponse,
     InvitePreviewResponse,
@@ -426,6 +427,37 @@ def me(current_user: User = Depends(get_current_user)) -> UserDto:
     a reload lands back inside the session rather than back at the sign-in screen.
     """
     return _user_dto(current_user)
+
+
+@router.post("/me/password", response_model=StatusResponse)
+def change_own_password(
+    req: ChangeOwnPasswordRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _csrf: None = Depends(require_csrf),
+) -> StatusResponse:
+    """Changes the signed-in person's own password. Any role.
+
+    The current password is checked first, so a session left open on a shared
+    machine cannot be used to lock its owner out. Every session is revoked with
+    it, exactly as an administrator reset does: the frontend signs out afterwards
+    and the new password is what signs back in.
+    """
+    if not verify_password(req.current_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Your current password is not correct.",
+        )
+
+    current_user.password_hash = hash_password(req.new_password)
+    current_user.updated_at = datetime.now(timezone.utc)
+
+    revoke_all_sessions(db, current_user.id)
+    db.commit()
+
+    logger.info("user changed their own password for %s", current_user.email)
+
+    return StatusResponse(status="password-changed")
 
 
 def provision_pending_user(

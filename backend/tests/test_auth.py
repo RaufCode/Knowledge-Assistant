@@ -1648,3 +1648,116 @@ class UserManagementTest(AuthTestCase):
             ).status_code,
             404,
         )
+
+
+class ChangeOwnPasswordTest(AuthTestCase):
+    """POST /api/auth/me/password: anybody signed in changes their own password.
+
+    The current password proves possession, so a session left open cannot be used
+    to lock its owner out. Employees reach this exactly as administrators do —
+    there is no role on the route.
+    """
+
+    NEW_PASSWORD = "a-brand-new-password-1!"
+
+    def change(
+        self, client: TestClient, current: str = PASSWORD, new: str = NEW_PASSWORD
+    ):
+        return client.post(
+            "/api/auth/me/password",
+            json={"current_password": current, "new_password": new},
+            headers=self.csrf_headers(client),
+        )
+
+    def test_employee_changes_their_own_password(self) -> None:
+        self.signed_in_admin()
+        employee = self.new_client()
+        self.invite_and_accept(employee, f"ama@{COMPANY}")
+
+        response = self.change(employee)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("password", response.json())
+
+        # The new password signs in and the old one no longer does.
+        self.assertEqual(
+            self.new_client()
+            .post(
+                "/api/auth/login",
+                json={"email": f"ama@{COMPANY}", "password": self.NEW_PASSWORD},
+            )
+            .status_code,
+            200,
+        )
+        self.assertEqual(
+            self.new_client()
+            .post(
+                "/api/auth/login",
+                json={"email": f"ama@{COMPANY}", "password": PASSWORD},
+            )
+            .status_code,
+            401,
+        )
+
+    def test_admin_uses_the_same_route(self) -> None:
+        admin = self.signed_in_admin()
+
+        response = self.change(admin)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            self.new_client()
+            .post(
+                "/api/auth/login",
+                json={"email": f"admin@{COMPANY}", "password": self.NEW_PASSWORD},
+            )
+            .status_code,
+            200,
+        )
+
+    def test_wrong_current_password_is_refused_and_changes_nothing(self) -> None:
+        self.signed_in_admin()
+        employee = self.new_client()
+        self.invite_and_accept(employee, f"ama@{COMPANY}")
+
+        response = self.change(employee, current="not-the-password-1!")
+
+        self.assertEqual(response.status_code, 401, response.text)
+
+        # The old password still works: a refused attempt changed nothing.
+        self.assertEqual(
+            self.new_client()
+            .post(
+                "/api/auth/login",
+                json={"email": f"ama@{COMPANY}", "password": PASSWORD},
+            )
+            .status_code,
+            200,
+        )
+
+    def test_weak_new_password_is_refused(self) -> None:
+        self.signed_in_admin()
+        employee = self.new_client()
+        self.invite_and_accept(employee, f"ama@{COMPANY}")
+
+        self.assertEqual(self.change(employee, new="short").status_code, 422)
+
+    def test_signed_out_is_refused(self) -> None:
+        response = self.new_client().post(
+            "/api/auth/me/password",
+            json={"current_password": PASSWORD, "new_password": self.NEW_PASSWORD},
+        )
+
+        self.assertEqual(response.status_code, 401, response.text)
+
+    def test_requires_the_csrf_header(self) -> None:
+        self.signed_in_admin()
+        employee = self.new_client()
+        self.invite_and_accept(employee, f"ama@{COMPANY}")
+
+        response = employee.post(
+            "/api/auth/me/password",
+            json={"current_password": PASSWORD, "new_password": self.NEW_PASSWORD},
+        )
+
+        self.assertEqual(response.status_code, 403, response.text)

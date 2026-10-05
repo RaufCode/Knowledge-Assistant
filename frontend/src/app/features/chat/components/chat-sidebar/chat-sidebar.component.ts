@@ -30,6 +30,7 @@ import { InputComponent } from '../../../../shared/components/input/input.compon
 import { ModalComponent } from '../../../../shared/components/modal/modal.component';
 import { ConversationItemComponent } from '../../../conversations/components/conversation-item/conversation-item.component';
 import { BrandLogoComponent } from '../brand-logo/brand-logo.component';
+import { readRefusalOr } from '../../../auth/utils/read-backend-refusal';
 
 /**
  * One destination in the administrator's navigation.
@@ -489,6 +490,16 @@ const ADMIN_NAV: AdminNavItem[] = [
         (closed)="closeOwnPassword()"
       >
         <app-form-field
+          label="Current password"
+          type="password"
+          icon="lock"
+          autocomplete="current-password"
+          placeholder="Enter your current password"
+          [required]="true"
+          [(value)]="ownCurrentPassword"
+        />
+
+        <app-form-field
           label="New password"
           type="password"
           icon="lock"
@@ -498,6 +509,17 @@ const ADMIN_NAV: AdminNavItem[] = [
           [(value)]="ownPassword"
           [error]="ownPasswordError()"
         />
+
+        @if (ownPasswordNotice()) {
+          <p
+            class="mt-3 flex items-start gap-2 rounded-md bg-danger/10 px-3 py-2 text-xs
+              text-danger"
+            role="alert"
+          >
+            <app-icon name="alert-triangle" [size]="14" class="mt-0.5 shrink-0" />
+            <span>{{ ownPasswordNotice() }}</span>
+          </p>
+        }
 
         <div modalFooter class="flex justify-between gap-2">
           <button app-button type="button" variant="ghost" (click)="closeOwnPassword()">
@@ -713,15 +735,20 @@ export class ChatSidebarComponent {
   /**
    * Whether this person can change their own password from here.
    *
-   * Administrators only: the reset endpoint is an administrator route, so anyone
-   * else would only ever be handed its refusal. Offered from the account card so
-   * it does not require finding yourself in a list of other people first.
+   * Everybody signed in: the self-service route checks the current password
+   * rather than the role, so an employee proves possession the same way an
+   * administrator does. Offered from the account card so it does not require
+   * finding yourself in a list of other people first.
    */
-  protected readonly canChangeOwnPassword = computed(() => this.auth.isAdmin());
+  protected readonly canChangeOwnPassword = computed(() => this.auth.isAuthenticated());
 
   protected readonly isOwnPasswordOpen = signal(false);
+  protected readonly ownCurrentPassword = signal('');
   protected readonly ownPassword = signal('');
   protected readonly isBusy = signal(false);
+
+  /** What went wrong with the last change attempt, shown inside the dialog. */
+  protected readonly ownPasswordNotice = signal('');
 
   protected readonly ownPasswordError = computed(() => {
     const value = this.ownPassword();
@@ -736,40 +763,62 @@ export class ChatSidebarComponent {
   /** Opens the dialog, discarding whatever the last attempt left behind. */
   protected askToChangeOwnPassword(): void {
     this.closeAccount();
+    this.ownCurrentPassword.set('');
     this.ownPassword.set('');
+    this.ownPasswordNotice.set('');
     this.isOwnPasswordOpen.set(true);
   }
 
   protected closeOwnPassword(): void {
     this.isOwnPasswordOpen.set(false);
+    this.ownCurrentPassword.set('');
     this.ownPassword.set('');
+    this.ownPasswordNotice.set('');
   }
 
   /**
    * Sets the new password, then signs out.
    *
-   * The reset revokes every session for the account, so staying put would leave
+   * The change revokes every session for the account, so staying put would leave
    * a page that looks signed in and fails on the next action — going through
-   * the sign-in screen is the honest sequence.
+   * the sign-in screen is the honest sequence. A refusal keeps the dialog open
+   * with the reason, so a mistyped current password is a retry rather than a
+   * dismissal.
    */
   protected saveOwnPassword(): void {
-    const me = this.auth.user();
+    if (this.auth.user() === null || this.isBusy()) {
+      return;
+    }
 
-    if (me === null || this.ownPassword().length < MIN_PASSWORD_LENGTH || this.isBusy()) {
+    if (this.ownCurrentPassword() === '') {
+      this.ownPasswordNotice.set('Enter your current password.');
+      return;
+    }
+
+    if (this.ownPassword().length < MIN_PASSWORD_LENGTH) {
+      this.ownPasswordNotice.set(
+        `Choose a new password of at least ${MIN_PASSWORD_LENGTH} characters.`,
+      );
       return;
     }
 
     this.isBusy.set(true);
+    this.ownPasswordNotice.set('');
 
-    this.auth.resetPassword(me.id, this.ownPassword()).subscribe({
+    this.auth.changeOwnPassword(this.ownCurrentPassword(), this.ownPassword()).subscribe({
       next: () => {
         this.isBusy.set(false);
         this.closeOwnPassword();
         this.signOut();
       },
-      error: () => {
+      error: (error: unknown) => {
         this.isBusy.set(false);
-        this.closeOwnPassword();
+
+        this.ownPasswordNotice.set(
+          (error as { status?: number } | null)?.status === 401
+            ? 'Your current password is not correct.'
+            : readRefusalOr(error, 'Your password could not be changed. Please try again.'),
+        );
       },
     });
   }

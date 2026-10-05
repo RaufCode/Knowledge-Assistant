@@ -127,6 +127,24 @@ class PasswordResetRequest(BaseModel):
         return check_password_policy(value)
 
 
+class ChangeOwnPasswordRequest(BaseModel):
+    """A password change by the person it belongs to.
+
+    The current password proves possession: a session cookie alone is not enough
+    to set a new one, so a laptop left signed in cannot be used to lock its owner
+    out. The policy applies to the new password exactly as it does everywhere a
+    password is set.
+    """
+
+    current_password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+    new_password: str = Field(min_length=1, max_length=MAX_PASSWORD_LENGTH)
+
+    @field_validator("new_password")
+    @classmethod
+    def check_policy(cls, value: str) -> str:
+        return check_password_policy(value)
+
+
 class CsrfResponse(BaseModel):
     """The double-submit token, echoed so the caller need not read the cookie.
 

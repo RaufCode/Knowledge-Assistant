@@ -69,6 +69,17 @@ export class AuthServiceStub {
   }
 
   /**
+   * Changes the signed-in person's own password.
+   *
+   * Always succeeds: there is no backend to check the current password against
+   * here. Present so the account card's dialog calls the same seam as the real
+   * service rather than one the tests cannot reach.
+   */
+  changeOwnPassword(): Observable<void> {
+    return of(undefined);
+  }
+
+  /**
    * No CSRF token to offer.
    *
    * Null rather than a value: the tests that care about the header assert on it

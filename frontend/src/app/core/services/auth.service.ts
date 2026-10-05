@@ -11,6 +11,7 @@ import {
   AccessRequestDto,
   AccessRequestListDto,
   AccessRequestSubmittedDto,
+  ChangeOwnPasswordRequestDto,
   CreateAccountRequestDto,
   PasswordResetRequestDto,
   PendingApprovalDto,
@@ -587,6 +588,25 @@ export class AuthService {
         body,
         this.credentials(),
       )
+      .pipe(map(() => undefined));
+  }
+
+  /**
+   * `POST /api/auth/me/password`. Changes the signed-in person's own password.
+   *
+   * Any role, unlike `resetPassword` above: the current password proves
+   * possession, so a session left open cannot be used to lock its owner out. The
+   * backend revokes every session with it, so the caller signs out afterwards
+   * and the new password is what signs back in.
+   */
+  changeOwnPassword(currentPassword: string, newPassword: string): Observable<void> {
+    const body: ChangeOwnPasswordRequestDto = {
+      current_password: currentPassword,
+      new_password: newPassword,
+    };
+
+    return this.http
+      .post<void>(`${this.baseUrl}/api/auth/me/password`, body, this.credentials())
       .pipe(map(() => undefined));
   }
 
