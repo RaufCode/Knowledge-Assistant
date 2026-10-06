@@ -22,12 +22,20 @@ export const QUESTION_PLACEHOLDER = 'Ask anything';
  * no endpoint for them, and inventing one would mean guessing at a contract it does
  * not have.
  *
- * Two of them, and two words each. A row of suggestions is a decision aid, so the
- * smaller it is the more it reads as a choice rather than as a menu to browse, and a
- * two-word topic is enough to recognise what the assistant knows about. The full
- * question is typed into the composer, which is one field away and remembers it.
+ * Two of them, and both written as the question that is actually asked. Choosing one
+ * sends it to the assistant as the question verbatim, so a two-word topic was not a
+ * shortcut on the way to asking it — it was the question, and the assistant was
+ * handed a bare noun to answer. The button also said what it would do: pressing it
+ * asks something, and this now reads as the thing being asked rather than as a
+ * chapter of a handbook.
+ *
+ * Both are answerable from the documents that are actually loaded, so neither
+ * suggestion leads to a "no answer found" on the first press.
  */
-export const STARTER_QUESTIONS: readonly string[] = ['Annual leave', 'VPN setup'];
+export const STARTER_QUESTIONS: readonly string[] = [
+  'How many annual leave days do I get?',
+  'How do I set up the VPN on a new laptop?',
+];
 
 /** Key used to remember the desktop sidebar preference. */
 export const SIDEBAR_PREFERENCE_KEY = 'ika.sidebar.collapsed';
