@@ -108,7 +108,7 @@ configured — an administrator copies it and sends it themselves.
 
 ### Opening the app from a phone
 
-The backend runs on `127.0.0.1:8099` and the app on `4200`. To use the app on a
+The backend runs on `127.0.0.1:8000` and the app on `4200`. To use the app on a
 phone, serve the app on your wifi and open it by your machine's LAN address:
 
 ```bash
