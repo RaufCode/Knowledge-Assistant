@@ -41,14 +41,6 @@
   --spacing-rail: 76px;
   --spacing-thread: 860px;
   /*
-   * The composer centres its placeholder in the field, but the field is narrower
-   * than the card by the send button and the gap beside it, so an even split of
-   * that field's own width lands the placeholder left of where the card is
-   * centred. This is that width as an inset, applied to the right of the field to
-   * put the two back in balance.
-   */
-  --spacing-send: 3.25rem;
-  /*
    * Height of the header strip on desktop, which is the height a title needs rather
    * than a number chosen for how it looks.
    *

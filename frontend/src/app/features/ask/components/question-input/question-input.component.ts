@@ -24,15 +24,12 @@ import { MAX_QUESTION_LENGTH, MIN_QUESTION_LENGTH, QUESTION_PLACEHOLDER } from '
  * cannot keep, so it was removed rather than hidden. The `paperclip` icon is left
  * in the icon set for when attaching is actually built.
  *
- * The text is centred, and the placeholder with it. They were set differently — the
- * placeholder centred and what you typed left-aligned — which meant the prompt
- * rearranged itself the moment a letter arrived, so the first thing anybody saw was
- * not where the question was going to be. One alignment for both, and the box reads
- * as a single centred prompt rather than two.
- *
- * `pr-send` still reserves the send button's width, so centring happens inside the
- * space the button leaves rather than across the whole row and sliding the text
- * underneath it.
+ * The text is left-aligned, and the placeholder with it. They were once set
+ * differently — the placeholder centred and what you typed left-aligned — which meant
+ * the prompt rearranged itself the moment a letter arrived, so the first thing
+ * anybody saw was not where the question was going to be. One alignment for both
+ * fixes that just as well, and a composer whose own sentences sit against its left
+ * edge is where the eye already is.
  */
 @Component({
   selector: 'app-question-input',
@@ -51,7 +48,7 @@ import { MAX_QUESTION_LENGTH, MIN_QUESTION_LENGTH, QUESTION_PLACEHOLDER } from '
           [placeholder]="placeholder"
           [attr.maxlength]="maxLength"
           aria-label="Ask a question about company policies"
-          class="block max-h-32 min-h-9 w-full resize-none bg-transparent py-2 pr-send text-center
+          class="block max-h-32 min-h-9 w-full resize-none bg-transparent py-2 text-left
             text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
           (input)="autoGrow($event)"
           (keydown.enter)="onEnter($event)"
