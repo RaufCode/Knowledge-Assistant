@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     create_engine,
@@ -75,6 +76,17 @@ class Message(Base):
     # indistinguishable from a genuine gap in the corpus. Added to live tables by
     # `_ensure_missing_columns` on startup.
     status: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
+    # How closely the retrieved passages matched the question, 1-10, on an
+    # assistant message that was built from them and null on every turn that was
+    # not: a question, a greeting, a refusal, an out-of-scope reply, or a gap in
+    # the corpus.
+    #
+    # Null rather than zero for those, because a low number beside an answer with
+    # no sources behind it would read as a poor answer rather than as the absence
+    # of one — there was nothing to match, which is a different thing from
+    # matching badly. Stored so a reloaded thread shows the same figure the stream
+    # did. Added to live tables by `_ensure_missing_columns` on startup.
+    confidence: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -265,6 +277,37 @@ def list_owned_conversations(db: SessionLocal, user_id: str) -> list[Conversatio
             .order_by(Conversation.updated_at.desc())
         ).all()
     )
+
+
+def recent_turns(db: SessionLocal, conversation_id: str, limit: int = 4) -> list[tuple[str, str]]:
+    """The last few messages of a conversation, oldest first, as `(role, text)`.
+
+    What a follow-up is recognised by. "And if I'm part-time?" says nothing about
+    the company on its own, so without this the assistant has no way to tell it
+    from a fresh question about part-time staff and retrieves it as written.
+
+    Bounded: the window is the last few messages rather than the whole thread,
+    because the classification call runs on every question and an unbounded history
+    would make its cost grow with the conversation. A window this short is enough
+    to carry the topic of the previous exchange, which is all a follow-up needs.
+
+    Assistant messages are included even though the classification prompt only
+    needs the question. The answer is what tells the follow-up what the previous
+    exchange actually settled, so a window of alternating pairs carries more than
+    the same number of questions alone would.
+
+    Truncation of the individual messages is the caller's business, not this
+    function's: it is a prompt concern, and what belongs in a stored conversation
+    is the message as written.
+    """
+    rows = db.scalars(
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+    ).all()
+
+    return [(row.role, row.content) for row in reversed(rows)]
 
 
 def touch(db: SessionLocal, conversation: Conversation) -> None:

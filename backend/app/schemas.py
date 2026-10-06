@@ -59,6 +59,10 @@ class MessageDto(BaseModel):
     # before this field existed. Null is read downstream as "worked it out from the
     # citations", which is what those older rows can still support.
     status: str | None = None
+    # How closely the retrieved passages matched the question, 1-10, or null on a
+    # turn that was not built from any. Null for the same reason `status` is
+    # nullable: an older row has no figure, and reporting one would be inventing it.
+    confidence: int | None = None
 
 
 ConversationDetailResponse.model_rebuild()
