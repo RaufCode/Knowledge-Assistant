@@ -73,6 +73,26 @@ services:
       - key: MIN_SCORE
         value: "0.40"
 
+      # Retrieval is hybrid: vector similarity and BM25 keyword matching, fused.
+      # The two candidate depths are how far each search looks *before* the
+      # fusion, so they are deliberately deeper than the four chunks the generator
+      # finally reads — a chunk outside both top-N cannot reach the fused top-N.
+      # `VECTOR_CANDIDATES` is load-bearing beyond ranking: it is also the window
+      # the keyword half may rescue from, so shrinking it removes candidates rather
+      # than only reordering them. Left unset in the blueprint on purpose: the code
+      # defaults are the tuned values, and repeating them here is a second place
+      # for them to drift.
+      #
+      # `KEYWORD_MIN_SCORE` is a BM25 score, not a similarity. It is not comparable
+      # with `MIN_SCORE` and must not be tuned against it.
+      #
+      # `RECALL_FLOOR` is deliberately NOT a lower `MIN_SCORE`, and the two must not
+      # be merged. On this embedding model the answerable and unanswerable score
+      # ranges overlap (answerable as low as 0.22, unanswerable as high as 0.32), so
+      # no relevance threshold separates them. `RECALL_FLOOR` only applies when
+      # nothing cleared `MIN_SCORE`, and hands those chunks to the generator to rule
+      # on — it never re-ranks a question that already had a real match.
+
       # The deployed Angular frontend. Listed explicitly (no wildcard) so
       # credentialed CORS responses carry a concrete `Access-Control-Allow-Origin`
       # and the CSRF origin check has something real to compare against.

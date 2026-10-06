@@ -37,9 +37,10 @@ backend/
 │   ├── bootstrap_admin.py # Creates the first administrator, from a shell
 │   └── rag/
 │       ├── __init__.py
-│       ├── engine.py      # RAG assistant (retrieve + generate)
-│       ├── guard.py       # Personal-question filter
-│       └── ingest.py      # Document loading & indexing
+│       ├── engine.py      # RAG assistant (classify + retrieve + generate)
+│       ├── guard.py       # Message classification (greeting / question / follow-up / out of scope)
+│       ├── ingest.py      # Document loading & indexing
+│       └── retrieval.py   # Hybrid retrieval: vector + keyword, merged with RRF
 ├── data/                  # Policy markdown documents (13 files)
 │   ├── 00-README.md
 │   ├── 01-company-overview.md
@@ -50,7 +51,10 @@ backend/
 ├── tests/
 │   ├── test_auth.py        # Auth, at the level of the HTTP contract
 │   ├── test_conversations.py
-│   └── test_engine_stream.py
+│   ├── test_engine_stream.py
+│   ├── test_greeting.py    # Greetings answered without retrieval
+│   ├── test_hybrid_retrieval.py  # Both searches, and their fusion
+│   └── test_intent.py      # Which path a message takes before retrieval
 ├── Dockerfile
 ├── requirements.txt
 ├── .env.example
@@ -182,8 +186,12 @@ it is the page's scheme that decides, not the hop behind it.
 | `FRONTEND_BASE_URL` | No | `http://localhost:4200` | Where an invitation link points |
 | `AUTH_BOOTSTRAP_KEY` | No | — | Guards the one route that can create the first administrator. Prefer `python -m app.bootstrap_admin` |
 | `AUTH_SEED_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | No | — | Seeds an administrator at startup. Ignored when `ENVIRONMENT=production` |
-| `TOP_K` | No | `4` | Number of documents to retrieve |
-| `MIN_SCORE` | No | `0.40` | Minimum similarity score threshold |
+| `MIN_SCORE` | No | `0.40` | Minimum vector-similarity score. Tied to `EMBED_MODEL` |
+| `RECALL_FLOOR` | No | `0.15` | When nothing clears `MIN_SCORE`, chunks above this are still passed to the generator to rule on. A recall setting, not a relevance one — see below |
+| `RECALL_CANDIDATES` | No | `4` | How many such chunks are passed on |
+| `VECTOR_CANDIDATES` | No | `10` | How far down the vector search looks. Also the window a keyword hit may rescue from |
+| `KEYWORD_CANDIDATES` | No | `10` | The same, for the keyword search |
+| `KEYWORD_MIN_SCORE` | No | `2.0` | Minimum BM25 score. A corpus-size scale, not a similarity one, so it is not comparable with `MIN_SCORE` |
 | `DATA_DIR` | No | `data` | Path to policy documents |
 
 `AUTH_SECRET_KEY` can be generated with:
@@ -288,6 +296,95 @@ Failures are reported rather than swallowed: a 429 or 5xx is retried with
 exponential backoff, and once the attempts are used up `/chat` answers 503 and
 writes no history row. `/health` reports `degraded` when the generation key is
 missing and `embedding_configured` for the retrieval key.
+
+## How a question is answered
+
+Two decisions happen before anything is retrieved, and both of them exist because
+the alternative was an answer that was wrong rather than one that was missing.
+
+**Which of four things is this message?** The classifier (`app/rag/guard.py`) sees
+the message *and the last few turns of the conversation*, because a follow-up
+cannot be recognised from its own words — "and if I'm part time?" is a complete,
+in-scope, self-contained question that only means something because of what came
+before it.
+
+| Category | Example | What happens |
+| --- | --- | --- |
+| Greeting | "hello", "thanks" | A short introduction. No retrieval. |
+| Question | "How many sick days do I get?" | Retrieved and answered from the documents, with citations. |
+| Follow-up | "anything else I should know?" | Rewritten into a standalone question first — *what else does the Code of Conduct document cover?* — then retrieved as above. |
+| Out of scope | "how many presidents has Ghana had?" | A statement of what the assistant is for. No retrieval. |
+
+A follow-up is rewritten rather than retrieved as written because "anything else"
+matches nothing in any document, which is how a follow-up used to end as a
+false "not found in the company documents".
+
+Out of scope and not-found say opposite things, and are kept apart deliberately:
+*not found* means the documents do not cover an in-scope question, so HR can
+supply the missing policy; *out of scope* means the question was never something
+HR has an answer to, so sending somebody there would be actively unhelpful.
+
+**Which chunks answer it?** Retrieval is hybrid (`app/rag/retrieval.py`). Vector
+similarity and BM25 keyword matching each return candidates, and the two ranked
+lists are merged by Reciprocal Rank Fusion — `1/(60 + rank)` per list, summed.
+They cover opposite failures: vector search finds "annual leave" in a chunk headed
+"Paid Time Off", and keyword search finds a chunk containing the literal "Code of
+Conduct" that the vector search under-ranked. Fusing on *rank* rather than score
+is what makes the merge possible, because cosine similarity and BM25 are not on
+the same scale and cannot be averaged.
+
+A chunk that only one search found still competes rather than being discarded —
+that is the case worth having, and it is the exact-term hit the other search
+buried. `grievance` is the live example: the vector search scores the right chunk
+at 0.149, far under the floor, and the keyword half is what puts it in front of the
+generator.
+
+One rule qualifies that, because it is not obvious: **a keyword hit may only
+rescue a chunk the vector search actually returned.** It need not score above
+`min_score` — under-scoring is the case being rescued — but it must have been
+considered. On a corpus this small, BM25's IDF is a weaker signal than it is over
+a large document collection: a light verb appearing in four chunks scores as "rare"
+as a policy name appearing in four. Left unchecked, "what do I get paid for my
+work?" put the IT & VPN guide first on the strength of "get" and "work" alone —
+terms whose similarity to that chunk is 0.163 — and the generator was handed a VPN
+guide in answer to a question about pay. `min_score` does not catch it, because it
+applies to what the vector search returned and that chunk was not returned at all.
+
+`VECTOR_CANDIDATES` is therefore load-bearing beyond ranking: it is the window a
+rescue may come from, so reducing it removes candidates rather than reordering
+them. It must be at least 10 for this corpus — at `top_k`=4 the vector search only
+ever saw four chunks, and `grievance` was not among them.
+
+### Why `MIN_SCORE` was not lowered
+
+Because on this embedding model the two cases cannot be separated by score. Best
+chunk cosine, measured:
+
+| | question | best cosine |
+| --- | --- | --- |
+| Answerable | What do I get paid for my work? | 0.307 |
+| Answerable | How much do I earn? | 0.222 |
+| Answerable | What is the notice period? | 0.269 |
+| Unanswerable | How many dentists does the company have? | 0.323 |
+| Unanswerable | What is the weather in Accra? | 0.295 |
+
+The ranges overlap. Any threshold low enough to admit the answerable rows also
+admits the unanswerable ones, and the corpus starts answering from the nearest
+irrelevant document. A relative threshold ("at least 70% of the best score") was
+implemented and measured: it produces **zero difference**, because it can only ever
+lower the floor for a weak query — it can never admit a chunk the vector search
+did not return.
+
+So `MIN_SCORE` stays at 0.40 and `RECALL_FLOOR` handles the gap instead. When no
+chunk clears `MIN_SCORE`, the best ones above `RECALL_FLOOR` are still handed to
+the generator. The generator already decides `NOT_FOUND` when handed irrelevant
+chunks — that is verified, not assumed — so the judgement goes where it can be
+made well. A question with a real match above `MIN_SCORE` never reaches this path
+at all, which is why no answer that works today changes.
+
+`MIN_SCORE` and `KEYWORD_MIN_SCORE` are separate floors because the two scores are
+not comparable. Raising either makes questions look "not found" with no error
+anywhere, so change them with the corpus in mind.
 
 ## API Endpoints
 
@@ -436,7 +533,45 @@ JSON object per `data:` line:
 | `status` | The answer is being written, before any of it exists yet. |
 | `delta` | A piece of the answer text. Repeat until `done`. |
 | `done` | The complete answer and its citations. Sent exactly once, and it is the authoritative one. |
+| `title` | The conversation's name, after the first exchange only. |
 | `error` | The answer could not be finished. Any partial text stays visible. |
+
+`done` carries a `status` naming what the turn turned out to be, so a client can
+draw each outcome as its own thing rather than inferring it:
+
+| `status` | Meaning | Cites |
+| --- | --- | --- |
+| *(absent)* | Answered from the documents. | Yes |
+| `not-found` | In scope, and the documents do not cover it. HR owns the gap. | No |
+| `out-of-scope` | Never something this assistant answers. Not a gap in the corpus. | No |
+| `restricted` | The asker's own records, which are not shared through here. | No |
+| `greeting` | Small talk, answered without retrieval. | No |
+
+The wire spells these in `kebab-case`, and a client should treat an unrecognised
+one as an ordinary answer rather than as a failure.
+
+`done` also carries `confidence`: how closely the retrieved passages matched the
+question, **1 to 10**, or `null`.
+
+It is derived from the similarity of the best chunk that was retrieved, and it is
+deliberately not a probability that the answer is right — nothing in the pipeline
+knows that, since the figure is computed before the model is called at all. What it
+reports is the quality of the evidence, which is why the two are separated: a
+well-matched passage set that the model then answered wrongly still scores high,
+and a correct answer drawn from a marginal match still scores low.
+
+The scale is anchored on measurements from this corpus with this embedding model:
+`RECALL_FLOOR` (0.15) at the bottom, and 0.70 at the top. So `MIN_SCORE` of 0.40
+lands **mid-scale** — a good answer reports about 5/10, not 8/10. That reads low,
+and it is the honest reading. `grievance` scores 1/10 because the chunk that
+answers it has a cosine of 0.149: the answer is right and the match is marginal,
+and the figure is about the second of those.
+
+`null` is returned for every turn built from no passages — a greeting, a refusal,
+an out-of-scope reply, or a question the corpus does not cover. Not `0`: there
+was nothing to match, which is a different thing from matching badly, and a low
+number beside an answer with no sources would read as a poor answer rather than as
+the absence of one.
 
 ```
 data: {"type":"status","stage":"writing"}
