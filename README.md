@@ -117,42 +117,42 @@ npm run start:dev -- --host 0.0.0.0 --port 4200
 
 Then on the phone, `http://<your-machine-ip>:4200`. The dev-server proxy forwards
 `/api` to the backend, so the phone only ever talks to one origin and needs no
-extra configuration. Add that address to `ALLOWED_ORIGINS` and
-`CSRF_TRUSTED_ORIGINS` in `backend/.env`, spelled exactly as the browser sends it:
-
-```bash
-ALLOWED_ORIGINS=http://localhost:4200,http://192.168.1.20:4200
-CSRF_TRUSTED_ORIGINS=http://localhost:4200,http://192.168.1.20:4200
-```
+extra configuration — not even an entry in an allow-list, because the request
+arrives at the backend naming the host the app itself was served at.
 
 A refusal names the origin it did not recognise, so a mistyped address is a 403
 that tells you what to fix rather than one that looks like a broken interceptor.
 
 ### Where the API is, and why the phone was different
 
-`frontend/public/config.json` names the backend the browser calls directly. The
-deployed one is `https://knowledge-assistant-chatbot.onrender.com`.
+`frontend/public/config.json` is `""`, which means the app serves `/api` from its
+own origin: the dev-server proxy in `proxy.conf.json` in development, and the
+Express reverse proxy in `src/server.ts` in production. The backend's address is
+`API_ORIGIN`, and the browser is never told it — every request it makes is to the
+address the page came from.
 
-The session is two `httpOnly` cookies, and in production the backend marks them
-`Secure`. A browser will not store a `Secure` cookie for a page served over plain
-http, and it drops it without a word — sign-in still answers `200`, and the next
-call answers `401`. So **running the app locally over http against the deployed
-backend cannot keep a session, on any device.** Use the deployed app for the
-deployed backend, or run the backend locally too, which serves its cookies without
-`Secure`.
+That is what makes the session stick. The session is `httpOnly` cookies, and a
+cookie is attached based on the *site* a request goes to. With the browser calling
+the backend on its own origin, those cookies are first-party, and no browser policy
+is left to get wrong: Safari's ITP and Chrome's third-party-cookie phase-out both
+apply to third-party cookies, and both apply to them differently per browser and per
+device. `AUTH_COOKIE_SAMESITE` therefore defaults to `lax`, which works because the
+request is same-site by construction rather than by luck.
 
-Cookies are also attached based on the *site* a request goes to, not the origin,
-and ports are irrelevant. `localhost` and `127.0.0.1` are different sites;
-`knowledge-assistant-chatbot.onrender.com` and any other `*.onrender.com` are the
-same one. Same-site is what lets `SameSite=Lax` work, and `Lax` is what keeps the
-cookies first-party rather than third-party — which is what Safari and Chrome are
-increasingly unwilling to send.
+The earlier version of this had the browser call
+`https://knowledge-assistant-chatbot.onrender.com` directly, which made the cookies
+third-party, and it worked on some desktops and failed on phones with nothing in the
+code to explain the difference. `AUTH_COOKIE_SAMESITE=none` is still available for an
+API the browser genuinely has to reach on an origin of its own; it is refused when it
+would be issued without `Secure`, because every browser drops that combination
+silently and still answers `200`.
 
-There is a second way to run it, which avoids the browser's decision entirely: the
-app can serve `/api` from its own origin (`src/server.ts`, or the dev-server proxy
-in `proxy.conf.json`). Set `config.json` to `""` and `API_ORIGIN` to the backend,
-and every request is same-site by construction. The backend trusts its own origin,
-so nothing has to be added to an allow-list.
+One trap is left, and it is the one nobody suspects: the backend marks its cookies
+`Secure` in production, and a browser will not store a `Secure` cookie for a page
+served over plain http — it drops it without a word, so sign-in still answers `200`
+and the next call answers `401`. Running the app over http therefore needs a local
+backend, which serves its cookies without `Secure`. The proxy does not change this:
+it is the page's scheme that decides, not the hop behind it.
 
 ## Environment Variables
 
@@ -570,18 +570,20 @@ FastAPI backend and the Angular app, server-rendered by its own Express server.
 3. Create the first administrator with `python -m app.bootstrap_admin`, then remove
    `AUTH_BOOTSTRAP_KEY`
 
-By default the browser calls the backend on its own origin, so `config.json` and the
-backend have to agree:
+The app serves its own `/api`, so `config.json` is `""` and the browser only ever
+calls the app's address:
 
-- `ALLOWED_ORIGINS` and `CSRF_TRUSTED_ORIGINS` on the backend must contain the
-  app's exact origin. A mismatch is a 403 on the first write, and the refusal names
-  the origin it did not recognise.
+- `API_ORIGIN` on the app service is the backend, and is what the proxy forwards to.
+- `ALLOWED_ORIGINS` and `CSRF_TRUSTED_ORIGINS` govern CORS and the CSRF origin
+  check. Neither needs the app's own origin listed: the request reaches the backend
+  naming the host it was sent to, which the backend recognises as its own. They still
+  matter for anything calling the backend directly.
 - `FRONTEND_BASE_URL` is where invitation links point.
 
-`render.yaml` leaves the app's own hostname to Render to generate, so read it off
-the service page after the first deploy and set those three to match. Serving the
-API from the app instead (`API_ORIGIN` plus `config.json` of `""`) removes the
-allow-list from the equation entirely.
+`render.yaml` sets all of these, including `API_ORIGIN`. Nothing has to be read off
+the service page after the first deploy, which is the point: an allow-list that has
+to name the address you are already at is one more thing that can be wrong, and a
+403 on the first write when it is.
 
 ## API Docs
 
