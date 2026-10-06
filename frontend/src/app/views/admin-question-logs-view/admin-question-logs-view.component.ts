@@ -98,7 +98,7 @@ const ALL_LABEL = 'All';
           }
         </div>
       </div>
-    } @else {
+    } @else if (auth.lacksAdminAccess()) {
       <app-admin-access-required />
     }
 

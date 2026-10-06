@@ -612,12 +612,15 @@ export class ChatSidebarComponent {
     () => this.auth.isAdmin() && this.section.isAdminSection(),
   );
 
-  /** The signed-in person's initials, or nothing before they have signed in. */
-  protected readonly initials = computed(() => {
-    const name = this.auth.user()?.name;
-
-    return name ? toInitials(name) : '';
-  });
+  /**
+ * The signed-in person's initials.
+ *
+ * A placeholder rather than nothing when the name has not arrived, because a blank
+ * circle reads as a broken control: it is the one thing on screen that says who is
+ * signed in, and an empty badge beside an empty name leaves the person looking at a
+ * page that has decided nobody is here.
+ */
+  protected readonly initials = computed(() => toInitials(this.auth.user()?.name ?? ''));
 
   /** The conversation a delete confirmation is about, or null when there is none. */
   private pendingDeleteId: string | null = null;

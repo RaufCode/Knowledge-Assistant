@@ -135,7 +135,7 @@ import { formatFileSize } from '../../shared/utils/file-size.util';
         tone="danger"
         (confirmed)="deleteDocument()"
       />
-    } @else {
+    } @else if (auth.lacksAdminAccess()) {
       <app-admin-access-required />
     }
   `,

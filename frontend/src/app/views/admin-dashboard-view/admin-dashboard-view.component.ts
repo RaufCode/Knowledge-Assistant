@@ -155,7 +155,7 @@ import { formatRelativeTime } from '../../shared/utils/relative-time.util';
           }
         </section>
       </div>
-    } @else {
+    } @else if (auth.lacksAdminAccess()) {
       <app-admin-access-required />
     }
   `,

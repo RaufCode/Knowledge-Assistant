@@ -155,6 +155,21 @@ export class AuthService {
   readonly isAdmin = computed(() => this.userState()?.role === 'admin');
 
   /**
+   * Whether somebody is signed in whose role is not `admin`.
+   *
+   * Deliberately not `!isAdmin()`. That is also true while nobody is signed in, and
+   * the administration screens used the difference to tell a refusal apart from a
+   * blank page — so a signed-out visitor arriving on one was told their account did
+   * not have administrator access, which is a different claim entirely: nothing had
+   * been decided about an account, because there was not one to decide about.
+   *
+   * Answering "nobody" instead is what lets the guard send them to sign in, which is
+   * where that answer belongs. The screen says nothing until there is somebody to
+   * refuse.
+   */
+  readonly lacksAdminAccess = computed(() => this.isAuthenticated() && !this.isAdmin());
+
+  /**
    * Where somebody lands after signing in, which depends on their role.
    *
    * An administrator lands on the dashboard, because their job starts there. An
@@ -190,6 +205,24 @@ export class AuthService {
 
   /** The in-flight refresh, shared so concurrent 401s cause one refresh, not several. */
   private refreshPromise: Promise<UserDto | null> | null = null;
+
+  /**
+   * Counts the sessions this tab has ended, so an answer already on its way can tell
+   * whether it still describes anything.
+   *
+   * A `GET /me` cannot be taken back. It is fired while a session is believed to
+   * exist and answered whenever the network gets round to it, so signing out in
+   * between does not stop it arriving — it arrives with a user in it and puts the
+   * person back. That is not hypothetical here: changing an administrator's own
+   * password revokes every session server-side while leaving the access token good
+   * for up to fifteen minutes, so the request a guard had already sent came back
+   * with the administrator in it, minutes after they had asked to be signed out.
+   *
+   * A request notes the count it was sent under and drops its own answer if the
+   * count has moved on. The answer is not wrong about who that was; it is wrong
+   * about who is signed in now.
+   */
+  private sessionEpoch = 0;
 
   /**
    * Whether the question can even be asked here.
@@ -303,9 +336,17 @@ export class AuthService {
       return Promise.resolve(null);
     }
 
+    const epoch = this.sessionEpoch;
+
     this.bootstrapPromise = firstValueFrom(
       this.http.get<UserDto>(`${this.baseUrl}/api/auth/me`, this.credentials()).pipe(
-        tap((user) => this.setUser(user)),
+        // The epoch is what makes a signed-out-in-the-meantime answer harmless: the
+        // person it names is no longer signed in, and setting them would undo that.
+        tap((user) => {
+          if (this.sessionEpoch === epoch) {
+            this.setUser(user);
+          }
+        }),
         // A 401 here means the access cookie has expired, not necessarily that the
         // session is over: the access token is deliberately short-lived and the
         // refresh cookie outlives it. So one refresh is tried before concluding
@@ -783,12 +824,20 @@ export class AuthService {
       return this.refreshPromise;
     }
 
+    const epoch = this.sessionEpoch;
+
     this.refreshPromise = firstValueFrom(
       this.http
         .post<UserResponseDto>(`${this.baseUrl}/api/auth/refresh`, {}, this.credentials())
         .pipe(
           map((response) => response.user),
-          tap((user) => this.setUser(user)),
+          // Same reasoning as `bootstrap`: a refresh that was asked for before the
+          // session ended must not bring it back afterwards.
+          tap((user) => {
+            if (this.sessionEpoch === epoch) {
+              this.setUser(user);
+            }
+          }),
           catchError((error: unknown) => {
             if (isSessionRefusal(error)) {
               this.setUser(null);
@@ -858,8 +907,19 @@ export class AuthService {
     return null;
   }
 
-  /** Forgets the current user without touching the server. */
+  /**
+   * Forgets the current user without touching the server.
+   *
+   * Also stops the app asking about a session it has just decided is over. The hint
+   * cookie outlives this call — it is the backend's to clear, and it only gets
+   * cleared when the revocation that follows lands — so without dropping it here a
+   * guard asked in the meantime would answer `/me`, and the access token that
+   * request carries is still good for up to fifteen minutes after its sessions were
+   * revoked. That is how signing out locally could put an administrator straight back
+   * on an admin screen, signed out of the account but with the page drawn for one.
+   */
   clear(): void {
+    this.forgetSessionHint();
     this.setUser(null);
   }
 
@@ -872,6 +932,13 @@ export class AuthService {
    * have arrived.
    */
   private setUser(user: UserDto | null): void {
+    // Bumped on every ending, never on a sign-in, so it counts sessions ended rather
+    // than requests sent. `bootstrap` and `refresh` compare against it and drop an
+    // answer that belongs to a session which is already over.
+    if (user === null) {
+      this.sessionEpoch += 1;
+    }
+
     this.userState.set(user);
     this.statusState.set(user ? 'authenticated' : 'anonymous');
     // Threads belong to the account that made them: point the browser at this

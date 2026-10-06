@@ -238,7 +238,7 @@ const STATUS_LABELS: Record<AccessRequestStatus, string> = {
           </div>
         </div>
       </div>
-    } @else {
+    } @else if (auth.lacksAdminAccess()) {
       <app-admin-access-required />
     }
   `,

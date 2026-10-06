@@ -44,6 +44,15 @@ export class AuthServiceStub {
   readonly isAdmin = this.adminState.asReadonly();
 
   /**
+   * Whether somebody is signed in who is not an administrator.
+   *
+   * Mirrors the real service's rule, so a spec that signs somebody out sees the same
+   * thing the screens see: no user is not a user without administrator access, and
+   * the two must not be answered the same way.
+   */
+  readonly lacksAdminAccess = computed(() => this.isAuthenticated() && !this.isAdmin());
+
+  /**
    * Where this person lands after signing in.
    *
    * Mirrors the real service's rule rather than being a fixed value, because the

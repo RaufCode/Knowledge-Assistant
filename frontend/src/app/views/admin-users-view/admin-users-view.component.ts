@@ -70,9 +70,9 @@ interface HandedOver {
 
     <div class="scrollbar-thin min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:px-8">
       <div class="flex min-w-0 flex-1 flex-col">
-        @if (!auth.isAdmin()) {
+        @if (auth.lacksAdminAccess()) {
           <app-admin-access-required />
-        } @else {
+        } @else if (auth.isAdmin()) {
           <div class="mb-4 flex flex-col gap-3">
             <div class="flex flex-wrap gap-2">
               <a routerLink="/admin/access">
