@@ -585,6 +585,41 @@ the service page after the first deploy, which is the point: an allow-list that 
 to name the address you are already at is one more thing that can be wrong, and a
 403 on the first write when it is.
 
+### Do not set NODE_ENV=production on the frontend service
+
+It breaks the build, in a way that looks like a broken toolchain rather than a
+missing variable. `npm install` and `npm ci` both skip `devDependencies` when
+`NODE_ENV=production`, and `@angular/cli` is one, so the install succeeds and quietly
+removes the tool the build needs:
+
+```
+removed 263 packages, and audited 99 packages in 917ms
+> ng build
+sh: 1: ng: not found
+```
+
+Nothing in the server needs the variable — `API_ORIGIN` is read directly, so behaviour
+is identical with and without it. `scripts/check_build_env.mjs` runs before the build
+and explains this rather than leaving "command not found", but the fix is to leave
+`NODE_ENV` unset.
+
+### A 500 from every /api route means API_ORIGIN
+
+The frontend serves `/api` itself, and if it cannot tell where the backend is, every
+call in the app fails while the rest of the app looks fine — SSR and static assets
+answer `200` because they never touch the proxy. That is a distinctive signature:
+
+```
+/api/auth/me           500
+/api/conversations     500
+/                      200
+```
+
+The service log holds the literal `API_ORIGIN is not set`. Note that a service created
+before a key was added to `render.yaml` never receives it, because a blueprint only
+applies env vars when it creates or re-syncs the service — so set it in the dashboard
+and check the build command matches the blueprint's `npm ci && npm run build`.
+
 ## API Docs
 
 Once running, interactive Swagger docs are available at:

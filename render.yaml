@@ -124,6 +124,19 @@ services:
       - key: NODE_VERSION
         value: "24"
 
+      # NODE_ENV must NOT be set to production on this service.
+      #
+      # It breaks the build. npm skips devDependencies when NODE_ENV=production, the
+      # Angular CLI is a devDependency, so the install quietly removes it and the
+      # build then fails with `sh: 1: ng: not found` — which says nothing about the
+      # cause. `scripts/check_build_env.mjs` runs before the build and names it, but
+      # the fix is to leave NODE_ENV unset: nothing in this server needs it, since
+      # API_ORIGIN is read directly.
+      #
+      # It is worth stating because setting it is a reasonable-looking thing to do on
+      # a Node service, and it was set here to make a missing API_ORIGIN a loud error
+      # instead of a silent fallback to localhost.
+
       # Where the API is. This server answers `/api` itself, forwarding to the
       # backend named here — which is what `config.json` (set to "") asks for.
       #
