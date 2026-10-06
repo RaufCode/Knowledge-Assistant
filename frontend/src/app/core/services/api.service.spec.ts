@@ -109,14 +109,19 @@ describe('ApiService', () => {
           { id: 'm2', role: 'assistant', content: "Hello! I'm the assistant.", sources: null, status: 'greeting', confidence: null, created_at: '2026-09-30T09:00:01' },
           { id: 'm3', role: 'assistant', content: 'Confidential.', sources: null, status: 'restricted', confidence: null, created_at: '2026-09-30T09:00:02' },
           { id: 'm4', role: 'assistant', content: "I couldn't find that.", sources: null, status: 'not-found', confidence: null, created_at: '2026-09-30T09:00:03' },
+          { id: 'm5', role: 'assistant', content: "That isn't something I cover.", sources: null, status: 'out-of-scope', confidence: null, created_at: '2026-09-30T09:00:04' },
         ],
       });
 
+      // The out-of-scope one is here because it is the case most easily lost: it
+      // cites nothing, like the other three, and reading it as "not-found" claims
+      // a gap in the documents on a question that never was one.
       expect(thread?.messages.map((message) => message.status)).toEqual([
         'answered',
         'greeting',
         'restricted',
         'not-found',
+        'out-of-scope',
       ]);
     });
 

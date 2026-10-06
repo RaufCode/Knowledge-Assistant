@@ -14,6 +14,7 @@ import { Message } from '../../../../core/models/message.model';
 import { AnswerCardComponent } from '../answer-card/answer-card.component';
 import { AnswerFailedComponent } from '../answer-failed/answer-failed.component';
 import { AnswerNotFoundComponent } from '../answer-not-found/answer-not-found.component';
+import { AnswerOutOfScopeComponent } from '../answer-out-of-scope/answer-out-of-scope.component';
 import { AnswerPendingComponent } from '../answer-pending/answer-pending.component';
 import { AnswerRestrictedComponent } from '../answer-restricted/answer-restricted.component';
 import { MessageBubbleComponent } from '../message-bubble/message-bubble.component';
@@ -46,6 +47,7 @@ const AT_BOTTOM_SLACK_PX = 24;
     AnswerCardComponent,
     AnswerFailedComponent,
     AnswerNotFoundComponent,
+    AnswerOutOfScopeComponent,
     AnswerPendingComponent,
     AnswerRestrictedComponent,
     MessageBubbleComponent,
@@ -87,6 +89,14 @@ const AT_BOTTOM_SLACK_PX = 24;
                 }
                 @case ('not-found') {
                   <app-answer-not-found [message]="message" />
+                }
+                @case ('out-of-scope') {
+                  <!-- Also not a failed search, and kept apart from the not-found
+                       card for a sharper reason: that one says the documents do
+                       not cover an in-scope question, this one says the question
+                       was never in scope. Drawing them alike would send somebody
+                       to HR over a general-knowledge question. -->
+                  <app-answer-out-of-scope [message]="message" />
                 }
                 @case ('restricted') {
                   <!-- A refusal, not a failed search: the card says so rather than

@@ -8,6 +8,7 @@ export type IconName =
   | 'check'
   | 'check-circle-2'
   | 'clock'
+  | 'compass'
   | 'copy'
   | 'file-text'
   | 'gauge'
@@ -107,6 +108,12 @@ const OPTICAL_STROKE = 48;
           <g>
             <circle cx="12" cy="12" r="9" />
             <path d="M12 7v5l3 2" />
+          </g>
+        }
+        @case ('compass') {
+          <g>
+            <circle cx="12" cy="12" r="10" />
+            <path d="m16.24 7.76-2.12 6.36-6.36 2.12 2.12-6.36z" />
           </g>
         }
         @case ('copy') {

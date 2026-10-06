@@ -25,11 +25,18 @@ export interface SourceReference {
  * assistant reporting that the corpus genuinely has nothing, because the two
  * need different wording and different recovery.
  *
- * `greeting` and `restricted` are answers that cite nothing for reasons that have
- * nothing to do with the corpus: one is small talk answered without retrieving, the
- * other is a question turned away before retrieval was attempted. Neither is a
- * failed search, and both would be misleading if drawn as one — a refusal labelled
- * "not found in company documents" claims the gap is in the documents.
+ * `greeting`, `restricted` and `out-of-scope` are answers that cite nothing for
+ * reasons that have nothing to do with the corpus: one is small talk answered
+ * without retrieving, one is a question turned away before retrieval was attempted,
+ * and one was never in scope to answer. None is a failed search, and all three
+ * would be misleading drawn as one — a refusal labelled "not found in company
+ * documents" claims the gap is in the documents.
+ *
+ * `out-of-scope` is kept apart from `not-found` because the two mean opposite
+ * things. `not-found` is "this is in scope and the documents do not cover it";
+ * `out-of-scope` is "this was never something this assistant answers". Sending
+ * somebody to HR over a general-knowledge question is not a useful answer, and it
+ * reads as though the assistant had misunderstood the question.
  */
 export type AnswerStatus =
   | 'pending'
@@ -37,6 +44,7 @@ export type AnswerStatus =
   | 'not-found'
   | 'greeting'
   | 'restricted'
+  | 'out-of-scope'
   | 'failed';
 
 /**
@@ -52,9 +60,18 @@ export const INCOMING_ANSWER_STATUSES: readonly AnswerStatus[] = [
   'not-found',
   'greeting',
   'restricted',
+  'out-of-scope',
 ];
 
-/** Narrows a wire status to a known one, or null when it is not one. */
+/**
+ * Narrows a wire status to a known one, or null when it is not one.
+ *
+ * The wire spells statuses in `kebab-case`, which is also how they are declared
+ * above, so this is a set lookup with no translation. An unknown status returns
+ * null rather than being cast through: a deployment that adds one should render as
+ * an ordinary answer rather than as a failed search, which is the safer of the two
+ * wrong readings.
+ */
 export function toKnownAnswerStatus(value: string | null | undefined): AnswerStatus | null {
   return value && INCOMING_ANSWER_STATUSES.includes(value as AnswerStatus)
     ? (value as AnswerStatus)

@@ -262,6 +262,20 @@ describe('ChatThreadComponent', () => {
       expect(element().textContent).toContain('Not found in company documents');
     });
 
+    it('draws an out-of-scope question apart from a gap in the corpus', async () => {
+      await draw(
+        'out-of-scope',
+        "I'm built to answer questions about company policies and internal documents.",
+      );
+
+      expect(element().textContent).toContain('Outside what I cover');
+      // The two say opposite things. Not-found means the documents do not cover
+      // an in-scope question; out-of-scope means it never was one, and drawing it
+      // as a gap would send somebody to HR over a general-knowledge question.
+      expect(element().textContent).not.toContain('Not found in company documents');
+      expect(element().querySelector('app-answer-not-found')).toBeNull();
+    });
+
     it('draws a greeting as an ordinary answer, because that is what it is', async () => {
       await draw('greeting', "Hello! I'm the assistant.");
 
