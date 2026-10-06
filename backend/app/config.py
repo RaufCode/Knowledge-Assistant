@@ -39,8 +39,49 @@ class Settings(BaseSettings):
     # (llama-3.2-nv-embedqa-1b-v2, nv-embedqa-e5-v5, nv-embed-v1, bge-m3).
     embed_model: str = "nvidia/nemotron-3-embed-1b"
     data_dir: str = "data"
+    # How many chunks reach the generator. Four is enough to answer a policy
+    # question without burying the prompt in passages the model will not use.
     top_k: int = 4
+
+    # How far down each search looks before the two are fused. Deliberately deeper
+    # than `top_k`: a chunk that is outside both lists' top few cannot reach the
+    # fused top few either, so searching exactly `top_k` from each would cap the
+    # fusion at the two best chunks it already had.
+    vector_candidates: int = 10
+    keyword_candidates: int = 10
+
+    # The floor below which a chunk is not a match at all, applied per search
+    # before fusion. Both are on their own search's scale and neither is
+    # comparable to the other.
+    #
+    # `min_score` is the existing cosine-similarity floor and is tied to
+    # `embed_model` — see the note on it below. `keyword_min_score` is a BM25
+    # score, whose absolute value depends on corpus size and term rarity rather
+    # than on any embedding, so it is set where a single meaningful term match on
+    # this corpus clears it and a stray common word does not.
     min_score: float = 0.40
+    keyword_min_score: float = 2.0
+
+    # Below `min_score`, nothing is a match — but something is *always* the best
+    # available answer, and refusing to show it to the generator throws away the
+    # only thing that can judge it properly. This is the floor for that last
+    # resort, and it is far lower on purpose: it is reached only when the strict
+    # pass found nothing at all, and only to give the generator the chance to
+    # answer or decline. It never relaxes `min_score` for a question that already
+    # has a real match.
+    #
+    # Set from the observed spread rather than tuned: questions the corpus can
+    # answer score as low as 0.22 on their best chunk, while genuinely unrelated
+    # questions peak around 0.32 — the two ranges overlap, which is exactly why
+    # this cannot be a relevance threshold and must be a recall one. Whether the
+    # chunk actually answers is the generator's call, and it is a good one.
+    recall_floor: float = 0.15
+
+    # How many chunks the last resort hands over. More than `top_k` would be
+    # pointless and fewer than `top_k` would make this look like a demotion; the
+    # point is to give the generator the same evidence it gets for any other
+    # question, so that it decides on equal terms.
+    recall_candidates: int = 4
     database_url: str = "postgresql://user:password@localhost:5432/knowledge_assistant"
     allowed_origins: str = "*"
 
