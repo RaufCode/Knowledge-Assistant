@@ -14,11 +14,11 @@ import { IconComponent } from '../../../../shared/components/icon/icon.component
  * tell somebody to reset a password that is perfectly fine, and a spinner would leave
  * them refreshing a page that is never going to change.
  *
- * Reached only on the server's `202`, which it sends **only when the password was
+ * Reached on the server's `202`, which it sends **only when the password was
  * correct**. That is what makes it safe to show: the person has already proved the
  * account is theirs, so telling them its state discloses nothing to anybody else. A
  * wrong password gets one generic answer whether the address is unknown, taken or
- * pending, so this screen cannot be used to find out who works here.
+ * waiting, so this screen cannot be used to find out who works here.
  *
  * What it must not do is pretend to be progress. There is no countdown and no
  * "checking" — the answer will not arrive on its own, and a screen that looks like it

@@ -86,6 +86,31 @@ class UserResponse(BaseModel):
     user: UserDto
 
 
+class PendingApprovalResponse(BaseModel):
+    """A correct sign-in for an account that exists but is not switched on.
+
+    The third answer `POST /api/auth/login` can give, and the reason it is a `202`
+    rather than a `401` is the whole point of it. Nothing went wrong: the password was
+    right, the account is real, and an administrator has not got to it yet. Refusing it
+    tells somebody to reset a password that is perfectly fine, and it sends them
+    looking for a problem with the one thing that was not broken.
+
+    Sent **only when the password verified**, which is what makes it safe to send at
+    all. The caller has proved they own the account by knowing its password, so naming
+    its state tells them nothing an attacker could not already work out. A wrong
+    password still gets the one generic refusal whether the address is unknown, taken,
+    or waiting — so this cannot be used to find out who has asked to join.
+
+    `requested_role` is null whenever the backend does not actually know it. A pending
+    account knows the role it will be given; a request that has not been decided does
+    not, and guessing would be a claim about an approval that has not happened.
+    """
+
+    status: Literal["pending"] = "pending"
+    name: str
+    requested_role: Role | None = None
+
+
 class UserSummaryDto(BaseModel):
     """One account, as an administrator's list shows it."""
 

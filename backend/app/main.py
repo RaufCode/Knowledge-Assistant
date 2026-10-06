@@ -165,17 +165,22 @@ app.include_router(auth_router)
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    """Log the real cause and return JSON.
+    """Log the real cause and return JSON, without the cause.
 
-    Without this, any unhandled error reaches the browser as a bare text/plain
-    500 carrying no explanation, which is what made the original upstream outage
-    so hard to diagnose from the outside.
+    Without this, any unhandled error reaches the browser as a bare text/plain 500
+    carrying no explanation at all, which is what made the original upstream outage so
+    hard to diagnose from the outside.
+
+    The exception's type and message go to the log and deliberately **not** into the
+    body. A 5xx body here used to read `OperationalError: could not connect...`, which
+    tells an attacker how the backend stores its data and tells the person looking at
+    the screen nothing they can act on — they cannot fix a dropped connection by
+    reading it. The log is where a cause belongs; this body only has to say that
+    something went wrong here.
     """
     logger.exception("unhandled error on %s %s", request.method, request.url.path)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"{type(exc).__name__}: {exc}"},
-    )
+
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
 
 def owned_conversation_or_404(

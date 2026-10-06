@@ -266,9 +266,9 @@ export class LoginViewComponent {
 
     this.auth.login(this.form.controls.email.value, this.form.controls.password.value).subscribe({
       next: (user) => {
-        // `null` is the server's "your account exists and is waiting to be approved".
-        // A separate screen, because nothing is wrong and a 401 here would send
-        // somebody to reset a password that is fine.
+        // `null` is the server's "your password was right and an administrator has to
+        // approve this account". A separate screen, because nothing is wrong and a 401
+        // here would send somebody to reset a password that is fine.
         if (user === null) {
           this.isSubmitting.set(false);
           void this.router.navigate(['/pending-approval']);
@@ -318,21 +318,6 @@ export class LoginViewComponent {
       },
       error: (error: unknown) => {
         this.isSubmitting.set(false);
-
-        // This backend refuses a correct sign-in for an unapproved account exactly
-        // like a wrong password, so a request made in this browser is the only
-        // thing that can tell the two apart. A remembered request earns the waiting
-        // screen rather than an error that claims the password is wrong; anything
-        // else keeps the generic refusal, which discloses nothing about who asked.
-        const remembered = this.auth.pendingRequestFor(this.form.controls.email.value);
-
-        if ((error as { status?: number } | null)?.status === 401 && remembered !== null) {
-          this.auth.notePendingAccess(remembered.name, remembered.role);
-          void this.router.navigate(['/pending-approval']);
-
-          return;
-        }
-
         this.notice.set(readSignInFailure(error));
       },
     });
@@ -407,6 +392,11 @@ export class LoginViewComponent {
  * purpose, so that it cannot be used to find out who has an account. A 429 means
  * the attempt limit was reached, which is worth saying plainly because the reader
  * did nothing wrong and the fix is to wait.
+ *
+ * A correct password on an account that is still waiting for approval never reaches
+ * this function: the backend answers that with its own `202` and its own payload, and
+ * the caller navigates to the waiting screen. A refusal here means the sign-in really
+ * was refused.
  */
 function readSignInFailure(error: unknown): string {
   const status = (error as { status?: number } | null)?.status;
@@ -424,5 +414,26 @@ function readSignInFailure(error: unknown): string {
     return readRefusalOr(error, GENERIC_REFUSAL);
   }
 
-  return 'That email and password do not match an account.';
+  if (status === 401 || status === 403) {
+    return 'That email and password do not match an account.';
+  }
+
+  // That message is said **only** for the statuses that mean the credentials were
+  // refused. It used to be the fall-through for everything else, so a backend that fell
+  // over answered a correct email and password with "that email and password do not
+  // match an account" — the reader then blames the one thing that was fine, resets a
+  // perfectly good password, and is refused again once the backend recovers.
+  if (typeof status === 'number' && status >= 500) {
+    // Deliberately NOT the server's own `detail`, unlike the case below. A 5xx body
+    // holds whatever the backend was carrying when it broke — the exception's type and
+    // message, a connection string, a query — and none of it was written for a reader.
+    // Passing it through hands over the shape of the internals and tells the person in
+    // front of the screen nothing they can act on.
+    return 'Something went wrong signing you in. Please try again in a moment.';
+  }
+
+  // Anything else here is a refusal the backend did write for somebody to read — a
+  // route that has moved, a body in an unexpected shape — so its own wording is more
+  // use than any sentence chosen in this file.
+  return readRefusalOr(error, 'Sign-in could not be completed. Please try again.');
 }

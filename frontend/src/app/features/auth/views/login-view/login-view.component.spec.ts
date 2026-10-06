@@ -377,6 +377,56 @@ describe('LoginViewComponent', () => {
     expect(navigate).not.toHaveBeenCalled();
   });
 
+  it('never tells somebody their password is wrong when the server fell over', async () => {
+    await signIn();
+
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush({ detail: 'Internal server error.' }, { status: 500, statusText: 'Server Error' });
+    await render();
+
+    // A 500 says nothing about the email or the password. Wording it as a credential
+    // failure sends the reader to reset a password that was fine, and they are refused
+    // again the moment the backend recovers — having changed nothing.
+    const text = element().textContent ?? '';
+
+    expect(text).not.toContain('do not match an account');
+    expect(text).toContain('went wrong');
+    expect(text).toContain('try again');
+  });
+
+  it('does not put a backend exception in front of the reader', async () => {
+    await signIn();
+
+    // A 5xx body can arrive carrying whatever the backend broke on. Even if it did,
+    // none of it may be shown: it is not written for a reader and it describes the
+    // inside of the system rather than anything the person can act on.
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush(
+        { detail: 'OperationalError: could not connect to server "db-primary"' },
+        { status: 500, statusText: 'Server Error' },
+      );
+    await render();
+
+    const text = element().textContent ?? '';
+
+    expect(text).not.toContain('OperationalError');
+    expect(text).not.toContain('db-primary');
+    expect(text).not.toContain('do not match an account');
+  });
+
+  it('blames the credentials for a 403, which is a refusal of this request', async () => {
+    await signIn();
+
+    http
+      .expectOne(`${API_BASE_URL}/api/auth/login`)
+      .flush({ detail: 'Forbidden' }, { status: 403, statusText: 'Forbidden' });
+    await render();
+
+    expect(element().textContent).toContain('do not match an account');
+  });
+
   it('says so plainly when the attempt limit is reached', async () => {
     await signIn();
 

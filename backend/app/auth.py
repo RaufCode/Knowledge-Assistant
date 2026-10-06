@@ -59,9 +59,10 @@ from app.schemas_auth import (
     InvitePreviewResponse,
     InviteRequest,
     InviteResponse,
-    LoginRequest,
-    PasswordResetRequest,
-    StatusResponse,
+LoginRequest,
+PendingApprovalResponse,
+PasswordResetRequest,
+StatusResponse,
     UserDto,
     UserListResponse,
     UserResponse,
@@ -98,10 +99,15 @@ REFRESH_COOKIE = "ika_refresh"
 # more way to send somebody an invitation link for somewhere else.
 ACCEPT_INVITE_PATH = "/accept-invite"
 
-# One message for every failed sign-in. Whether the address is unknown, the
-# password is wrong, or the account is still a pending invitation, the answer is
-# the same 401. Splitting them would turn this endpoint into a way to enumerate
-# which company email addresses have accounts.
+# One message for every sign-in that genuinely failed. Whether the address is
+# unknown, the password is wrong, or the invitation has never been accepted, the
+# answer is the same 401. Splitting them would turn this endpoint into a way to
+# enumerate which company email addresses have accounts.
+#
+# What it is *not* used for is a correct password on an account that is merely
+# waiting for approval. That is a `202` with its own payload, below, and it is safe
+# to answer separately precisely because it only goes out once the password has been
+# verified — knowing a password already proves more than the answer would disclose.
 INVALID_CREDENTIALS = "That email and password do not match an account."
 
 # Likewise for invitations: an unknown token, an expired one and a used one are
@@ -241,7 +247,14 @@ def issue_csrf(response: Response) -> CsrfResponse:
     return CsrfResponse(csrf_token=set_csrf_cookie(response))
 
 
-@router.post("/login", response_model=UserResponse)
+@router.post(
+    "/login",
+    response_model=UserResponse | PendingApprovalResponse,
+    responses={
+        401: {"description": "The address or the password is wrong."},
+        202: {"description": "Correct password, but the account is not approved yet."},
+    },
+)
 @limiter.limit(LOGIN_RATE_LIMIT)
 def login(
     request: Request,
@@ -249,32 +262,80 @@ def login(
     req: LoginRequest,
     db: Session = Depends(get_db),
     _csrf: None = Depends(require_csrf),
-) -> UserResponse:
+) -> UserResponse | PendingApprovalResponse:
     """Signs somebody in.
 
     Exempt from CSRF because there is no session yet to have issued a token for.
     What protects it instead is the rate limit, the fact that a forged sign-in needs
     a password the attacker does not have, and `SameSite=Lax` withholding the
     cookies from a cross-site POST so the response cannot be read back.
+
+    Three answers, not two. A session when the account is active and the password is
+    right; `PendingApprovalResponse` when the password is right and the account is
+    **waiting on an administrator**; and one generic `401` for everything else. That
+    middle case used to be folded into the `401`, which was wrong in the only way that
+    reaches a user: it told somebody their password did not match an account when it
+    matched perfectly, and sent them to reset something that was not broken.
+
+    Answering it separately costs no security, because it is sent *only* once the
+    password has verified. Proving you own an account is not information you can hand
+    to somebody who does not, so this cannot be used to find out which addresses have
+    asked to join — the same reason an invitation link can be previewed at all.
     """
     user = find_user_by_email(db, req.email)
 
-    # The hash is verified even when there is no such user, against a fixed dummy,
-    # so that an address with no account takes the same time as one with a wrong
-    # password. Without this, response time alone says which addresses exist.
     if user is None:
+        # Somebody who registered is not in `users` yet — approval writes that row —
+        # so their request is the only thing there is to check the password against.
+        # Found and verified here so a correct sign-in gets the waiting screen rather
+        # than the wrong-password refusal. A wrong password, or no request at all,
+        # falls through to the same `401` an unknown address gets, after the same
+        # dummy verification, so nothing about this branch is visible from outside.
+        open_request = find_open_access_request(db, req.email)
+
+        if open_request is not None and verify_password(
+            req.password, open_request.password_hash
+        ):
+            logger.info("sign-in for %s is waiting on an administrator", req.email)
+            response.status_code = status.HTTP_202_ACCEPTED
+
+            # No role: nobody has decided one yet. The screen says as much rather than
+            # naming one, because an approval carries the role and nothing else does.
+            return PendingApprovalResponse(name=open_request.name)
+
+        # The hash is verified even when there is no such user, against a fixed dummy,
+        # so that an address with no account takes the same time as one with a wrong
+        # password. Without this, response time alone says which addresses exist.
         verify_password(req.password, dummy_password_hash())
         logger.info("sign-in attempt for unknown address %s", req.email)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=INVALID_CREDENTIALS)
 
-    if not user.is_active or not verify_password(req.password, user.password_hash):
+    if user.password_hash is None:
+        # Invited and never accepted: there is no password to have got right, so
+        # nothing here can be verified and nothing may be said about the account.
+        # Verified against the dummy so the time taken matches every other refusal.
+        verify_password(req.password, dummy_password_hash())
+        logger.info("sign-in against a pending invitation for %s", user.email)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=INVALID_CREDENTIALS)
+
+    if not verify_password(req.password, user.password_hash):
         logger.info("failed sign-in for %s", user.email)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=INVALID_CREDENTIALS)
+
+    if not user.is_active:
+        # The password was right, which is the only thing this branch is entitled to
+        # assume: nobody who has not got the password can reach it. Answering with the
+        # waiting screen rather than a refusal is what stops a correct password from
+        # reading as a wrong one.
+        logger.info("sign-in for %s is on an account that is not active", user.email)
+        response.status_code = status.HTTP_202_ACCEPTED
+
+        return PendingApprovalResponse(name=user.name, requested_role=user.role)
 
     # A hash made at a lower cost than the current setting is replaced on the way
     # past, which is the only moment a user has already proved they know the
     # plaintext.
-    if user.password_hash and needs_rehash(user.password_hash):
+    if needs_rehash(user.password_hash):
         user.password_hash = hash_password(req.password)
         db.commit()
 

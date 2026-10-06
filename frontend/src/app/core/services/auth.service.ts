@@ -443,11 +443,10 @@ export class AuthService {
    *
    * Emits `null` for an account that exists but is not switched on, which is a real
    * answer and not a failure: the password was right, the account is simply waiting on
-   * an administrator. The caller shows the pending screen from it.
-   *
-   * Nothing is stored on that answer. No session cookie came with it and no user is
-   * set, so a pending account cannot be mistaken for a signed-in one anywhere else in
-   * the app.
+   * an administrator. The backend only sends it once the password has verified, so
+   * nothing here has to guess — and nothing is stored on that answer. No session cookie
+   * came with it and no user is set, so a pending account cannot be mistaken for a
+   * signed-in one anywhere else in the app.
    */
   login(email: string, password: string): Observable<UserDto | null> {
     const body: LoginRequestDto = { email: email.trim(), password };
@@ -465,23 +464,14 @@ export class AuthService {
           }
 
           this.pendingState.set(response);
-
-          if (this.isBrowser) {
-            document.cookie = `ika_pending=${btoa(
-              JSON.stringify(response),
-            )}; path=/; samesite=lax; max-age=86400`;
-          }
+          this.rememberPending(response);
 
           return null;
         }),
         tap((user) => {
           if (user) {
             this.pendingState.set(null);
-            if (this.isBrowser) {
-              document.cookie = `ika_pending=; path=/; max-age=0; samesite=lax`;
-            }
-            // Approved since the request was made: nothing left to wait on.
-            this.forgetAccessRequest(user.email);
+            this.forgetPending();
             this.setUser(user);
             // Sign-in rotates the CSRF cookie server-side, so the one held here is no
             // longer the one the server expects.
@@ -489,6 +479,37 @@ export class AuthService {
           }
         }),
       );
+  }
+
+  /**
+   * Keeps the waiting answer across a reload, in a readable cookie.
+   *
+   * The waiting screen has to survive a refresh, and neither a signal nor the URL does
+   * that. Not a credential and not a secret: it is the server's own answer about an
+   * account the caller has already proved they own, it grants nothing, and it is
+   * dropped the moment a sign-in succeeds.
+   */
+  private rememberPending(pending: PendingApprovalDto): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    try {
+      document.cookie = `ika_pending=${btoa(
+        JSON.stringify(pending),
+      )}; path=/; samesite=lax; max-age=86400`;
+    } catch {
+      // Losing it costs a screen with no name on it after a reload, and nothing more.
+    }
+  }
+
+  /** Drops the waiting answer, now that there is a session to show instead. */
+  private forgetPending(): void {
+    if (!this.isBrowser) {
+      return;
+    }
+
+    document.cookie = `ika_pending=; path=/; max-age=0; samesite=lax`;
   }
 
   private readonly pendingFromCookie = (): PendingApprovalDto | null => {
@@ -536,96 +557,6 @@ export class AuthService {
    */
   readonly lastPending = this.pendingState.asReadonly();
 
-  /** Local store for access requests made in this browser. */
-  private static readonly PENDING_REQUEST_KEY = 'ika_pending_request';
-
-  /** Remembers an access request made here, so a later sign-in can explain a refusal.
-   *
-   * The backend answers a correct sign-in for an unapproved account exactly as it
-   * answers a wrong password, so without this memory there is no telling the two
-   * apart. What is stored is only what the person typed moments ago on this same
-   * browser — never anything the server confirmed — which bounds what it can say.
-   */
-  private rememberAccessRequest(name: string, email: string, role: Role): void {
-    if (!this.isBrowser) {
-      return;
-    }
-
-    try {
-      localStorage.setItem(
-        AuthService.PENDING_REQUEST_KEY,
-        JSON.stringify({ name: name.trim(), email: email.trim().toLowerCase(), role }),
-      );
-    } catch {
-      // Remembering is a courtesy. A browser that refuses storage still gets the
-      // generic refusal rather than a second failure about remembering.
-    }
-  }
-
-  /** The access request remembered for this address, if it was made here. */
-  pendingRequestFor(email: string): { name: string; role: Role } | null {
-    if (!this.isBrowser) {
-      return null;
-    }
-
-    try {
-      const raw = localStorage.getItem(AuthService.PENDING_REQUEST_KEY);
-
-      if (!raw) {
-        return null;
-      }
-
-      const stored = JSON.parse(raw) as { name?: unknown; email?: unknown; role?: unknown };
-
-      if (typeof stored.email !== 'string' || stored.email !== email.trim().toLowerCase()) {
-        return null;
-      }
-
-      return {
-        name: typeof stored.name === 'string' ? stored.name : '',
-        role: stored.role === 'admin' ? 'admin' : 'employee',
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  /** Forgets the remembered request, once its account signs in. */
-  private forgetAccessRequest(email: string): void {
-    if (!this.isBrowser) {
-      return;
-    }
-
-    try {
-      const raw = localStorage.getItem(AuthService.PENDING_REQUEST_KEY);
-
-      if (raw) {
-        const stored = JSON.parse(raw) as { email?: unknown };
-
-        if (stored.email === email.trim().toLowerCase()) {
-          localStorage.removeItem(AuthService.PENDING_REQUEST_KEY);
-        }
-      }
-    } catch {
-      // Best effort, as above.
-    }
-  }
-
-  /**
-   * Shows the waiting screen for a request remembered from this browser.
-   *
-   * For a backend that distinguishes "right password, not approved" with its own
-   * answer, this never runs — that answer carries the person's verified details.
-   * Here the details are what was typed at registration, which is all there is.
-   */
-  notePendingAccess(name: string, role: Role | null): void {
-    const dto: PendingApprovalDto = { status: 'pending', name, requested_role: role };
-    this.pendingState.set(dto);
-
-    if (this.isBrowser) {
-      document.cookie = `ika_pending=${btoa(JSON.stringify(dto))}; path=/; samesite=lax; max-age=86400`;
-    }
-  }
   previewInvite(token: string): Observable<InvitePreviewDto> {
     return this.http.get<InvitePreviewDto>(
       `${this.baseUrl}/api/auth/invite/${encodeURIComponent(token)}`,
@@ -675,12 +606,14 @@ export class AuthService {
   ): Observable<AccessRequestSubmittedDto> {
     const body: AccessRequestDto = { name: name.trim(), email: email.trim(), role, password };
 
+    // Nothing is remembered here. An earlier version wrote the request to
+    // `localStorage` so that a later sign-in could be recognised as "still waiting"
+    // from a generic refusal; the backend answers that case properly now, so the only
+    // thing the memory bought was a way to show the wrong screen on the wrong device.
     return this.http.post<AccessRequestSubmittedDto>(
       `${this.baseUrl}/api/auth/request-access`,
       body,
       this.credentials(),
-    ).pipe(
-      tap(() => this.rememberAccessRequest(name, email, role)),
     );
   }
 

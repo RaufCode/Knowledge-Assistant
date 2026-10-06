@@ -1211,9 +1211,105 @@ class AccessRequestTest(AuthTestCase):
             "/api/auth/login", json={"email": f"newcomer@{COMPANY}", "password": PASSWORD}
         )
 
-        # No user row exists until approval, so this answers like a wrong password.
-        self.assertEqual(response.status_code, 401)
+        # The password was right, so the answer is "waiting", not a refusal. This used
+        # to be a 401 with the wrong-password wording, which told somebody their
+        # password did not match when it matched perfectly.
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()["status"], "pending")
+
+        # Still no session, and still no account: a request remains a request. Only the
+        # answer changed, not what it grants.
         self.assertIsNone(self.stored_user(f"newcomer@{COMPANY}"))
+        self.assertNotIn(ACCESS_COOKIE, self.new_client().cookies)
+
+    def test_a_pending_request_is_not_a_way_to_enumerate_accounts(self) -> None:
+        """The waiting answer is only sent once the password has verified.
+
+        This is the whole reason it is safe to distinguish "waiting" from "refused" at
+        all: an attacker who does not have the password still cannot tell whether an
+        address has asked to join, because they get the identical generic refusal a
+        never-seen address gets.
+        """
+        self.asks_for(self.new_client())
+
+        pending_wrong_password = self.new_client().post(
+            "/api/auth/login", json={"email": f"newcomer@{COMPANY}", "password": "wrong-one-1!"}
+        )
+        never_registered = self.new_client().post(
+            "/api/auth/login", json={"email": f"stranger@{COMPANY}", "password": "wrong-one-1!"}
+        )
+
+        # Byte-for-byte the same answer, so the two cannot be told apart from outside.
+        self.assertEqual(pending_wrong_password.status_code, 401)
+        self.assertEqual(pending_wrong_password.json(), never_registered.json())
+        self.assertEqual(
+            pending_wrong_password.json()["detail"],
+            "That email and password do not match an account.",
+        )
+
+    def test_the_waiting_answer_names_no_role_nobody_granted(self) -> None:
+        """A request nobody has decided cannot report what it will be given.
+
+        The role is chosen on approval and nowhere else, so naming one here would be a
+        claim about a decision that has not happened.
+        """
+        self.asks_for(self.new_client())
+
+        response = self.new_client().post(
+            "/api/auth/login", json={"email": f"newcomer@{COMPANY}", "password": PASSWORD}
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertIsNone(response.json()["requested_role"])
+        # The name is safe to echo: the caller just proved the account is theirs.
+        self.assertEqual(response.json()["name"], "Kofi Mensah")
+
+    def test_a_deactivated_account_is_waiting_rather_than_refused(self) -> None:
+        """An administrator switching an account off must not read as a bad password.
+
+        Distinct from a pending request: the row and the password both exist, so the
+        correct password can be verified and there is nothing to be vague about.
+        """
+        self.invite_and_accept(self.new_client(), f"ama@{COMPANY}")
+        admin = self.signed_in_admin()
+        user_id = self.stored_user(f"ama@{COMPANY}").id
+
+        deactivated = admin.patch(
+            f"/api/auth/users/{user_id}",
+            json={"is_active": False},
+            headers=self.csrf_headers(admin),
+        )
+        self.assertEqual(deactivated.status_code, 200, deactivated.text)
+
+        response = self.new_client().post(
+            "/api/auth/login", json={"email": f"ama@{COMPANY}", "password": PASSWORD}
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()["requested_role"], "employee")
+        self.assertNotIn(ACCESS_COOKIE, self.new_client().cookies)
+
+    def test_a_pending_invitation_still_gets_the_generic_refusal(self) -> None:
+        """An invitation nobody has accepted has no password to have got right.
+
+        So there is nothing to verify, and nothing may be said: this is the one
+        not-switched-on case that has to keep answering like a wrong password.
+        """
+        self.signed_in_admin()
+        self.new_client().post(
+            "/api/auth/invite",
+            json={"name": "Ama Konadu", "email": f"ama@{COMPANY}", "role": "employee"},
+            headers=self.csrf_headers(self.new_client()),
+        )
+
+        response = self.new_client().post(
+            "/api/auth/login", json={"email": f"ama@{COMPANY}", "password": PASSWORD}
+        )
+
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertEqual(
+            response.json()["detail"], "That email and password do not match an account."
+        )
 
     def test_a_weak_password_is_refused(self) -> None:
         response = self.asks_for(self.new_client(), password="abc")
