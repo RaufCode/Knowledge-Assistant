@@ -51,7 +51,9 @@ CLIENT_A = "1111-aaaa-1111-aaaa-1111"
 class StubAssistant:
     """Answers without a model, streaming the answer in two pieces."""
 
-    def ask_stream(self, question: str) -> Iterator[dict]:
+    def ask_stream(
+        self, question: str, history: list[tuple[str, str]] | None = None
+    ) -> Iterator[dict]:
         yield {"type": "status", "stage": "writing"}
         yield {"type": "delta", "text": "Answer "}
         yield {"type": "delta", "text": f"to {question}"}
@@ -228,7 +230,7 @@ class OneConversationPerThreadTest(ConversationTestCase):
         conversation_id = self.new_conversation()
 
         class BrokenAssistant(StubAssistant):
-            def ask_stream(self, question):
+            def ask_stream(self, question, history=()):
                 yield {"type": "delta", "text": "Half an ans"}
                 raise RuntimeError("connection dropped")
 
@@ -681,6 +683,85 @@ class StreamedAnswerTest(ConversationTestCase):
         response = self.ask(conversation_id, "How much leave?")
 
         self.assertEqual(read_events(response.text)[0], {"type": "status", "stage": "writing"})
+
+
+class RecentTurnsTest(ConversationTestCase):
+    """The window of the conversation handed to the assistant on each turn.
+
+    It is what lets a follow-up be recognised as one, so what it contains is part
+    of the HTTP contract rather than an implementation detail.
+    """
+
+    class HistoryRecordingAssistant(StubAssistant):
+        def __init__(self) -> None:
+            self.seen: list = []
+
+        def ask_stream(self, question: str, history=None):
+            self.seen.append(list(history or []))
+            yield from StubAssistant.ask_stream(self, question, history)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.recorder = self.HistoryRecordingAssistant()
+        main.state["assistant"] = self.recorder
+
+    def test_a_first_question_is_answered_with_nothing_before_it(self):
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "How much leave do I get?")
+
+        self.assertEqual(self.recorder.seen[-1], [])
+
+    def test_the_previous_turn_is_handed_over(self):
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "How much leave do I get?")
+        self.ask(conversation_id, "and can I carry it over?")
+
+        # The question is not in the window: it is the one being answered, and
+        # asking the assistant to classify a message against a history that
+        # already contains it would be asking whether it is a follow-up of itself.
+        self.assertEqual(
+            self.recorder.seen[-1],
+            [
+                ("user", "How much leave do I get?"),
+                ("assistant", "Answer to How much leave do I get?"),
+            ],
+        )
+
+    def test_the_window_is_bounded_and_oldest_first(self):
+        conversation_id = self.new_conversation()
+
+        for index in range(6):
+            self.ask(conversation_id, f"Question {index}?")
+
+        window = self.recorder.seen[-1]
+
+        self.assertLessEqual(len(window), 4)
+        # Oldest first, so the model reads it as a conversation rather than
+        # backwards, and the newest turn in it is the one before this question.
+        self.assertEqual(window[-1], ("assistant", "Answer to Question 4?"))
+        self.assertEqual(window[0][0], "user")
+
+    def test_another_conversations_messages_are_not_in_the_window(self):
+        first = self.new_conversation()
+        second = self.new_conversation()
+
+        self.ask(first, "A question in the first?")
+        self.ask(second, "A question in the second?")
+        self.ask(second, "A follow-up in the second?")
+
+        # Two threads open in the sidebar must not bleed into each other. Without
+        # the conversation filter, "A follow-up in the second?" would be handed a
+        # window containing the first conversation's question and could be read as
+        # a follow-up to it.
+        self.assertEqual(
+            [text for _, text in self.recorder.seen[-1]],
+            [
+                "A question in the second?",
+                "Answer to A question in the second?",
+            ],
+        )
 
 
 if __name__ == "__main__":

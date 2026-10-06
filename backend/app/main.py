@@ -9,7 +9,6 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -25,6 +24,7 @@ from app.database import (
     get_owned_conversation,
     init_db,
     list_owned_conversations,
+    recent_turns,
     touch,
 )
 from app.dependencies import get_current_user, get_db, open_db, require_csrf
@@ -322,15 +322,18 @@ def send_message(
     per piece of answer text, then a `done` carrying the finished answer and its
     citations. After the very first exchange the stream also ends with a `title`
     event naming the conversation, and that title replaces the placeholder.
+
+    The recent turns are read and handed to the assistant, which is what lets
+    "anything else I should know?" be answered as a continuation of the question
+    before it. They are read before the new question is recorded, so the window
+    holds the conversation as it stood rather than including the message being
+    answered.
     """
     conversation = owned_conversation_or_404(db, conversation_id, user.id)
 
-    was_empty = (
-        db.scalar(
-            select(Message).where(Message.conversation_id == conversation.id).limit(1)
-        )
-        is None
-    )
+    history = recent_turns(db, conversation.id)
+
+    was_empty = not history
 
     db.add(
         Message(
@@ -349,7 +352,7 @@ def send_message(
 
     def events() -> Iterator[str]:
         try:
-            for event in state["assistant"].ask_stream(req.content):
+            for event in state["assistant"].ask_stream(req.content, history):
                 if event["type"] == "done":
                     db.add(
                         Message(
@@ -361,6 +364,10 @@ def send_message(
                             # Recorded so a reloaded conversation renders this turn the
                             # same way it did as it streamed.
                             status=event.get("status"),
+                            # And so the confidence it showed while streaming is still
+                            # there to show, rather than the card rendering without one
+                            # on every other visit.
+                            confidence=event.get("confidence"),
                         )
                     )
                     touch(db, conversation)
