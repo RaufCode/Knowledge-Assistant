@@ -95,12 +95,13 @@ class ParseClassificationTest(unittest.TestCase):
             with self.subTest(reply=reply):
                 self.assertIs(parse_classification(reply, "anything").category, expected)
 
-    def test_restricted_is_not_the_models_to_choose(self):
-        # The confidentiality guard's patterns decide it, and a classifier call must
-        # not be able to talk the guard out of a refusal.
-        self.assertNotIn(Category.RESTRICTED.value, MODEL_CATEGORIES)
-        self.assertIn(Category.CONVERSATIONAL.value, MODEL_CATEGORIES)
-        self.assertEqual(len(MODEL_CATEGORIES), 4)
+    def test_the_model_is_offered_the_guard_as_a_backstop(self):
+        # Name patterns are bypassed by rephrasing, so the model is offered
+        # RESTRICTED as well: the rules run first and cannot be talked out of, and
+        # the model decides the phrasings nobody thought of.
+        self.assertIn(Category.RESTRICTED.value, MODEL_CATEGORIES)
+        self.assertIn(Category.EXPANSION.value, MODEL_CATEGORIES)
+        self.assertEqual(len(MODEL_CATEGORIES), 6)
 
     def test_follow_up_keeps_the_rewritten_question(self):
         result = parse_classification(
@@ -313,14 +314,14 @@ class RoutingTest(unittest.TestCase):
         self.assertEqual(events[-1]["kind"], "answer")
         self.assertEqual(events[-1]["confidence"], CONFIDENCE_MAX)
 
-    def test_a_follow_up_retrieves_the_rewritten_question(self):
+    def test_a_topic_shifting_follow_up_retrieves_the_rewritten_question(self):
         asked: list[str] = []
         assistant = assistant_answering(
             [
                 classification_reply(
-                    "FOLLOW_UP", "What else does the Code of Conduct document cover?"
+                    "FOLLOW_UP", "What does the Code of Conduct say about contractors?"
                 ),
-                "Retaliation is prohibited.",
+                "Contractors are held to the same standard.",
             ]
         )
         assistant.retrieval = type(
@@ -328,7 +329,7 @@ class RoutingTest(unittest.TestCase):
             (),
             {
                 "retrieve": staticmethod(
-                    lambda q: asked.append(q) or [_candidate("Retaliation is prohibited.")]
+                    lambda q: asked.append(q) or [_candidate("Contractors are held to the same standard.")]
                 )
             },
         )()
@@ -337,18 +338,23 @@ class RoutingTest(unittest.TestCase):
             ("user", "What does the Code of Conduct say about behaviour?"),
             ("assistant", "Communicate respectfully, be accountable."),
         ]
-        events = list(assistant.ask_stream("anything else I should know?", history))
+        events = list(assistant.ask_stream("what about contractors?", history))
 
         # Retrieval got the standalone question, not the follow-up's wording.
-        self.assertEqual(asked, ["What else does the Code of Conduct document cover?"])
+        self.assertEqual(
+            asked, ["What does the Code of Conduct say about contractors?"]
+        )
         self.assertEqual(events[-1]["kind"], "answer")
         self.assertTrue(events[-1]["answered"])
         # And the generator was given the thread, so the answer continues it
         # rather than restating the previous turn. The question it answers is the
-        # rewritten one, which is the point: "anything else I should know?" names
-        # no document, and the previous question is what it was about.
+        # rewritten one, which is the point: "what about contractors?" names no
+        # document, and the previous question is what it was about.
         self.assertIn("What does the Code of Conduct say about behaviour?", assistant.asked[-1])
-        self.assertIn("Question: What else does the Code of Conduct document cover?", assistant.asked[-1])
+        self.assertIn(
+            "Question: What does the Code of Conduct say about contractors?",
+            assistant.asked[-1],
+        )
 
     def test_only_a_real_question_with_no_support_is_not_found(self):
         # One path may say the documents do not cover this, and it is the path that

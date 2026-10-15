@@ -36,7 +36,7 @@ from app import main
 from app.config import settings
 from app.database import Base, Conversation, Message, User
 from app.dependencies import ACCESS_COOKIE, CSRF_COOKIE
-from app.rag.engine import LEGACY_STATUS
+from app.rag.engine import LEGACY_STATUS, PreviousAnswer
 from app.rag.guard import Category, Classification
 from app.security import create_access_token, hash_password, new_csrf_token
 
@@ -44,6 +44,7 @@ SOURCE = {
     "document": "Leave Policy",
     "section": "Annual Leave",
     "snippet": "Full-time employees are entitled to 21 days.",
+    "chunk_id": "0f1e2d3c4b5a6978",
     "score": 0.823,
 }
 
@@ -59,7 +60,12 @@ class StubAssistant:
     category script their own.
     """
 
-    def classify(self, question: str, history=None) -> Classification:
+    def classify(
+        self,
+        question: str,
+        history: list[tuple[str, str]] | None = None,
+        previous: "PreviousAnswer | None" = None,
+    ) -> Classification:
         return Classification(Category.COMPANY_QUESTION, question)
 
     def ask_stream(
@@ -67,6 +73,7 @@ class StubAssistant:
         question: str,
         history: list[tuple[str, str]] | None = None,
         classification: Classification | None = None,
+        previous: "PreviousAnswer | None" = None,
     ) -> Iterator[dict]:
         yield {"type": "status", "stage": "writing"}
         yield {"type": "delta", "text": "Answer "}
@@ -252,7 +259,7 @@ class OneConversationPerThreadTest(ConversationTestCase):
         conversation_id = self.new_conversation()
 
         class BrokenAssistant(StubAssistant):
-            def ask_stream(self, question, history=(), classification=None):
+            def ask_stream(self, question, history=(), classification=None, previous=None):
                 yield {"type": "delta", "text": "Half an ans"}
                 raise RuntimeError("connection dropped")
 
@@ -536,7 +543,7 @@ class KindPersistenceTest(ConversationTestCase):
 
     def answering(self, kind: str, answer: str) -> StubAssistant:
         class KindlyAssistant(StubAssistant):
-            def ask_stream(self, question, history=None, classification=None):
+            def ask_stream(self, question, history=None, classification=None, previous=None):
                 yield {"type": "status", "stage": "writing"}
                 yield {"type": "delta", "text": answer}
                 yield {
@@ -584,12 +591,94 @@ class KindPersistenceTest(ConversationTestCase):
                 self.assertEqual(assistant_message["status"], LEGACY_STATUS[kind])
 
 
+class ContinuingAnAnswerTest(ConversationTestCase):
+    """What "anything else?" needs from the conversation's own record.
+
+    The continuation is anchored to the passages the last answer cited, with the
+    ones it already showed held back — so the route has to hand the assistant two
+    things it cannot work out for itself: what the last turn was, and which chunks
+    this thread has already put in front of the reader. Both come out of storage,
+    which is what makes the same continuation happen after a reload.
+    """
+
+    def echoing_assistant(self) -> list[PreviousAnswer | None]:
+        """An assistant that records the previous answer it was handed."""
+        seen: list[PreviousAnswer | None] = []
+
+        class PreviousRecordingAssistant(StubAssistant):
+            def ask_stream(self, question, history=None, classification=None, previous=None):
+                seen.append(previous)
+                yield from StubAssistant.ask_stream(
+                    self, question, history, classification, previous
+                )
+
+        main.state["assistant"] = PreviousRecordingAssistant()
+
+        return seen
+
+    def test_the_first_message_has_nothing_to_continue(self):
+        seen = self.echoing_assistant()
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "How much annual leave do I get?")
+
+        self.assertIsNone(seen[-1])
+
+    def test_the_next_message_carries_the_answer_and_what_it_already_showed(self):
+        seen = self.echoing_assistant()
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "How much annual leave do I get?")
+        self.ask(conversation_id, "anything else?")
+
+        previous = seen[-1]
+
+        self.assertIsNotNone(previous)
+        self.assertEqual(previous.kind, "answer")
+        self.assertEqual(previous.question, "How much annual leave do I get?")
+        self.assertEqual(previous.answer, "Answer to How much annual leave do I get?")
+        self.assertEqual(
+            [source["document"] for source in previous.sources], [SOURCE["document"]]
+        )
+        # And the chunk ids, which is what keeps the continuation from re-quoting
+        # the passage the first answer already showed.
+        self.assertEqual(previous.cited, frozenset({SOURCE["chunk_id"]}))
+
+    def test_every_chunk_this_thread_shown_is_held_back_not_only_the_last_answer(self):
+        seen = self.echoing_assistant()
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "How much annual leave do I get?")
+        self.ask(conversation_id, "anything else?")
+        self.ask(conversation_id, "anything else?")
+
+        # Three answers have quoted the same passage by now; the reader has read it
+        # once, and it must not come round again.
+        self.assertEqual(seen[-1].cited, frozenset({SOURCE["chunk_id"]}))
+
+    def test_a_citation_carries_a_chunk_id_that_survives_the_reload(self):
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "How much annual leave do I get?")
+
+        detail = self.client.get(
+            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_A}
+        ).json()
+        answer = detail["messages"][-1]
+
+        # Stored with the message, so the continuation can be anchored after the
+        # reader has closed the tab rather than only while it is open.
+        self.assertEqual(answer["sources"][0]["chunk_id"], SOURCE["chunk_id"])
+        stored = self.messages_in_db(conversation_id)[-1]
+        self.assertEqual(stored.sources[0]["chunk_id"], SOURCE["chunk_id"])
+
+
 class TitleGenerationTest(ConversationTestCase):
     def test_a_greeting_does_not_name_the_conversation(self):
         # Naming a thread "Hey" is how the sidebar fills with conversations that
         # have no subject in them. The title waits for the first real question.
         class GreetingFirstAssistant(StubAssistant):
-            def classify(self, question: str, history=None) -> Classification:
+            def classify(self, question, history=None, previous=None) -> Classification:
                 category = (
                     Category.CONVERSATIONAL
                     if question.strip().lower() in {"hey", "hi", "there is no question"}
@@ -632,7 +721,7 @@ class TitleGenerationTest(ConversationTestCase):
         # an in-scope question with no coverage is still the subject of the
         # conversation, and leaving it "New conversation" would hide that.
         class NotFoundAssistant(StubAssistant):
-            def ask_stream(self, question, history=None, classification=None):
+            def ask_stream(self, question, history=None, classification=None, previous=None):
                 yield {"type": "status", "stage": "writing"}
                 yield {"type": "delta", "text": "I couldn't find that."}
                 yield {
@@ -838,10 +927,14 @@ class RecentTurnsTest(ConversationTestCase):
     class HistoryRecordingAssistant(StubAssistant):
         def __init__(self) -> None:
             self.seen: list = []
+            self.previous: list = []
 
-        def ask_stream(self, question: str, history=None, classification=None):
+        def ask_stream(self, question, history=None, classification=None, previous=None):
             self.seen.append(list(history or []))
-            yield from StubAssistant.ask_stream(self, question, history, classification)
+            self.previous.append(previous)
+            yield from StubAssistant.ask_stream(
+                self, question, history, classification, previous
+            )
 
     def setUp(self) -> None:
         super().setUp()
