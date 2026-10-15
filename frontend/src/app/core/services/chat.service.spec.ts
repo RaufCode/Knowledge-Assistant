@@ -58,8 +58,18 @@ describe('ChatService', () => {
   let pushEvent: (event: ChatStreamEventDto) => void = () => undefined;
   let closeStream: () => void = () => undefined;
 
-  /** The URL the list is fetched from, which names the client. */
-  const listUrl = (): string => `${API_BASE_URL}/api/conversations`;
+  /**
+   * The URL the list is fetched from, which names the client.
+   *
+   * Read from the service rather than written out, because the id is minted per
+   * test and the request that fetches the list carries it: a URL without it is not
+   * a URL this app makes, so expecting one matches no request at all.
+   */
+  const listUrl = (): string => `${API_BASE_URL}/api/conversations?client_id=${clientId}`;
+
+  /** The URL one conversation's thread is fetched from. */
+  const threadUrl = (id: string): string =>
+    `${API_BASE_URL}/api/conversations/${id}?client_id=${clientId}`;
 
   /** The list a restored browser has, reused where a refresh is served. */
   const RESTORED_LIST: ConversationListPayload = {
@@ -135,7 +145,7 @@ describe('ChatService', () => {
   const givenRestoredConversations = (): void => {
     http.expectOne(listUrl()).flush(RESTORED_LIST);
 
-    http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+    http.expectOne(threadUrl('conv-1')).flush({
       id: 'conv-1',
       title: 'Annual leave',
       messages: [
@@ -178,19 +188,26 @@ describe('ChatService', () => {
     });
   };
 
-  /** Pushes a finished answer and closes the stream. */
+  /**
+   * Pushes a finished answer and closes the stream.
+   *
+   * `kind` is what the backend settled on and what the thread draws from; the
+   * legacy `status` and `answered` ride along so a client that has not been
+   * redeployed still has both to fall back on.
+   */
   const streamAnswer = async (
     answer: string,
     answered = true,
     sources: unknown[] = [],
-    status = answered ? 'answered' : 'not-found',
+    kind = answered ? 'answer' : 'not_found',
     confidence: number | null = null,
   ): Promise<void> => {
     pushEvent({
       type: 'done',
       answer,
       answered,
-      status,
+      kind,
+      status: kind === 'not_found' ? 'not-found' : kind === 'answer' ? 'answered' : kind,
       confidence,
       sources: sources as never,
     });
@@ -259,7 +276,7 @@ describe('ChatService', () => {
         'assistant',
       ]);
       expect(messages().at(-2)?.text).toBe('Can I carry it over?');
-      expect(messages().at(-1)?.status).toBe('pending');
+      expect(messages().at(-1)?.kind).toBe('pending');
       expect(chat.isLoading()).toBe(true);
 
       // The list is re-read once the answer lands, so the completed stream here is
@@ -375,7 +392,7 @@ describe('ChatService', () => {
       const answer = messages().at(-1);
 
       expect(answer?.text).toBe('Yes, up to five days.');
-      expect(answer?.status).toBe('answered');
+      expect(answer?.kind).toBe('answer');
       // Citations arrive with the finished answer, never before it, so the
       // citation block is never shown beside a half-written answer.
       expect(answer?.sources).toEqual([SOURCE]);
@@ -393,7 +410,7 @@ describe('ChatService', () => {
 
       // "Not in the documents" is a confident statement about the corpus, and there
       // is nothing to retry about it.
-      expect(messages().at(-1)?.status).toBe('not-found');
+      expect(messages().at(-1)?.kind).toBe('not_found');
       expect(chat.isLoading()).toBe(false);
     });
 
@@ -408,7 +425,7 @@ describe('ChatService', () => {
       // A connection dropped part way through has produced no answer at all.
       // Reporting that as "not found in the documents" would blame the corpus for
       // a dropped connection, and there would be nothing left to retry.
-      expect(messages().at(-1)?.status).toBe('failed');
+      expect(messages().at(-1)?.kind).toBe('failed');
       expect(messages().at(-1)?.text).toContain('interrupted');
       expect(chat.isLoading()).toBe(false);
     });
@@ -426,7 +443,7 @@ describe('ChatService', () => {
 
       // The backend cannot answer with a status once the stream has opened, so the
       // failure travels as an event and reads the same way on screen.
-      expect(messages().at(-1)?.status).toBe('failed');
+      expect(messages().at(-1)?.kind).toBe('failed');
       expect(messages().at(-1)?.text).toBe(
         'The assistant is temporarily unavailable. Please try again.',
       );
@@ -436,7 +453,7 @@ describe('ChatService', () => {
       http.expectOne(listUrl()).flush({
         conversations: [{ id: 'conv-1', title: null, updated_at: '2026-09-30T09:00:00' }],
       });
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+      http.expectOne(threadUrl('conv-1')).flush({
         id: 'conv-1',
         title: null,
         messages: [],
@@ -447,6 +464,7 @@ describe('ChatService', () => {
         type: 'done',
         answer: 'Twenty days.',
         answered: true,
+        kind: 'answer',
         status: 'answered',
         confidence: null,
         sources: [],
@@ -518,7 +536,7 @@ describe('ChatService', () => {
         'assistant',
       ]);
       expect(messages().at(-2)?.text).toBe('Can I carry it over?');
-      expect(messages().at(-1)?.status).toBe('pending');
+      expect(messages().at(-1)?.kind).toBe('pending');
       expect(streamRequests.map((request) => request.body.content)).toEqual([
         'Can I carry it over?',
         'Can I carry it over?',
@@ -564,7 +582,7 @@ describe('ChatService', () => {
       http.expectOne(listUrl()).flush({
         conversations: [{ id: 'conv-1', title: 'Leave', updated_at: '2026-09-30T09:00:00' }],
       });
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+      http.expectOne(threadUrl('conv-1')).flush({
         id: 'conv-1',
         title: 'Leave',
         messages: [
@@ -637,7 +655,7 @@ describe('ChatService', () => {
       givenRestoredConversations();
 
       chat.openConversation('conv-1');
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+      http.expectOne(threadUrl('conv-1')).flush({
         id: 'conv-1',
         title: 'Leave',
         messages: [
@@ -646,6 +664,7 @@ describe('ChatService', () => {
             role: 'assistant',
             content: 'Twenty days.',
             sources: [{ document: 'Leave Policy', section: 'S', snippet: 'x', score: 0.5 }],
+            kind: 'answer',
             status: 'answered',
             confidence: 5,
             created_at: '2026-09-30T09:00:01',
@@ -714,7 +733,7 @@ describe('ChatService', () => {
 
       conversations.openConversation('conv-2');
       http
-        .expectOne(`${API_BASE_URL}/api/conversations/conv-2`)
+        .expectOne(threadUrl('conv-2'))
         .flush({
           id: 'conv-2',
           title: 'VPN setup',
@@ -751,7 +770,7 @@ describe('ChatService', () => {
       chat.openConversation('conv-2');
 
       const request = http.expectOne(
-        `${API_BASE_URL}/api/conversations/conv-2`,
+        threadUrl('conv-2'),
       );
 
       expect(request.request.method).toBe('GET');
@@ -787,7 +806,7 @@ describe('ChatService', () => {
       // conversation and would read as the refresh having lost the thread.
       chat.openConversation('conv-2');
 
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-2`).flush({
+      http.expectOne(threadUrl('conv-2')).flush({
         id: 'conv-2',
         title: 'Expenses',
         messages: [
@@ -826,12 +845,12 @@ describe('ChatService', () => {
       givenRestoredConversations();
 
       chat.openConversation('conv-2');
-      const slow = http.expectOne(`${API_BASE_URL}/api/conversations/conv-2`);
+      const slow = http.expectOne(threadUrl('conv-2'));
 
       // Switched again before the thread arrived, so this one now belongs to a
       // conversation the user has already left.
       chat.openConversation('conv-1');
-      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1`).flush({
+      http.expectOne(threadUrl('conv-1')).flush({
         id: 'conv-1',
         title: 'Annual leave',
         messages: [

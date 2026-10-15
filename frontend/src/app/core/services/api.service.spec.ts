@@ -93,35 +93,63 @@ describe('ApiService', () => {
       ]);
     });
 
-    it('reads each stored outcome back as itself', async () => {
+    it('reads each stored kind back as itself', async () => {
       let thread: ConversationThread | undefined;
 
       api.getConversation('conv-1', CLIENT).subscribe((value) => (thread = value));
 
-      // Four replies that all cite nothing. Only the recorded outcome tells a
-      // greeting from a refusal from a genuine gap, so a thread reopened tomorrow
-      // draws the same cards it did while it was being answered.
+      // Four replies that all cite nothing. Only the recorded kind tells a
+      // conversational reply from a refusal from a genuine gap, so a thread
+      // reopened tomorrow draws the same thing it did while it was being answered.
       http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`).flush({
         id: 'conv-1',
         title: null,
         messages: [
-          { id: 'm1', role: 'user', content: 'Hello', sources: null, status: null, confidence: null, created_at: '2026-09-30T09:00:00' },
-          { id: 'm2', role: 'assistant', content: "Hello! I'm the assistant.", sources: null, status: 'greeting', confidence: null, created_at: '2026-09-30T09:00:01' },
-          { id: 'm3', role: 'assistant', content: 'Confidential.', sources: null, status: 'restricted', confidence: null, created_at: '2026-09-30T09:00:02' },
-          { id: 'm4', role: 'assistant', content: "I couldn't find that.", sources: null, status: 'not-found', confidence: null, created_at: '2026-09-30T09:00:03' },
-          { id: 'm5', role: 'assistant', content: "That isn't something I cover.", sources: null, status: 'out-of-scope', confidence: null, created_at: '2026-09-30T09:00:04' },
+          { id: 'm1', role: 'user', content: 'Hey', sources: null, kind: null, status: null, confidence: null, created_at: '2026-09-30T09:00:00' },
+          { id: 'm2', role: 'assistant', content: "Hello! Ask me anything.", sources: null, kind: 'conversational', status: 'greeting', confidence: null, created_at: '2026-09-30T09:00:01' },
+          { id: 'm3', role: 'assistant', content: 'Confidential.', sources: null, kind: 'restricted', status: 'restricted', confidence: null, created_at: '2026-09-30T09:00:02' },
+          { id: 'm4', role: 'assistant', content: "I couldn't find that.", sources: null, kind: 'not_found', status: 'not-found', confidence: null, created_at: '2026-09-30T09:00:03' },
+          { id: 'm5', role: 'assistant', content: "That isn't something I cover.", sources: null, kind: 'out_of_scope', status: 'out-of-scope', confidence: null, created_at: '2026-09-30T09:00:04' },
+          { id: 'm6', role: 'assistant', content: 'Full-time staff get 25 days.', sources: [SOURCE], kind: 'answer', status: 'answered', confidence: 8, created_at: '2026-09-30T09:00:05' },
         ],
       });
 
-      // The out-of-scope one is here because it is the case most easily lost: it
-      // cites nothing, like the other three, and reading it as "not-found" claims
-      // a gap in the documents on a question that never was one.
-      expect(thread?.messages.map((message) => message.status)).toEqual([
-        'answered',
-        'greeting',
+      // The conversational and out-of-scope ones are here because they are the cases
+      // most easily lost: each cites nothing, like the other three, and reading
+      // either as "not_found" claims a gap in the documents on a message that never
+      // asked about the documents at all.
+      expect(thread?.messages.map((message) => message.kind)).toEqual([
+        'answer',
+        'conversational',
         'restricted',
-        'not-found',
-        'out-of-scope',
+        'not_found',
+        'out_of_scope',
+        'answer',
+      ]);
+    });
+
+    it('reads a row stored before the kind existed through its legacy status', async () => {
+      let thread: ConversationThread | undefined;
+
+      api.getConversation('conv-1', CLIENT).subscribe((value) => (thread = value));
+
+      // Rows written before `kind` was added still carry only the older vocabulary.
+      // Reading them as anything else would redraw a greeting as a gap in the
+      // corpus, which is the mislabelling the kind exists to stop.
+      http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`).flush({
+        id: 'conv-1',
+        title: null,
+        messages: [
+          { id: 'm1', role: 'assistant', content: "Hello! I'm the assistant.", sources: null, status: 'greeting', created_at: '2026-09-30T09:00:00' },
+          { id: 'm2', role: 'assistant', content: "That isn't something I cover.", sources: null, status: 'out-of-scope', created_at: '2026-09-30T09:00:01' },
+          { id: 'm3', role: 'assistant', content: 'Twenty days.', sources: [SOURCE], status: 'answered', created_at: '2026-09-30T09:00:02' },
+        ],
+      });
+
+      expect(thread?.messages.map((message) => message.kind)).toEqual([
+        'conversational',
+        'out_of_scope',
+        'answer',
       ]);
     });
 
@@ -139,6 +167,7 @@ describe('ApiService', () => {
             role: 'assistant',
             content: 'Twenty days.',
             sources: [SOURCE],
+            kind: 'answer',
             status: 'answered',
             confidence: 8,
             created_at: '2026-09-30T09:00:00',
@@ -154,10 +183,10 @@ describe('ApiService', () => {
 
       api.getConversation('conv-1', CLIENT).subscribe((value) => (thread = value));
 
-      // No status on the row. The citations are all the evidence there is, so an
-      // ungrounded answer falls back to the not-found card and a grounded one to the
-      // answer card. These threads are old, and this is the best that can be said
-      // about them.
+      // Neither a kind nor a status on the row. The citations are all the evidence
+      // there is, so an ungrounded answer falls back to the not-found card and a
+      // grounded one to the answer card. These threads are older still, and this is
+      // the best that can be said about them.
       http.expectOne(`${API_BASE_URL}/api/conversations/conv-1?client_id=${CLIENT}`).flush({
         id: 'conv-1',
         title: null,
@@ -167,7 +196,7 @@ describe('ApiService', () => {
         ],
       });
 
-      expect(thread?.messages.map((message) => message.status)).toEqual(['answered', 'not-found']);
+      expect(thread?.messages.map((message) => message.kind)).toEqual(['answer', 'not_found']);
     });
 
     it('escapes both the conversation id and the client id', () => {
@@ -261,8 +290,8 @@ describe('ApiService', () => {
 
       // A message that came from the backend has been written down. Pending and
       // failed belong to an answer being streamed in this browser.
-      expect(question?.status).toBe('answered');
-      expect(answer?.status).toBe('answered');
+      expect(question?.kind).toBe('answer');
+      expect(answer?.kind).toBe('answer');
       // A question cites nothing, and null becomes an empty list so no consumer
       // has to check.
       expect(question?.sources).toEqual([]);
