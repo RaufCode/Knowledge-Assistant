@@ -29,6 +29,7 @@ from app.database import (
 )
 from app.dependencies import get_current_user, get_db, open_db, require_csrf
 from app.rag.engine import Assistant, LlmUnavailable
+from app.rag.guard import Category
 from app.rag.ingest import build_index
 from app.rate_limit import limiter, rate_limit_exceeded_handler
 from app.schemas_auth import check_password_policy
@@ -319,9 +320,9 @@ def send_message(
     abandoned halfway records the question but no half-answer.
 
     The events are a `status` saying the answer is being written, one `delta`
-    per piece of answer text, then a `done` carrying the finished answer and its
-    citations. After the very first exchange the stream also ends with a `title`
-    event naming the conversation, and that title replaces the placeholder.
+    per piece of answer text, then a `done` carrying the finished answer, the
+    `kind` of reply it is and its citations. After the first exchange that
+    names the conversation, the stream also ends with a `title` event.
 
     The recent turns are read and handed to the assistant, which is what lets
     "anything else I should know?" be answered as a continuation of the question
@@ -332,8 +333,6 @@ def send_message(
     conversation = owned_conversation_or_404(db, conversation_id, user.id)
 
     history = recent_turns(db, conversation.id)
-
-    was_empty = not history
 
     db.add(
         Message(
@@ -346,13 +345,31 @@ def send_message(
     )
     db.commit()
 
-    # Naming the conversation is a second model call, so it runs beside the answer
-    # rather than in front of it. Only the first exchange has one to do.
-    title_job = TitleJob(conversation.id, req.content).start() if was_empty else None
-
     def events() -> Iterator[str]:
         try:
-            for event in state["assistant"].ask_stream(req.content, history):
+            # Classified here rather than inside `ask_stream` so that the same
+            # decision decides both what is said and whether the conversation is
+            # named: naming it from "hey" is how the sidebar fills with
+            # conversations called "Hey". Passed back in rather than asked for a
+            # second time — it is one classification, with two consequences.
+            classification = state["assistant"].classify(req.content, history)
+
+            # Naming the conversation is a second model call, so it runs beside the
+            # answer rather than in front of it. Only an untitled conversation gets
+            # one, and only a real question is worth naming: until a question is
+            # asked the thread stays "New conversation", and the first one is what
+            # names it.
+            title_job = None
+
+            if conversation.title is None and classification.category in (
+                Category.COMPANY_QUESTION,
+                Category.FOLLOW_UP,
+            ):
+                title_job = TitleJob(conversation.id, classification.query).start()
+
+            for event in state["assistant"].ask_stream(
+                req.content, history, classification
+            ):
                 if event["type"] == "done":
                     db.add(
                         Message(
@@ -361,12 +378,17 @@ def send_message(
                             role="assistant",
                             content=event["answer"],
                             sources=event["sources"] or None,
-                            # Recorded so a reloaded conversation renders this turn the
-                            # same way it did as it streamed.
+                            # Which kind of reply this was, recorded so a reloaded
+                            # conversation renders this turn the same way it did as
+                            # it streamed. Every kind of reply cites nothing, so
+                            # without it a conversational turn and a gap in the
+                            # corpus are the same message.
+                            kind=event.get("kind"),
+                            # And the wording an older client expects.
                             status=event.get("status"),
-                            # And so the confidence it showed while streaming is still
-                            # there to show, rather than the card rendering without one
-                            # on every other visit.
+                            # And so the confidence it showed while streaming is
+                            # still there to show, rather than the card rendering
+                            # without one on every other visit.
                             confidence=event.get("confidence"),
                         )
                     )
@@ -408,7 +430,7 @@ TITLE_WAIT_SECONDS = 10
 
 
 class TitleJob:
-    """Names a brand new conversation on its own thread.
+    """Names a conversation that has something to be named after, on its own thread.
 
     Naming the conversation cannot be part of the request's own work: it is a
     second model call, and running it inline would either delay the answer the
@@ -417,9 +439,9 @@ class TitleJob:
     nothing, and the name is stored whether or not anyone is still listening.
     """
 
-    def __init__(self, conversation_id: str, first_message: str) -> None:
+    def __init__(self, conversation_id: str, first_question: str) -> None:
         self._conversation_id = conversation_id
-        self._first_message = first_message
+        self._first_question = first_question
         self._title: str | None = None
         self._finished = threading.Event()
         self._thread = threading.Thread(target=self._run, name="title", daemon=True)
@@ -436,7 +458,7 @@ class TitleJob:
 
     def _run(self) -> None:
         try:
-            title = state["assistant"].generate_title(self._first_message)
+            title = state["assistant"].generate_title(self._first_question)
             if title:
                 self._title = title
                 self._store(title)
