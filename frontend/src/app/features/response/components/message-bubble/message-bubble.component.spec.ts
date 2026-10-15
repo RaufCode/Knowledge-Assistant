@@ -10,7 +10,7 @@ function question(overrides: Partial<Message> = {}): Message {
     role: 'user',
     text: 'How much annual leave do I get?',
     createdAt: '2026-09-30T08:00:00Z',
-    status: 'answered',
+    kind: 'answer',
     sources: [],
     documentCount: 0,
     confidence: null,

@@ -14,7 +14,7 @@ function userMessage(id: string, text: string): Message {
     role: 'user',
     text,
     createdAt: '2026-09-30T08:00:00Z',
-    status: 'answered',
+    kind: 'answer',
     sources: [],
     documentCount: 0,
     confidence: null,
@@ -23,7 +23,7 @@ function userMessage(id: string, text: string): Message {
 
 /** An answer whose text can grow, as a streaming one does. */
 function answerMessage(id: string, text: string): Message {
-  return { ...userMessage(id, text), role: 'assistant', status: 'pending' };
+  return { ...userMessage(id, text), role: 'assistant', kind: 'pending' };
 }
 
 /**
@@ -233,14 +233,16 @@ describe('ChatThreadComponent', () => {
   });
   describe('drawing the four outcomes that cite nothing', () => {
     /**
-     * A refusal, a greeting and a gap all arrive with no citations, so they can only
-     * be told apart by the outcome the backend recorded. These assert each draws its
-     * own card rather than falling through to the ordinary answer one.
+     * A refusal, a conversational reply, an out-of-scope one and a gap in the
+     * corpus all arrive with no citations, so they can only be told apart by the kind
+     * the backend recorded. These assert each draws as itself rather than falling
+     * through to the not-found card, which is the only one of the five that is a
+     * claim about the documents.
      */
-    const draw = async (status: Message['status'], text: string): Promise<void> => {
+    const draw = async (kind: Message['kind'], text: string): Promise<void> => {
       messages.set([
         userMessage('1-user', 'A question'),
-        { ...answerMessage('1-assistant', text), status },
+        { ...answerMessage('1-assistant', text), kind },
       ]);
       await render();
     };
@@ -257,31 +259,63 @@ describe('ChatThreadComponent', () => {
     });
 
     it('draws a gap in the corpus as not found', async () => {
-      await draw('not-found', "I couldn't find that in the company documents.");
+      await draw('not_found', "I couldn't find that in the company documents.");
 
       expect(element().textContent).toContain('Not found in company documents');
     });
 
-    it('draws an out-of-scope question apart from a gap in the corpus', async () => {
+    it('draws an out-of-scope reply as an ordinary bubble with no frame', async () => {
       await draw(
-        'out-of-scope',
+        'out_of_scope',
         "I'm built to answer questions about company policies and internal documents.",
       );
 
-      expect(element().textContent).toContain('Outside what I cover');
-      // The two say opposite things. Not-found means the documents do not cover
-      // an in-scope question; out-of-scope means it never was one, and drawing it
-      // as a gap would send somebody to HR over a general-knowledge question.
+      // The two say opposite things. Not-found means the documents do not cover an
+      // in-scope question; out-of-scope means it never was one, and drawing it as a
+      // gap would send somebody to HR over a general-knowledge question. So it is
+      // drawn as the reply it is: the scope message and nothing else.
+      expect(element().querySelector('.answer-prose')?.textContent).toContain(
+        "I'm built to answer questions about company policies",
+      );
       expect(element().textContent).not.toContain('Not found in company documents');
+      expect(element().textContent).not.toContain('indexed documents');
       expect(element().querySelector('app-answer-not-found')).toBeNull();
+      // And no evidence, because there is none behind it.
+      expect(element().textContent).not.toContain('Grounded in');
+      expect(element().textContent).not.toContain('Confidence');
     });
 
-    it('draws a greeting as an ordinary answer, because that is what it is', async () => {
-      await draw('greeting', "Hello! I'm the assistant.");
+    it('draws a conversational reply as an ordinary bubble and nothing else', async () => {
+      await draw('conversational', "You're right, no question yet.");
 
+      expect(element().querySelector('.answer-prose')?.textContent).toContain(
+        "You're right, no question yet.",
+      );
+      expect(element().textContent).not.toContain('Not found in company documents');
+      expect(element().textContent).not.toContain('indexed documents');
+      expect(element().textContent).not.toContain('Grounded in');
       expect(element().querySelector('app-answer-restricted')).toBeNull();
+    });
+
+    it('draws an answer with its sources and confidence last', async () => {
+      messages.set([
+        userMessage('1-user', 'How much annual leave?'),
+        {
+          ...answerMessage('1-assistant', 'Full-time staff get 25 days.'),
+          kind: 'answer',
+          sources: [
+            { document: 'Leave Policy', section: 'Annual Leave', snippet: '25 days', score: 0.82 },
+          ],
+          documentCount: 1,
+          confidence: 8,
+        },
+      ]);
+      await render();
+
+      expect(element().textContent).toContain('Grounded in');
+      expect(element().textContent).toContain('Confidence');
+      expect(element().textContent).toContain('Leave Policy');
       expect(element().querySelector('app-answer-not-found')).toBeNull();
-      expect(element().querySelector('.answer-prose')?.textContent).toContain("Hello!");
     });
   });
 });

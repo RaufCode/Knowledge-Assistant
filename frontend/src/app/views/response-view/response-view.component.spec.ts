@@ -13,7 +13,7 @@ const MESSAGES: Message[] = [
     id: 'm1',
     role: 'user',
     text: 'How much leave do I have?',
-    status: 'answered',
+    kind: 'answer',
     sources: [],
     documentCount: 0,
     confidence: null,
@@ -23,7 +23,7 @@ const MESSAGES: Message[] = [
     id: 'm2',
     role: 'assistant',
     text: 'Twenty days.',
-    status: 'answered',
+    kind: 'answer',
     sources: [],
     documentCount: 0,
     confidence: null,
@@ -165,7 +165,7 @@ describe('ResponseViewComponent', () => {
     });
 
     it('asks a failed message again through the thread', async () => {
-      messages.set([{ ...MESSAGES[1], status: 'failed', text: 'It went wrong.' }]);
+      messages.set([{ ...MESSAGES[1], kind: 'failed', text: 'It went wrong.' }]);
       await refresh();
 
       element().querySelector<HTMLButtonElement>('app-answer-failed button')?.click();

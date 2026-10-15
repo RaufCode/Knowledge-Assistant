@@ -18,7 +18,7 @@ function answeredMessage(overrides: Partial<Message> = {}): Message {
     role: 'assistant',
     text: 'You accrue 25 days of annual leave.',
     createdAt: '2026-09-30T08:00:00Z',
-    status: 'answered',
+    kind: 'answer',
     sources: [SOURCE],
     documentCount: 1,
     confidence: 9,
@@ -60,7 +60,7 @@ describe('AnswerCardComponent', () => {
       // A stream that leads with its citations shows a list that the answer below
       // it may contradict. A half-written answer has no citations to show, and
       // claiming otherwise is a claim the app would have to take back.
-      message = answeredMessage({ text: 'You accrue 25', status: 'pending' });
+      message = answeredMessage({ text: 'You accrue 25', kind: 'pending' });
       streaming = true;
       await render();
 
@@ -71,7 +71,7 @@ describe('AnswerCardComponent', () => {
     it('appear once the answer finishes, without the message changing', async () => {
       // The same turn, streamed and then closed. Only `isStreaming` moves, so a
       // citation list cannot depend on the answer being re-delivered to show up.
-      message = answeredMessage({ text: 'You accrue 25', status: 'pending' });
+      message = answeredMessage({ text: 'You accrue 25', kind: 'pending' });
       streaming = true;
       await render();
       expect(element().querySelectorAll('app-source-tag').length).toBe(0);
@@ -165,7 +165,7 @@ describe('AnswerCardComponent', () => {
     });
 
     it('show nothing for an answer with no sources', async () => {
-      message = answeredMessage({ sources: [], documentCount: 0, status: 'not-found' });
+      message = answeredMessage({ sources: [], documentCount: 0, kind: 'not_found' });
       await render();
 
       expect(element().querySelectorAll('app-source-tag').length).toBe(0);
@@ -203,7 +203,7 @@ describe('AnswerCardComponent', () => {
     it('shows nothing while the answer is still being written', async () => {
       // It scores the finished answer and the passages behind it. Mid-stream there
       // is no finished answer, and a number would be scoring text that does not exist.
-      message = answeredMessage({ status: 'pending', confidence: 7 });
+      message = answeredMessage({ kind: 'pending', confidence: 7 });
       streaming = true;
       await render();
 
@@ -237,7 +237,7 @@ describe('AnswerCardComponent', () => {
       element().querySelector('.answer-prose') as HTMLElement;
 
     beforeEach(async () => {
-      message = answeredMessage({ status: 'pending', text: 'You accrue 25 days', sources: [] });
+      message = answeredMessage({ kind: 'pending', text: 'You accrue 25 days', sources: [] });
       streaming = true;
       await render();
     });
