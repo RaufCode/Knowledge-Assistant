@@ -25,14 +25,40 @@ in this process. A second copy of the corpus in the database would be a second
 thing to keep in step with the first for no ranking gain.
 """
 
+import hashlib
 import logging
 import math
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+def chunk_key(node: object) -> str:
+    """A stable id for a chunk, the same however the index was built.
+
+    The id a chunk carries inside the index is an implementation detail of the
+    indexer — it is minted when the nodes are created, not derived from what they
+    say — so it cannot be used to ask "have I already shown this one?" across
+    conversations, or across restarts, which is exactly what continuing an answer
+    needs to know. This is derived from what the chunk says instead: same document,
+    same section, same text, same id, every time.
+
+    Short, because it is stored on every citation of every message.
+    """
+    metadata = getattr(node, "metadata", {}) or {}
+
+    material = "\x1f".join(
+        (
+            str(metadata.get("policy_title", "")),
+            str(metadata.get("section", "")),
+            node.get_content(),
+        )
+    )
+
+    return hashlib.sha1(material.encode("utf-8")).hexdigest()[:16]
 
 # BM25's two free parameters. The standard values from Robertson & Zaragoza: k1
 # controls how fast a repeated term stops counting for (1.2-2.0 is the usual
@@ -328,6 +354,46 @@ class HybridRetriever:
         Empty means the corpus has nothing on the question, which the caller
         reports as such rather than answering from what it does have.
         """
+        return self._rank(query)[: self._top_k]
+
+    def retrieve_continuation(
+        self,
+        query: str,
+        anchors: Iterable[tuple[str, str]],
+        already_shown: Iterable[str],
+    ) -> list[Candidate]:
+        """More of the passages an answer was drawn from, minus the ones it used.
+
+        What "anything else?" needs, and why the ordinary path cannot serve it: the
+        message names no document, so it retrieves against a topic it does not
+        have. Here the topic comes from the answer being continued — the same
+        documents and sections it cited — and the chunks it already quoted are
+        removed, so the generator is left with what it has not already said.
+
+        Empty means those sources are exhausted, which is a different fact from the
+        corpus having a gap, and the caller reports it as one.
+
+        The ranking is the same search, over the same candidates, with the same
+        floors: this filters what that search produced rather than scoring anything
+        of its own, so a chunk that cannot win the fusion here could not have won it
+        in an ordinary answer either.
+        """
+        wanted = {(document, section) for document, section in anchors}
+        seen = set(already_shown)
+
+        if not wanted:
+            return []
+
+        return [
+            candidate
+            for candidate in self._rank(query)
+            if (candidate.node.metadata.get("policy_title"), candidate.node.metadata.get("section"))
+            in wanted
+            and chunk_key(candidate.node) not in seen
+        ][: self._top_k]
+
+    def _rank(self, query: str) -> list[Candidate]:
+        """Both searches, fused, reranked — the whole list, not truncated."""
         vector_hits, vector_seen, similarities = self._vector_search(query)
         keyword_hits = self._keyword_search(query, vector_seen)
 
@@ -418,9 +484,9 @@ class HybridRetriever:
         )
 
         if self._rerank is not None:
-            candidates = self._rerank.rerank(query, candidates[: self._top_k * 3])
+            return self._rerank.rerank(query, candidates[: self._top_k * 3])
 
-        return candidates[: self._top_k]
+        return candidates
 
     def _vector_search(self, query: str) -> tuple[list[Hit], set[str], dict[str, float]]:
         """The chunks closest to the question in meaning, every id it considered, and
