@@ -72,10 +72,21 @@ class Message(Base):
     sources: Mapped[list | None] = mapped_column(JSON, nullable=True, default=None)
     # How the assistant's turn was answered, on an assistant message and null on
     # a question. Recorded so a reloaded thread renders the same card it did as
-    # it streamed: a greeting cites nothing, and without this it is
-    # indistinguishable from a genuine gap in the corpus. Added to live tables by
+    # it streamed: a reply that cites nothing, and a genuine gap in the corpus,
+    # would otherwise be indistinguishable. Added to live tables by
     # `_ensure_missing_columns` on startup.
     status: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
+    # What kind of reply this is: `answer`, `not_found`, `out_of_scope`,
+    # `conversational` or `restricted`. This is what the client draws from, and it
+    # is a separate column from `status` because the two answer different
+    # questions: `status` is the wording an older client expects, while `kind` says
+    # which of several replies that cite nothing this one is. Only `not_found` may
+    # be drawn as "not found in company documents", and only it may name HR.
+    #
+    # Nullable, and read as null on rows written before this column existed: a
+    # stored row then carries only the legacy `status`, which still identifies
+    # every kind but one (see `LEGACY_STATUS` in `app/rag/engine.py`).
+    kind: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
     # How closely the retrieved passages matched the question, 1-10, on an
     # assistant message that was built from them and null on every turn that was
     # not: a question, a greeting, a refusal, an out-of-scope reply, or a gap in
