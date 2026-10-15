@@ -20,15 +20,17 @@ from app.database import (
     Message,
     SessionLocal,
     User,
+    cited_chunk_ids,
     create_conversation,
     get_owned_conversation,
     init_db,
+    last_exchange,
     list_owned_conversations,
     recent_turns,
     touch,
 )
 from app.dependencies import get_current_user, get_db, open_db, require_csrf
-from app.rag.engine import Assistant, LlmUnavailable
+from app.rag.engine import Assistant, LlmUnavailable, PreviousAnswer
 from app.rag.guard import Category
 from app.rag.ingest import build_index
 from app.rate_limit import limiter, rate_limit_exceeded_handler
@@ -303,6 +305,29 @@ def delete_conversation(
     return {"status": "deleted"}
 
 
+def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None:
+    """What this message follows, as far as answering it needs to know.
+
+    Three things the classifier and the retrieval both need, all of them the
+    conversation's own record rather than anything held in memory: whether the
+    last turn was a refusal, which passages it cited, and which passages this
+    thread has already shown. A reload changes none of them, so a reader who
+    refreshes and then asks "anything else?" gets the same continuation.
+    """
+    question, answer = last_exchange(db, conversation_id)
+
+    if answer is None:
+        return None
+
+    return PreviousAnswer(
+        kind=answer.kind,
+        question=question.content if question else "",
+        answer=answer.content,
+        sources=tuple(answer.sources or ()),
+        cited=cited_chunk_ids(db, conversation_id),
+    )
+
+
 @app.post("/api/conversations/{conversation_id}/messages")
 def send_message(
     conversation_id: str,
@@ -325,14 +350,18 @@ def send_message(
     names the conversation, the stream also ends with a `title` event.
 
     The recent turns are read and handed to the assistant, which is what lets
-    "anything else I should know?" be answered as a continuation of the question
-    before it. They are read before the new question is recorded, so the window
-    holds the conversation as it stood rather than including the message being
-    answered.
+    "what about contractors?" be answered as a continuation of the question before
+    it. They are read before the new question is recorded, so the window holds the
+    conversation as it stood rather than including the message being answered.
+
+    So is the last exchange itself: an answer carries which passages it cited, and
+    "anything else?" is answered from the same documents with those passages
+    removed rather than from a fresh search for a phrase that names nothing.
     """
     conversation = owned_conversation_or_404(db, conversation_id, user.id)
 
     history = recent_turns(db, conversation.id)
+    previous = _previous_answer(db, conversation.id)
 
     db.add(
         Message(
@@ -352,7 +381,9 @@ def send_message(
             # named: naming it from "hey" is how the sidebar fills with
             # conversations called "Hey". Passed back in rather than asked for a
             # second time — it is one classification, with two consequences.
-            classification = state["assistant"].classify(req.content, history)
+            classification = state["assistant"].classify(
+                req.content, history, previous
+            )
 
             # Naming the conversation is a second model call, so it runs beside the
             # answer rather than in front of it. Only an untitled conversation gets
@@ -368,7 +399,7 @@ def send_message(
                 title_job = TitleJob(conversation.id, classification.query).start()
 
             for event in state["assistant"].ask_stream(
-                req.content, history, classification
+                req.content, history, classification, previous
             ):
                 if event["type"] == "done":
                     db.add(
