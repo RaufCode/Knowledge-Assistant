@@ -44,6 +44,10 @@ class Source(BaseModel):
     document: str
     section: str
     snippet: str
+    # Stable id for the passage itself. Not drawn: it is how "anything else?" knows
+    # which passages this thread has already shown, which it can only know from the
+    # stored citations.
+    chunk_id: str | None = None
     score: float
 
 

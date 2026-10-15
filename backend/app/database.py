@@ -326,6 +326,68 @@ def touch(db: SessionLocal, conversation: Conversation) -> None:
     db.commit()
 
 
+# How far back the "what was asked, and what was answered" pair is looked for. Four
+# rows is the same window the classifier reads, so the two cannot disagree about
+# which exchange a message is following.
+LAST_EXCHANGE_ROWS = 6
+
+
+def last_exchange(
+    db: SessionLocal, conversation_id: str
+) -> tuple["Message | None", "Message | None"]:
+    """The most recent (question, answer) pair in a conversation, oldest first.
+
+    Both halves or neither: a question whose answer has not arrived yet is not a
+    pair, and there is nothing to continue from until it has. Read from the stored
+    conversation rather than from the stream in memory, so "anything else?" after a
+    reload continues the same way it would have without one.
+    """
+    rows = db.scalars(
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(LAST_EXCHANGE_ROWS)
+    ).all()
+
+    answer = next((row for row in rows if row.role == "assistant"), None)
+
+    if answer is None:
+        return None, None
+
+    position = rows.index(answer)
+    question = next(
+        (row for row in rows[position + 1 :] if row.role == "user"),
+        None,
+    )
+
+    return question, answer
+
+
+def cited_chunk_ids(db: SessionLocal, conversation_id: str) -> frozenset[str]:
+    """Every chunk id this conversation has already put in front of the reader.
+
+    Across the whole thread rather than the last answer: "anything else?" three
+    turns later must not re-quote the passage the first answer used, and only the
+    whole thread knows which passages those are. A conversation of any size holds
+    tens of rows, and the sources are already loaded to read them, so this is a
+    pass over data in memory rather than a query of its own.
+    """
+    rows = db.scalars(
+        select(Message.sources).where(
+            Message.conversation_id == conversation_id,
+            Message.role == "assistant",
+            Message.sources.is_not(None),
+        )
+    ).all()
+
+    return frozenset(
+        str(source["chunk_id"])
+        for sources in rows
+        for source in (sources or [])
+        if isinstance(source, dict) and source.get("chunk_id")
+    )
+
+
 def get_user(db: SessionLocal, user_id: str) -> User | None:
     """The user with this id, or None.
 
