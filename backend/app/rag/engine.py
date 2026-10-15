@@ -1,6 +1,8 @@
 import logging
+import re
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from enum import Enum
 
 from llama_index.core import VectorStoreIndex
@@ -20,12 +22,14 @@ from app.rag.guard import (
     asks_about_capabilities,
     build_classifier_prompt,
     classify_by_rules,
+    is_restricted_request,
     parse_classification,
 )
 from app.rag.retrieval import (
     Candidate,
     HybridRetriever,
     KeywordIndex,
+    chunk_key,
     retrieval_confidence,
 )
 
@@ -53,6 +57,7 @@ class ResponseKind(str, Enum):
     OUT_OF_SCOPE = "out_of_scope"
     CONVERSATIONAL = "conversational"
     RESTRICTED = "restricted"
+    NO_MORE_INFO = "no_more_info"
 
 
 # The vocabulary the wire used before `kind` existed, kept so a client that has
@@ -64,18 +69,58 @@ LEGACY_STATUS: dict[ResponseKind, str] = {
     ResponseKind.OUT_OF_SCOPE: "out-of-scope",
     ResponseKind.CONVERSATIONAL: "greeting",
     ResponseKind.RESTRICTED: "restricted",
+    ResponseKind.NO_MORE_INFO: "no-more-info",
 }
 
+
+@dataclass(frozen=True)
+class PreviousAnswer:
+    """The exchange this message follows, as far as answering it needs to know.
+
+    Read from the conversation's own record rather than from the in-memory stream,
+    so it survives a reload: a reader who asks "anything else?" tomorrow after a
+    page refresh gets the same continuation the same day.
+
+    `kind` is there for one rule — a follow-up to a refusal is a refusal, however
+    it is phrased — and `sources` and `cited` for another: the sources say which
+    documents and sections the topic lives in, and `cited` is every chunk id the
+    conversation has already shown, so the continuation can be answered from what
+    is left rather than repeating what the reader has already read.
+    """
+
+    kind: str | None = None
+    question: str = ""
+    answer: str = ""
+    sources: tuple[Mapping[str, object], ...] = ()
+    cited: frozenset[str] = frozenset()
+
+
+# The vocabulary the wire used before `kind` existed, kept so a client that has
+# not been redeployed still draws these replies recognisably. `kind` is what
+# everything current reads.
 # In scope, and the documents genuinely do not cover it. Named HR because a
 # missing policy is a gap in what the corpus holds, and HR owns the corpus.
 FALLBACK_MSG = (
     "I couldn't find that in the company documents. "
     "Please contact HR at hr@acmetech.example or +233 30 000 0000."
 )
+# The refusal is the same whether the record is the asker's own or somebody else's,
+# and that is deliberate. It says what this assistant does not share; it does not
+# say whether a record exists, who has one, or what any document says about it. A
+# refusal that distinguished "there is no record of that" from "there is, but not
+# for you" would answer the question the reader was refused.
 PERSONAL_MSG = (
     "I can only answer general policy questions and I can't access personal "
     "records such as leave balances, salaries or payslips. Please check the HR "
     "self-service portal on the intranet, or contact HR at hr@acmetech.example."
+)
+# The documents behind the topic being continued are used up. Not a gap in the
+# corpus and not a failure: the reader has been given everything those sections
+# say, and the useful thing to do now is offer a different policy rather than a
+# dead end or a false claim that something is missing.
+EXHAUSTED_MSG = (
+    "That covers everything the documents say on this topic. "
+    "Is there another policy I can look up?"
 )
 # Never in scope, so it is not a gap in the corpus and there is nothing for HR to
 # supply. This is deliberately a different sentence from FALLBACK_MSG: telling
@@ -134,6 +179,50 @@ Rules:
 - If the question asks about the asker's own personal records (their own leave
   balance, salary, payslip, appraisal), reply with exactly: PERSONAL
 - Never use outside knowledge."""
+
+# An expansion is told apart from a follow-up by its context, not its question:
+# everything here has already been answered, and the passages the previous answer
+# cited have been removed from the pool. So the job is to say what is *left*, and
+# the previous answer is in the prompt precisely so the model knows what it must
+# not say again.
+EXPANSION_USER_PROMPT = """Conversation so far:
+{conversation}
+
+Already covered by the last answer:
+{covered}
+
+Context — the rest of the same documents:
+{context}
+
+Question: {question}
+Answer:"""
+
+EXPANSION_SYSTEM_PROMPT = """You are the Internal Knowledge Assistant for Acme \
+Technologies, continuing an answer the reader has already been given.
+
+Everything they have already been told is listed in the user message, and the \
+context holds only what those same documents say beyond it. Add what is missing and \
+nothing else:
+
+- Do not repeat, restate or reword anything in the "already covered" list. The \
+reader has read it.
+- Do not open with "In addition" or any other connective. Begin with the new point.
+- If the context adds nothing beyond what was already covered, reply with exactly: \
+NOT_FOUND. It will be turned into a statement that those documents are exhausted, \
+which is the truth.
+- Never use outside knowledge, and never state a company fact that is not in the \
+context."""
+
+# The generator signals "nothing here" by replying with a sentinel rather than an
+# answer, and the sentinel is compared as text. That is fragile in one direction
+# worth closing: the model sometimes writes the same words as a sentence — "Not
+# found." — and a comparison for the exact token lets that through as an answer
+# whose whole content is that it found nothing. These are the spellings of the
+# sentinel that mean the same thing; anything longer than this is a real answer
+# that happens to use the words.
+NOT_FOUND_REPLY = re.compile(r"^(?:not[ _-]?found|nothing found|no information found)\.?$", re.I)
+
+PERSONAL_REPLY = re.compile(r"^personal\.?$", re.I)
 
 # Output budget for classifying a message. Two short lines, but the configured
 # model reasons before it writes, so the same reasoning-model budget as the other
@@ -444,6 +533,7 @@ class Assistant:
         question: str,
         history: Sequence[tuple[str, str]] = (),
         classification: Classification | None = None,
+        previous: PreviousAnswer | None = None,
     ) -> Iterator[dict]:
         """Answer as a sequence of events, so the caller can render it as it lands.
 
@@ -466,12 +556,12 @@ class Assistant:
         recognised as one, what a follow-up's answer is written against, and what
         a conversational reply acknowledges.
 
-        `classification` is the caller's decision, when it has already made one:
-        naming a conversation is the same problem as answering the message, and
-        both are decided by the same call, so the route passes its result in
-        rather than paying for a second classification.
+        `classification` and `previous` are the caller's, when it has already read
+        them: the route classifies once for two reasons — what to say, and whether
+        the conversation is worth naming — and the previous answer is the same
+        conversation's own record.
         """
-        classification = classification or self.classify(question, history)
+        classification = classification or self.classify(question, history, previous)
 
         # Small talk, out-of-scope requests and refusals are all answered before
         # anything is retrieved. They are cases where the documents cannot help:
@@ -504,6 +594,12 @@ class Assistant:
             return
 
         if classification.category is Category.RESTRICTED:
+            # Before retrieval, always, and never on the strength of what retrieval
+            # found: a question about a colleague's pay has no chunk to find, which
+            # used to be the only thing standing between it and a reply saying the
+            # documents do not cover it. Nothing here is quoted from the documents
+            # either — the notice is the same one for any record, and says what is
+            # not shared rather than whether anything exists.
             yield {"type": "status", "stage": "writing"}
             yield {"type": "delta", "text": PERSONAL_MSG}
             yield {
@@ -512,7 +608,11 @@ class Assistant:
             }
             return
 
-        candidates = self._retrieve(classification.query)
+        if classification.category is Category.EXPANSION:
+            yield from self._expansion_events(question, history, previous)
+            return
+
+        candidates = self._retrieve(classification, previous)
 
         # From here on the message is a genuine in-scope question, so this is the
         # one path that may report a gap in the corpus.
@@ -547,30 +647,17 @@ class Assistant:
         text = "".join(parts).strip()
         logger.info("answered %r via %s", question, settings.llm_model)
 
-        if "PERSONAL" == text:
-            yield {
-                "type": "done",
-                **_result(PERSONAL_MSG, ResponseKind.RESTRICTED),
-            }
-        elif "NOT_FOUND" in text:
-            yield {
-                "type": "done",
-                **_result(FALLBACK_MSG, ResponseKind.NOT_FOUND),
-            }
-        else:
-            yield {
-                "type": "done",
-                **_result(text, ResponseKind.ANSWER, sources, confidence),
-            }
+        yield {"type": "done", **_settle(text, sources, confidence)}
 
     def ask(
         self,
         question: str,
         history: Sequence[tuple[str, str]] = (),
         classification: Classification | None = None,
+        previous: PreviousAnswer | None = None,
     ) -> dict:
         """The same answer as `ask_stream`, in one piece rather than as events."""
-        classification = classification or self.classify(question, history)
+        classification = classification or self.classify(question, history, previous)
 
         if classification.category is Category.CONVERSATIONAL:
             return _result(
@@ -583,7 +670,10 @@ class Assistant:
         if classification.category is Category.RESTRICTED:
             return _result(PERSONAL_MSG, ResponseKind.RESTRICTED)
 
-        candidates = self._retrieve(classification.query)
+        if classification.category is Category.EXPANSION:
+            return self._expansion(question, history, previous)
+
+        candidates = self._retrieve(classification, previous)
 
         if not candidates:
             return _result(FALLBACK_MSG, ResponseKind.NOT_FOUND)
@@ -595,30 +685,34 @@ class Assistant:
         text = self._complete(user_prompt, system_prompt=system_prompt)
         logger.info("answered %r via %s", question, settings.llm_model)
 
-        if "PERSONAL" == text:
-            return _result(PERSONAL_MSG, ResponseKind.RESTRICTED)
-        if "NOT_FOUND" in text:
-            return _result(FALLBACK_MSG, ResponseKind.NOT_FOUND)
-
-        return _result(
-            text,
-            ResponseKind.ANSWER,
-            [_source(candidate) for candidate in candidates],
-            confidence,
-        )
+        return _settle(text, [_source(c) for c in candidates], confidence)
 
     def classify(
-        self, question: str, history: Sequence[tuple[str, str]] = ()
+        self,
+        question: str,
+        history: Sequence[tuple[str, str]] = (),
+        previous: PreviousAnswer | None = None,
     ) -> Classification:
         """What this message is, decided before anything is retrieved.
 
-        Obvious small talk and personal-record questions are matched by pattern,
-        with no model call: both are exact-match judgements a model could only make
-        less reliably, and a greeting must not stop working when the model does.
-        Everything else goes to the model with the recent turns attached, because a
-        remark about the conversation cannot be told from a question by pattern, a
-        follow-up cannot be recognised from its own words, and an out-of-scope
-        request can be worded in too many ways to list.
+        Obvious small talk, obvious expansions and private-record requests are
+        matched by pattern, with no model call: they are exact-match judgements a
+        model could only make less reliably, a greeting must not stop working when
+        the model does, and a refusal must not depend on a classifier call being
+        available. Everything else goes to the model with the recent turns
+        attached, because a remark about the conversation cannot be told from a
+        question by pattern, a follow-up cannot be recognised from its own words,
+        an out-of-scope request can be worded in too many ways to list, and the
+        guard's patterns are bypassed by rephrasing.
+
+        The confidentiality guard is applied twice, and the second time is the one
+        that matters: to the *standalone* query, after a follow-up has been
+        rewritten. "and his bonus?" is refused by the rules on the raw message, but
+        a rewrite that turns it into "What is Kwame's bonus?" would otherwise be
+        the form that got through — the message looks harmless and the query is the
+        one that is retrieved. A follow-up to a refusal stays a refusal for the
+        same reason: a reader who has just been told what is not shared is not
+        asking a new question with "and what about...".
 
         A model that cannot be reached is treated as saying nothing useful, which
         `parse_classification` reads as `COMPANY_QUESTION`: the ordinary retrieval
@@ -630,6 +724,26 @@ class Assistant:
         by_rule = classify_by_rules(question)
 
         if by_rule is not None:
+            if by_rule is Category.EXPANSION:
+                # A refusal has no passages behind it, so there is nothing an
+                # expansion could continue from, and "anything else?" after being
+                # told what is not shared is not a request for more of it. It stays
+                # a refusal rather than being told a topic is exhausted.
+                if previous is not None and previous.kind == ResponseKind.RESTRICTED.value:
+                    return Classification(Category.RESTRICTED, question)
+
+                # Already exhausted, so still an expansion: same passages, same
+                # answer, rather than a fresh search of documents already read.
+                if _topic_is_exhausted(previous):
+                    return Classification(Category.EXPANSION, question)
+
+                if not _has_previous_answer(previous):
+                    # Nothing to continue from. "Anything else?" as the first
+                    # message of a conversation is a follow-up with nothing to
+                    # follow, so it takes the ordinary path and is judged on its
+                    # merits like any other.
+                    return Classification(Category.FOLLOW_UP, question)
+
             return Classification(by_rule, question)
 
         try:
@@ -650,6 +764,30 @@ class Assistant:
             reply,
         )
 
+        if classification.category is Category.EXPANSION and not _has_previous_answer(
+            previous
+        ):
+            return Classification(Category.FOLLOW_UP, question)
+
+        # The guard, again, on whatever will actually be retrieved or generated
+        # against. Rules first so a rewrite cannot smuggle a request past them, and
+        # the refusal inherited from the last turn so that "and his bonus?" after a
+        # refusal is one.
+        if (
+            classification.category in {Category.FOLLOW_UP, Category.EXPANSION}
+            and previous is not None
+            and previous.kind == ResponseKind.RESTRICTED.value
+        ):
+            # Scoped to follow-ups and expansions on purpose: the turn after a
+            # refusal is very often an ordinary question — "what is the leave
+            # policy?" — and refusing that would be refusing the conversation
+            # rather than the record.
+            logger.info("follow-up to a refused turn stays refused: %r", question)
+            return Classification(Category.RESTRICTED, question)
+
+        if is_restricted_request(classification.query):
+            return Classification(Category.RESTRICTED, classification.query)
+
         # Only a follow-up uses the rewritten wording. For everything else the
         # user's own words are what gets retrieved: the rewrite is the model's
         # paraphrase, and paraphrasing a question that was already standalone can
@@ -662,6 +800,88 @@ class Assistant:
             logger.info("follow-up rewritten for retrieval: %r -> %r", question, classification.query)
 
         return classification
+
+    def _expansion_events(
+        self,
+        question: str,
+        history: Sequence[tuple[str, str]],
+        previous: PreviousAnswer | None,
+    ) -> Iterator[dict]:
+        """"Anything else?", answered from what the last answer had left.
+
+        Never a `not_found`: the documents the reader is on have not run out of
+        *topics*, and telling somebody the indexed documents do not cover "anything
+        else" is a claim about the corpus that says nothing true about it.
+        """
+        yield {"type": "status", "stage": "writing"}
+
+        answer, kind, sources, confidence = self._expansion(question, history, previous)
+
+        for piece in _stream_pieces(answer):
+            yield {"type": "delta", "text": piece}
+
+        yield {"type": "done", **_result(answer, kind, sources, confidence)}
+
+    def _expansion(
+        self,
+        question: str,
+        history: Sequence[tuple[str, str]],
+        previous: PreviousAnswer | None,
+    ) -> tuple[str, ResponseKind, list[dict], int | None]:
+        """The continuation, as text, kind, citations and confidence.
+
+        Retrieval is anchored to the passages the last answer cited, with those
+        passages themselves removed, so what reaches the generator is what the
+        reader has not been shown yet. When there is nothing left, that is said
+        plainly rather than reported as a gap in the corpus.
+        """
+        exhausted = (EXHAUSTED_MSG, ResponseKind.NO_MORE_INFO, [], None)
+
+        if previous is None or not previous.sources or _topic_is_exhausted(previous):
+            return exhausted
+
+        anchors = {
+            (str(source.get("document", "")), str(source.get("section", "")))
+            for source in previous.sources
+        }
+
+        candidates = self.retrieval.retrieve_continuation(
+            previous.question or previous.answer, anchors, previous.cited
+        )
+
+        if not candidates:
+            logger.info("nothing left in %d anchored passages to continue", len(anchors))
+            return exhausted
+
+        user_prompt = EXPANSION_USER_PROMPT.format(
+            conversation=_conversation(history, 600),
+            covered=_covered(previous.answer),
+            context=_context(candidates),
+            question=question,
+        )
+
+        try:
+            parts: list[str] = []
+            for delta in self._stream(
+                user_prompt, system_prompt=EXPANSION_SYSTEM_PROMPT
+            ):
+                parts.append(delta)
+
+            text = "".join(parts).strip()
+        except LlmUnavailable as exc:
+            logger.warning("continuation unavailable, saying the sources are spent: %s", exc.reason)
+            return exhausted
+
+        logger.info("continued %r via %s", question, settings.llm_model)
+
+        # The generator saying it has nothing left is the same fact as the passages
+        # having nothing left, and it is reported the same way.
+        if _declined(text) == "not_found" or not text:
+            return exhausted
+
+        sources = [_source(candidate) for candidate in candidates]
+
+        return text, ResponseKind.ANSWER, sources, retrieval_confidence(candidates)
 
     def conversational_pieces(
         self, message: str, history: Sequence[tuple[str, str]] = ()
@@ -704,15 +924,43 @@ class Assistant:
         """`conversational_pieces` as one piece of text, for the unstreamed path."""
         return _finish_conversational(list(self.conversational_pieces(message, history)))
 
-    def _retrieve(self, query: str) -> list[Candidate]:
+    def _retrieve(
+        self, classification: Classification, previous: PreviousAnswer | None = None
+    ) -> list[Candidate]:
         """The chunks worth answering from, or none at all.
 
         Both searches, fused — see `app/rag/retrieval.py`. Nothing here can fail
         the question outright: a vector search that errors degrades to the keyword
         half, and a question with no usable keywords comes back empty, which the
         caller reports as a gap in the corpus rather than as an outage.
+
+        A follow-up gets a second attempt, and this is the only path that does.
+        Its query is the model's paraphrase, and a paraphrase can land on wording
+        the corpus does not use — "What else does the expectations document cover?"
+        finds nothing, while the question that started the thread found plenty.
+        So when the rewrite retrieves nothing, the question the reader actually
+        asked is tried in its place. It is the same topic by definition, and the
+        generator is still told it is continuing the thread; what changes is which
+        words the search used. Only when that finds nothing either is the turn
+        reported as a gap in the corpus.
         """
-        return self.retrieval.retrieve(query)
+        candidates = self.retrieval.retrieve(classification.query)
+
+        if candidates or classification.category is not Category.FOLLOW_UP:
+            return candidates
+
+        fallback = (previous.question if previous else "").strip()
+
+        if not fallback or fallback == classification.query:
+            return candidates
+
+        logger.info(
+            "follow-up retrieved nothing for %r; trying the question it continues: %r",
+            classification.query,
+            fallback,
+        )
+
+        return self.retrieval.retrieve(fallback)
 
 
 def _source(candidate: Candidate) -> dict:
@@ -738,10 +986,115 @@ def _source(candidate: Candidate) -> dict:
         "document": node.metadata["policy_title"],
         "section": node.metadata["section"],
         "snippet": node.get_content(metadata_mode=MetadataMode.NONE)[:200],
+        # Stable across restarts of the index, so "anything else?" knows which
+        # passages it has already shown without keeping a second copy of the
+        # conversation in memory. See `chunk_key`.
+        "chunk_id": chunk_key(node),
         "score": (
             round(candidate.similarity, 3) if candidate.similarity is not None else 0.0
         ),
     }
+
+
+def _declined(text: str) -> str | None:
+    """Which sentinel the generator answered with, if it answered with one.
+
+    The two sentinels are short and exact because they have to be unambiguous: a
+    generator that writes "Not found." rather than the token has still said it
+    found nothing, and shipping that as an answer whose entire content is that it
+    found nothing is the one reading that cannot be defended afterwards. Anything
+    longer than a sentinel is treated as an answer, including an answer that uses
+    the words in passing.
+    """
+    cleaned = " ".join((text or "").split())
+
+    if PERSONAL_REPLY.match(cleaned):
+        return "personal"
+
+    if NOT_FOUND_REPLY.match(cleaned):
+        return "not_found"
+
+    # The token can also arrive with a little of the reasoning model around it,
+    # which is what the substring test catches.
+    if "PERSONAL" in cleaned:
+        return "personal"
+
+    if "NOT_FOUND" in cleaned:
+        return "not_found"
+
+    return None
+
+
+def _settle(text: str, sources: list[dict], confidence: int | None) -> dict:
+    """The closing event for a generated answer, whatever it turned out to be.
+
+    A refusal drops the citations and the figure on the way through: neither is
+    evidence when the answer is that nothing is shared, and a confidence score
+    beside a refusal would describe a measurement nobody made.
+    """
+    declined = _declined(text)
+
+    if declined == "personal":
+        return _result(PERSONAL_MSG, ResponseKind.RESTRICTED)
+
+    if declined == "not_found":
+        return _result(FALLBACK_MSG, ResponseKind.NOT_FOUND)
+
+    return _result(text, ResponseKind.ANSWER, sources, confidence)
+
+
+def _context(candidates: Sequence[Candidate]) -> str:
+    """The passages a generator is given, each labelled with where it came from."""
+    return "\n\n".join(
+        f"({candidate.node.metadata['policy_title']} > {candidate.node.metadata['section']})\n"
+        f"{candidate.node.get_content(metadata_mode=MetadataMode.NONE)}"
+        for candidate in candidates
+    )
+
+
+def _covered(answer: str) -> str:
+    """What the last answer already said, so the continuation can leave it out."""
+    return " ".join((answer or "").split())[:2000] or "(nothing yet)"
+
+
+def _stream_pieces(text: str) -> Iterator[str]:
+    """A finished reply, as the pieces a client appends as they arrive.
+
+    The same shape as a streamed answer — `done` carries the whole reply whatever
+    the deltas were — so a reader watching one sees the message arrive the way
+    every other reply does. Split on sentence ends, which is as fine-grained as it
+    is worth being without a second call per sentence.
+    """
+    parts = re.split(r"(?<=[.!?])\s+", text.strip()) if text.strip() else []
+
+    if not parts:
+        return
+
+    yield " ".join(parts[:-1]) + " " if len(parts) > 1 else parts[0]
+    yield parts[-1]
+
+
+def _has_previous_answer(previous: PreviousAnswer | None) -> bool:
+    """Whether there is a previous answer this message can continue.
+
+    Only a grounded answer counts. A refusal, a small talk reply and an
+    out-of-scope reply have no passages behind them, so there is nothing an
+    expansion could continue from, and a reader asking "anything else?" after one
+    is better served by the ordinary path than by being told a topic is exhausted.
+    """
+    return previous is not None and bool(previous.sources)
+
+
+def _topic_is_exhausted(previous: PreviousAnswer | None) -> bool:
+    """Whether the last turn already said this topic has nothing left in it.
+
+    Which it may have: the corpus is chunked by section, so an answer that cited
+    three sections can have read all of them. Asking "anything else?" again then
+    would search the same documents for the same passages, and either restate the
+    previous answer or come back as a false gap in the corpus — the two things this
+    path exists to avoid. So the same answer is given again, which is the truth.
+    """
+    return previous is not None and previous.kind == ResponseKind.NO_MORE_INFO.value
 
 
 def _result(
@@ -827,11 +1180,7 @@ def _generation_prompt(
     the answer continues the thread rather than opening a new one. The context is
     still the only source of facts either way.
     """
-    context = "\n\n".join(
-        f"({candidate.node.metadata['policy_title']} > {candidate.node.metadata['section']})\n"
-        f"{candidate.node.get_content(metadata_mode=MetadataMode.NONE)}"
-        for candidate in candidates
-    )
+    context = _context(candidates)
 
     if classification.category is not Category.FOLLOW_UP:
         return USER_PROMPT.format(context=context, question=classification.query), SYSTEM_PROMPT
