@@ -297,6 +297,20 @@ describe('ChatThreadComponent', () => {
       expect(element().querySelector('app-answer-restricted')).toBeNull();
     });
 
+    it('draws an exhausted topic as an ordinary reply, not a gap', async () => {
+      await draw('no_more_info', 'That covers everything the documents say on this topic.');
+
+      // "Anything else?" after the passages behind that topic are used up is not a
+      // failed search, and the not-found card is the one frame that claims the
+      // corpus is missing something.
+      expect(element().querySelector('app-answer-not-found')).toBeNull();
+      expect(element().textContent).not.toContain('Not found in company documents');
+      expect(element().textContent).not.toContain('indexed documents');
+      expect(element().querySelector('.answer-prose')?.textContent).toContain(
+        'That covers everything the documents say',
+      );
+    });
+
     it('draws an answer with its sources and confidence last', async () => {
       messages.set([
         userMessage('1-user', 'How much annual leave?'),
