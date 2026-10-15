@@ -111,6 +111,7 @@ describe('ApiService', () => {
           { id: 'm4', role: 'assistant', content: "I couldn't find that.", sources: null, kind: 'not_found', status: 'not-found', confidence: null, created_at: '2026-09-30T09:00:03' },
           { id: 'm5', role: 'assistant', content: "That isn't something I cover.", sources: null, kind: 'out_of_scope', status: 'out-of-scope', confidence: null, created_at: '2026-09-30T09:00:04' },
           { id: 'm6', role: 'assistant', content: 'Full-time staff get 25 days.', sources: [SOURCE], kind: 'answer', status: 'answered', confidence: 8, created_at: '2026-09-30T09:00:05' },
+          { id: 'm7', role: 'assistant', content: 'That covers everything the documents say on this topic.', sources: null, kind: 'no_more_info', status: 'no-more-info', confidence: null, created_at: '2026-09-30T09:00:06' },
         ],
       });
 
@@ -125,6 +126,7 @@ describe('ApiService', () => {
         'not_found',
         'out_of_scope',
         'answer',
+        'no_more_info',
       ]);
     });
 
@@ -143,6 +145,7 @@ describe('ApiService', () => {
           { id: 'm1', role: 'assistant', content: "Hello! I'm the assistant.", sources: null, status: 'greeting', created_at: '2026-09-30T09:00:00' },
           { id: 'm2', role: 'assistant', content: "That isn't something I cover.", sources: null, status: 'out-of-scope', created_at: '2026-09-30T09:00:01' },
           { id: 'm3', role: 'assistant', content: 'Twenty days.', sources: [SOURCE], status: 'answered', created_at: '2026-09-30T09:00:02' },
+          { id: 'm4', role: 'assistant', content: 'That covers everything on this topic.', sources: null, status: 'no-more-info', created_at: '2026-09-30T09:00:03' },
         ],
       });
 
@@ -150,6 +153,7 @@ describe('ApiService', () => {
         'conversational',
         'out_of_scope',
         'answer',
+        'no_more_info',
       ]);
     });
 

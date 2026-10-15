@@ -28,6 +28,10 @@ export interface SourceReference {
  * - `not_found`: an in-scope question the documents do not cover. The only kind
  *   drawn as "not found in company documents", and the only one that names a route
  *   to HR, because it is the only one claiming a gap in the corpus.
+ * - `no_more_info`: "anything else?" on a topic the previous answer already used
+ *   up. Not a gap in the corpus and not a failure — the passages behind that topic
+ *   have been read, and saying so is a different fact from saying something is
+ *   missing. Drawn as an ordinary reply.
  * - `out_of_scope`: a real request that was never something this assistant
  *   answers. Drawn as an ordinary reply, with no claim about the documents.
  * - `conversational`: a greeting, an acknowledgement, a remark about the exchange,
@@ -45,6 +49,7 @@ export type AnswerKind =
   | 'failed'
   | 'answer'
   | 'not_found'
+  | 'no_more_info'
   | 'out_of_scope'
   | 'conversational'
   | 'restricted';
@@ -60,6 +65,7 @@ export type AnswerKind =
 export const INCOMING_ANSWER_KINDS: readonly AnswerKind[] = [
   'answer',
   'not_found',
+  'no_more_info',
   'out_of_scope',
   'conversational',
   'restricted',
@@ -76,6 +82,7 @@ export const INCOMING_ANSWER_KINDS: readonly AnswerKind[] = [
 const LEGACY_ANSWER_KINDS: Readonly<Record<string, AnswerKind>> = {
   answered: 'answer',
   'not-found': 'not_found',
+  'no-more-info': 'no_more_info',
   greeting: 'conversational',
   'out-of-scope': 'out_of_scope',
   restricted: 'restricted',

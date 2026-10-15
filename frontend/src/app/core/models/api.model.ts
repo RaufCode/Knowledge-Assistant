@@ -14,6 +14,12 @@ export interface SourceDto {
   /** The passage the answer was drawn from. */
   snippet: string;
   /**
+   * Stable id for the passage itself, so "anything else?" can tell which passages
+   * this thread has already shown. Not rendered: it is the backend's bookkeeping
+   * rather than something a reader is shown.
+   */
+  chunk_id?: string | null;
+  /**
    * Retrieval relevance. The schema documents neither its range nor its unit, so
    * it is carried through untouched and never rendered as a number.
    */
@@ -75,8 +81,8 @@ export interface MessageDto {
   created_at: string;
   /**
    * What kind of reply this is, and what the client draws from: `answer`,
-   * `not_found`, `out_of_scope`, `conversational` or `restricted`. Null on a
-   * question, and on any message stored before this field existed.
+   * `not_found`, `no_more_info`, `out_of_scope`, `conversational` or `restricted`.
+   * Null on a question, and on any message stored before this field existed.
    */
   kind: string | null;
   /**
