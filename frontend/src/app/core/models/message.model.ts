@@ -18,77 +18,101 @@ export interface SourceReference {
 }
 
 /**
- * Outcome of a single message.
+ * What kind of reply a message is, which is what decides how it is drawn.
  *
- * `failed` is a transport outcome rather than an answer outcome: the assistant
- * never got to answer. It is kept distinct from `not-found`, which is the
- * assistant reporting that the corpus genuinely has nothing, because the two
- * need different wording and different recovery.
+ * The backend names these, and every one of them except `answer` arrives with no
+ * sources and no confidence, so they cannot be told apart from the absence of
+ * either — which is exactly why they are named:
  *
- * `greeting`, `restricted` and `out-of-scope` are answers that cite nothing for
- * reasons that have nothing to do with the corpus: one is small talk answered
- * without retrieving, one is a question turned away before retrieval was attempted,
- * and one was never in scope to answer. None is a failed search, and all three
- * would be misleading drawn as one — a refusal labelled "not found in company
- * documents" claims the gap is in the documents.
+ * - `answer`: a grounded answer, with the passages it came from.
+ * - `not_found`: an in-scope question the documents do not cover. The only kind
+ *   drawn as "not found in company documents", and the only one that names a route
+ *   to HR, because it is the only one claiming a gap in the corpus.
+ * - `out_of_scope`: a real request that was never something this assistant
+ *   answers. Drawn as an ordinary reply, with no claim about the documents.
+ * - `conversational`: a greeting, an acknowledgement, a remark about the exchange,
+ *   or a question about the assistant. Drawn as an ordinary reply.
+ * - `restricted`: a refusal, drawn as one.
  *
- * `out-of-scope` is kept apart from `not-found` because the two mean opposite
- * things. `not-found` is "this is in scope and the documents do not cover it";
- * `out-of-scope` is "this was never something this assistant answers". Sending
- * somebody to HR over a general-knowledge question is not a useful answer, and it
- * reads as though the assistant had misunderstood the question.
+ * `pending` and `failed` are the two that never arrive from the backend: they
+ * belong to an answer being produced here, or to a request that never produced
+ * one. `failed` is kept apart from `not_found` because a dropped connection means
+ * the answer may well exist, and telling somebody the documents do not cover it is
+ * blaming the corpus for a network.
  */
-export type AnswerStatus =
+export type AnswerKind =
   | 'pending'
-  | 'answered'
-  | 'not-found'
-  | 'greeting'
-  | 'restricted'
-  | 'out-of-scope'
-  | 'failed';
+  | 'failed'
+  | 'answer'
+  | 'not_found'
+  | 'out_of_scope'
+  | 'conversational'
+  | 'restricted';
 
 /**
- * The statuses a stored or streamed answer can arrive as.
+ * The kinds a stored or streamed answer can arrive as.
  *
- * Separate from the type because the wire carries a plain string, and a status the
+ * Separate from the type because the wire carries a plain string, and a kind the
  * backend invents later has to be recognised as unknown rather than cast through
  * unchecked. `pending` and `failed` are absent on purpose: both belong to an answer
  * being produced here, so neither can arrive from the backend.
  */
-export const INCOMING_ANSWER_STATUSES: readonly AnswerStatus[] = [
-  'answered',
-  'not-found',
-  'greeting',
+export const INCOMING_ANSWER_KINDS: readonly AnswerKind[] = [
+  'answer',
+  'not_found',
+  'out_of_scope',
+  'conversational',
   'restricted',
-  'out-of-scope',
 ];
 
 /**
- * Narrows a wire status to a known one, or null when it is not one.
+ * The vocabulary the backend used before `kind` existed, mapped onto these.
  *
- * The wire spells statuses in `kebab-case`, which is also how they are declared
- * above, so this is a set lookup with no translation. An unknown status returns
- * null rather than being cast through: a deployment that adds one should render as
- * an ordinary answer rather than as a failed search, which is the safer of the two
- * wrong readings.
+ * Read rather than dropped, so a message stored by an older deployment — a thread
+ * reopened after an upgrade, or a response served by a backend that has not been
+ * redeployed — still draws as what it was instead of falling back to "not found",
+ * which is the one frame that is a claim about the corpus.
  */
-export function toKnownAnswerStatus(value: string | null | undefined): AnswerStatus | null {
-  return value && INCOMING_ANSWER_STATUSES.includes(value as AnswerStatus)
-    ? (value as AnswerStatus)
-    : null;
+const LEGACY_ANSWER_KINDS: Readonly<Record<string, AnswerKind>> = {
+  answered: 'answer',
+  'not-found': 'not_found',
+  greeting: 'conversational',
+  'out-of-scope': 'out_of_scope',
+  restricted: 'restricted',
+};
+
+/**
+ * Narrows a wire kind to a known one, or null when it is not one.
+ *
+ * Both vocabularies are accepted, because a deployment can be at either one for a
+ * while: the stored rows behind this are written once and read for ever. An
+ * unknown value returns null rather than being cast through, so a kind this app has
+ * never heard of renders as an ordinary reply rather than as a failed search,
+ * which is the safer of the two wrong readings.
+ */
+export function toKnownAnswerKind(value: string | null | undefined): AnswerKind | null {
+  if (!value) {
+    return null;
+  }
+
+  if (INCOMING_ANSWER_KINDS.includes(value as AnswerKind)) {
+    return value as AnswerKind;
+  }
+
+  return LEGACY_ANSWER_KINDS[value] ?? null;
 }
 
 /**
  * The outcome of one completed question, as a message is written with it.
  *
- * `status` is whatever the backend settled on rather than being worked out from
- * `answered`, because the backend distinguishes a greeting, a confidentiality
- * refusal and a genuine gap in the corpus — three answers that all cite nothing,
- * and three different things to show somebody.
+ * `kind` is whatever the backend settled on rather than being worked out from
+ * whether the answer cites anything, because the backend distinguishes a greeting,
+ * a confidentiality refusal and a genuine gap in the corpus — three replies that
+ * all cite nothing, and three different things to show somebody.
  */
 export interface ResolvedAnswer {
   text: string;
-  status: AnswerStatus;
+  kind: AnswerKind;
   sources: SourceReference[];
   confidence: number | null;
 }
@@ -108,7 +132,8 @@ export interface Message {
    */
   text: string;
   createdAt: string;
-  status: AnswerStatus;
+  /** What kind of reply this is, which is what the thread draws it as. */
+  kind: AnswerKind;
   /** Populated for an answered message; empty for a question and for a failure. */
   sources: SourceReference[];
   /** Set when the message is grounded, used for the "Grounded in N documents" hint. */
@@ -117,9 +142,10 @@ export interface Message {
    * How well the retrieved passages matched the question, 1-10, or null when the
    * answer was not built from any.
    *
-   * Null rather than zero for a greeting, a refusal or a gap in the corpus: those
-   * have no passages to be confident about, and a low number beside them would read
-   * as a poor answer rather than as the absence of one.
+   * Null rather than zero for a conversational reply, a refusal, an out-of-scope
+   * reply or a gap in the corpus: those have no passages to be confident about, and
+   * a low number beside them would read as a poor answer rather than as the absence
+   * of one.
    */
   confidence: number | null;
 }

@@ -74,8 +74,14 @@ export interface MessageDto {
   sources: SourceDto[] | null;
   created_at: string;
   /**
-   * How the assistant answered. Null on a question, and on any message stored
-   * before this field existed.
+   * What kind of reply this is, and what the client draws from: `answer`,
+   * `not_found`, `out_of_scope`, `conversational` or `restricted`. Null on a
+   * question, and on any message stored before this field existed.
+   */
+  kind: string | null;
+  /**
+   * How the assistant answered, in the vocabulary predating `kind`. Kept because
+   * stored rows still carry it, and `kind` on those rows is null.
    */
   status: string | null;
   /**
@@ -122,6 +128,12 @@ export type ChatStreamEventDto =
   | {
       type: 'done';
       answer: string;
+      kind: string;
+      /**
+       * Whether the reply is a grounded answer, and `status` in the vocabulary
+       * predating `kind`. Both are read as fallbacks for a backend that has not
+       * been redeployed; `kind` is what everything current draws from.
+       */
       answered: boolean;
       status: string;
       confidence: number | null;

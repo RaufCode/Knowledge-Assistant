@@ -14,7 +14,6 @@ import { Message } from '../../../../core/models/message.model';
 import { AnswerCardComponent } from '../answer-card/answer-card.component';
 import { AnswerFailedComponent } from '../answer-failed/answer-failed.component';
 import { AnswerNotFoundComponent } from '../answer-not-found/answer-not-found.component';
-import { AnswerOutOfScopeComponent } from '../answer-out-of-scope/answer-out-of-scope.component';
 import { AnswerPendingComponent } from '../answer-pending/answer-pending.component';
 import { AnswerRestrictedComponent } from '../answer-restricted/answer-restricted.component';
 import { MessageBubbleComponent } from '../message-bubble/message-bubble.component';
@@ -29,8 +28,9 @@ import { MessageBubbleComponent } from '../message-bubble/message-bubble.compone
 const AT_BOTTOM_SLACK_PX = 24;
 
 /**
- * The conversation itself: user bubbles on the right, assistant turns on the
- * left with the right card per state (answer, no match, still searching).
+ * The conversation itself: user bubbles on the right, assistant turns on the left
+ * with the right drawing for the kind of reply each one is — an answer, a gap in
+ * the corpus, a refusal, a remark, or an exchange still in progress.
  *
  * This is the only scrollable container in the view. The header and the composer
  * sit outside it in a fixed-height column, so reading back through a long
@@ -47,7 +47,6 @@ const AT_BOTTOM_SLACK_PX = 24;
     AnswerCardComponent,
     AnswerFailedComponent,
     AnswerNotFoundComponent,
-    AnswerOutOfScopeComponent,
     AnswerPendingComponent,
     AnswerRestrictedComponent,
     MessageBubbleComponent,
@@ -74,7 +73,7 @@ const AT_BOTTOM_SLACK_PX = 24;
             />
           } @else {
             <div class="min-w-0 flex-1">
-              @switch (message.status) {
+              @switch (message.kind) {
                 @case ('pending') {
                   <!-- Text on a pending turn means the answer is streaming in.
                        Before the first piece arrives the card says it is
@@ -87,23 +86,19 @@ const AT_BOTTOM_SLACK_PX = 24;
                     <app-answer-pending />
                   }
                 }
-                @case ('not-found') {
+                @case ('not_found') {
+                  <!-- The only kind that claims a gap in the corpus, so the only
+                       kind that shows "not found in company documents" and its
+                       route to HR. An out-of-scope reply, a conversational one and
+                       a refusal all cite nothing too, and drawing any of them here
+                       would tell somebody the documents are missing a policy that
+                       was never their question, or that a refusal was a failed
+                       search they should rephrase. -->
                   <app-answer-not-found [message]="message" />
-                }
-                @case ('out-of-scope') {
-                  <!-- Also not a failed search, and kept apart from the not-found
-                       card for a sharper reason: that one says the documents do
-                       not cover an in-scope question, this one says the question
-                       was never in scope. Drawing them alike would send somebody
-                       to HR over a general-knowledge question. -->
-                  <app-answer-out-of-scope [message]="message" />
                 }
                 @case ('restricted') {
                   <!-- A refusal, not a failed search: the card says so rather than
-                       claiming the documents do not cover the question. A greeting
-                       needs no card of its own and falls through to the answer one,
-                       because that is exactly what it is — an answer, just not one
-                       drawn from a document. -->
+                       claiming the documents do not cover the question. -->
                   <app-answer-restricted [message]="message" />
                 }
                 @case ('failed') {
@@ -114,6 +109,13 @@ const AT_BOTTOM_SLACK_PX = 24;
                   />
                 }
                 @default {
+                  <!-- answer, out_of_scope and conversational all draw as an
+                       ordinary reply, and that is the whole of what they have in
+                       common: none of them is built from a passage, so none of them
+                       has a citation list, a document count or a confidence figure
+                       to show. An out-of-scope reply and a greeting arrive with
+                       nothing but their words, and the words are what the reader
+                       needs. -->
                   <app-answer-card [message]="message" />
                 }
               }

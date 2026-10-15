@@ -17,33 +17,37 @@ import {
 } from '../models/api.model';
 import { Conversation, ConversationThread } from '../models/conversation.model';
 import {
-  AnswerStatus,
+  AnswerKind,
   Message,
   SourceReference,
   countDocuments,
-  toKnownAnswerStatus,
+  toKnownAnswerKind,
 } from '../models/message.model';
 import { AuthService, CSRF_HEADER } from './auth.service';
 
 /**
  * How a stored message should be rendered.
  *
- * The backend records the outcome on the row, so this is read rather than guessed,
- * and a conversation reopened tomorrow draws the same cards it did when it was
- * being answered.
+ * The backend records the kind on the row, so this is read rather than guessed,
+ * and a conversation reopened tomorrow draws the same thing it did when it was
+ * being answered. The legacy `status` is read next to it because rows stored
+ * before `kind` existed still carry only that, and drawing those as a gap in the
+ * corpus would be the exact mislabelling `kind` was added to stop.
  *
- * Two fallbacks, both about rows that predate the field. A question carries no
- * outcome at all and is never anything but answered, and an assistant row with no
- * recorded status and no citations is a miss — which is all the evidence such a row
- * has, and is why those older threads may draw a greeting as a not-found until they
- * are asked again.
+ * The last fallback is for rows predating both: a question carries no outcome at
+ * all and is never anything but an answer, and an assistant row with no recorded
+ * outcome and no citations is a miss — which is all the evidence such a row has.
  */
-function toAnswerStatus(dto: MessageDto): AnswerStatus {
+function toAnswerKind(dto: MessageDto): AnswerKind {
   if (dto.role === 'user') {
-    return 'answered';
+    return 'answer';
   }
 
-  return toKnownAnswerStatus(dto.status) ?? (dto.sources?.length ? 'answered' : 'not-found');
+  return (
+    toKnownAnswerKind(dto.kind) ??
+    toKnownAnswerKind(dto.status) ??
+    (dto.sources?.length ? 'answer' : 'not_found')
+  );
 }
 
 /** An error from the backend, already reduced to something a view can show. */
@@ -448,7 +452,7 @@ export class ApiService {
       role: dto.role,
       text: dto.content,
       createdAt: parseUtcTimestamp(dto.created_at),
-      status: toAnswerStatus(dto),
+      kind: toAnswerKind(dto),
       sources,
       documentCount: countDocuments(sources),
       confidence: dto.confidence ?? null,

@@ -15,11 +15,11 @@ import {
 import { SourceDto } from '../models/api.model';
 import { UNTITLED_CONVERSATION } from '../models/conversation.model';
 import {
-  AnswerStatus,
+  AnswerKind,
   MIN_MESSAGE_LENGTH,
   ResolvedAnswer,
   SourceReference,
-  toKnownAnswerStatus,
+  toKnownAnswerKind,
 } from '../models/message.model';
 import { ApiError, ApiService, STREAM_INCOMPLETE_MESSAGE } from './api.service';
 import { ConversationService } from './conversation.service';
@@ -28,12 +28,17 @@ import { IdentityService } from './identity.service';
 /**
  * What the closing event settled on.
  *
- * The backend's own `status` when it is one this app knows, and `answered` only as
- * the fallback for a deployment predating it — where `answered` is still the only
- * signal on the wire and un-answered has to mean the not-found card.
+ * The backend's own `kind` when it is one this app knows, then its legacy
+ * `status`, and only then `answered` — the fallback for a deployment predating
+ * both, where an un-answered reply has to mean a gap in the corpus because it is
+ * the only signal there is.
  */
-function toAnswerStatus(event: { status: string; answered: boolean }): AnswerStatus {
-  return toKnownAnswerStatus(event.status) ?? (event.answered ? 'answered' : 'not-found');
+function toAnswerKind(event: { kind: string; status: string; answered: boolean }): AnswerKind {
+  return (
+    toKnownAnswerKind(event.kind) ??
+    toKnownAnswerKind(event.status) ??
+    (event.answered ? 'answer' : 'not_found')
+  );
 }
 
 /**
@@ -411,7 +416,7 @@ export class ChatService {
           // point is then not the answer at all.
           return {
             text: event.answer,
-            status: toAnswerStatus(event),
+            kind: toAnswerKind(event),
             sources: event.sources.map((dto) => this.toSource(dto)),
             confidence: event.confidence ?? null,
           };
