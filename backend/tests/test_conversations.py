@@ -36,6 +36,8 @@ from app import main
 from app.config import settings
 from app.database import Base, Conversation, Message, User
 from app.dependencies import ACCESS_COOKIE, CSRF_COOKIE
+from app.rag.engine import LEGACY_STATUS
+from app.rag.guard import Category, Classification
 from app.security import create_access_token, hash_password, new_csrf_token
 
 SOURCE = {
@@ -49,15 +51,35 @@ CLIENT_A = "1111-aaaa-1111-aaaa-1111"
 
 
 class StubAssistant:
-    """Answers without a model, streaming the answer in two pieces."""
+    """Answers without a model, streaming the answer in two pieces.
+
+    The route classifies the message itself and passes the result in, so the stub
+    answers that as well. Everything it is asked is treated as a company question,
+    which is what makes a conversation worth naming; the tests that need another
+    category script their own.
+    """
+
+    def classify(self, question: str, history=None) -> Classification:
+        return Classification(Category.COMPANY_QUESTION, question)
 
     def ask_stream(
-        self, question: str, history: list[tuple[str, str]] | None = None
+        self,
+        question: str,
+        history: list[tuple[str, str]] | None = None,
+        classification: Classification | None = None,
     ) -> Iterator[dict]:
         yield {"type": "status", "stage": "writing"}
         yield {"type": "delta", "text": "Answer "}
         yield {"type": "delta", "text": f"to {question}"}
-        yield {"type": "done", "answer": f"Answer to {question}", "answered": True, "sources": [SOURCE]}
+        yield {
+            "type": "done",
+            "answer": f"Answer to {question}",
+            "answered": True,
+            "kind": "answer",
+            "status": "answered",
+            "confidence": 7,
+            "sources": [SOURCE],
+        }
 
     def generate_title(self, first_message: str) -> str:
         words = " ".join(first_message.split())[:20]
@@ -230,7 +252,7 @@ class OneConversationPerThreadTest(ConversationTestCase):
         conversation_id = self.new_conversation()
 
         class BrokenAssistant(StubAssistant):
-            def ask_stream(self, question, history=()):
+            def ask_stream(self, question, history=(), classification=None):
                 yield {"type": "delta", "text": "Half an ans"}
                 raise RuntimeError("connection dropped")
 
@@ -509,7 +531,128 @@ class ConversationLifecycleTest(ConversationTestCase):
         self.assertEqual(self.messages_in_db(conversation_id), [])
 
 
+class KindPersistenceTest(ConversationTestCase):
+    """Every reply records the kind it was, so a reload draws it the same way."""
+
+    def answering(self, kind: str, answer: str) -> StubAssistant:
+        class KindlyAssistant(StubAssistant):
+            def ask_stream(self, question, history=None, classification=None):
+                yield {"type": "status", "stage": "writing"}
+                yield {"type": "delta", "text": answer}
+                yield {
+                    "type": "done",
+                    "answer": answer,
+                    "answered": kind == "answer",
+                    "kind": kind,
+                    "status": LEGACY_STATUS[kind],
+                    "confidence": 6 if kind == "answer" else None,
+                    "sources": [SOURCE] if kind == "answer" else [],
+                }
+
+        main.state["assistant"] = KindlyAssistant()
+        return main.state["assistant"]
+
+    def test_each_kind_is_stored_and_returned(self):
+        # Every kind of reply cites nothing except an answer, so without the kind a
+        # reloaded thread cannot tell a conversational turn from a gap in the
+        # corpus: both are a message with no sources on it.
+        for kind, answer in [
+            ("conversational", "You're right, no question yet."),
+            ("out_of_scope", "That isn't something I can help with."),
+            ("not_found", "I couldn't find that in the company documents."),
+            ("restricted", "I can't share personal records."),
+            ("answer", "Full-time staff get 25 days."),
+        ]:
+            with self.subTest(kind=kind):
+                self.answering(kind, answer)
+                conversation_id = self.new_conversation()
+                self.ask(conversation_id, "How much leave do I have?")
+
+                stored = self.messages_in_db(conversation_id)[-1]
+                self.assertEqual(stored.kind, kind)
+
+                detail = self.client.get(
+                    f"/api/conversations/{conversation_id}",
+                    params={"client_id": CLIENT_A},
+                ).json()
+                assistant_message = detail["messages"][-1]
+
+                self.assertEqual(assistant_message["kind"], kind)
+                self.assertEqual(assistant_message["content"], answer)
+                # The legacy vocabulary is still there for a client that has not been
+                # redeployed, and it is not the same word as the kind.
+                self.assertEqual(assistant_message["status"], LEGACY_STATUS[kind])
+
+
 class TitleGenerationTest(ConversationTestCase):
+    def test_a_greeting_does_not_name_the_conversation(self):
+        # Naming a thread "Hey" is how the sidebar fills with conversations that
+        # have no subject in them. The title waits for the first real question.
+        class GreetingFirstAssistant(StubAssistant):
+            def classify(self, question: str, history=None) -> Classification:
+                category = (
+                    Category.CONVERSATIONAL
+                    if question.strip().lower() in {"hey", "hi", "there is no question"}
+                    else Category.COMPANY_QUESTION
+                )
+                return Classification(category, question)
+
+        main.state["assistant"] = GreetingFirstAssistant()
+
+        conversation_id = self.new_conversation()
+
+        greeting = read_events(self.ask(conversation_id, "Hey").text)
+        remark = read_events(self.ask(conversation_id, "there is no question").text)
+
+        self.assertNotIn("title", [event["type"] for event in greeting])
+        self.assertNotIn("title", [event["type"] for event in remark])
+        detail = self.client.get(
+            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_A}
+        ).json()
+        self.assertIsNone(detail["title"])
+
+        # And the first real question names it, from that question rather than from
+        # the greeting that opened the thread.
+        asked = read_events(
+            self.ask(conversation_id, "How much annual leave do I get?").text
+        )
+        self.assertEqual(asked[-1]["type"], "title")
+        # From the question, not from either of the messages before it.
+        self.assertIn("annual", asked[-1]["title"].lower())
+        self.assertNotIn("hey", asked[-1]["title"].lower())
+        self.assertNotIn("question", asked[-1]["title"].lower())
+
+        detail = self.client.get(
+            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_A}
+        ).json()
+        self.assertEqual(detail["title"], asked[-1]["title"])
+
+    def test_a_question_the_documents_do_not_cover_still_names_the_conversation(self):
+        # The question is what names a thread, not whether it could be answered:
+        # an in-scope question with no coverage is still the subject of the
+        # conversation, and leaving it "New conversation" would hide that.
+        class NotFoundAssistant(StubAssistant):
+            def ask_stream(self, question, history=None, classification=None):
+                yield {"type": "status", "stage": "writing"}
+                yield {"type": "delta", "text": "I couldn't find that."}
+                yield {
+                    "type": "done",
+                    "answer": "I couldn't find that.",
+                    "answered": False,
+                    "kind": "not_found",
+                    "status": "not-found",
+                    "confidence": None,
+                    "sources": [],
+                }
+
+        main.state["assistant"] = NotFoundAssistant()
+        conversation_id = self.new_conversation()
+
+        events = read_events(self.ask(conversation_id, "What is the dental policy?").text)
+
+        self.assertEqual(events[-1]["type"], "title")
+        self.assertIn("dental", events[-1]["title"].lower())
+
     def test_the_first_exchange_names_the_conversation(self):
         conversation_id = self.new_conversation()
 
@@ -696,9 +839,9 @@ class RecentTurnsTest(ConversationTestCase):
         def __init__(self) -> None:
             self.seen: list = []
 
-        def ask_stream(self, question: str, history=None):
+        def ask_stream(self, question: str, history=None, classification=None):
             self.seen.append(list(history or []))
-            yield from StubAssistant.ask_stream(self, question, history)
+            yield from StubAssistant.ask_stream(self, question, history, classification)
 
     def setUp(self) -> None:
         super().setUp()
