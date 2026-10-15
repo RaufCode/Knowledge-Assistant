@@ -1,19 +1,25 @@
 import logging
 import time
 from collections.abc import Iterator, Sequence
+from enum import Enum
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import MetadataMode
 from openai import APIConnectionError, APIStatusError, OpenAI, OpenAIError
 
 from app.config import settings
+from app.rag.capabilities import (
+    CAPABILITIES_BRIEF,
+    CAPABILITIES_REPLY,
+    CONVERSATIONAL_FALLBACK,
+)
 from app.rag.guard import (
     CLASSIFIER_SYSTEM_PROMPT,
     Category,
     Classification,
+    asks_about_capabilities,
     build_classifier_prompt,
-    is_greeting,
-    is_personal_question,
+    classify_by_rules,
     parse_classification,
 )
 from app.rag.retrieval import (
@@ -24,6 +30,41 @@ from app.rag.retrieval import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ResponseKind(str, Enum):
+    """What kind of reply this is, which is what decides how it is drawn.
+
+    On every response and on the stream's closing event, and stored on the
+    assistant's message so a reloaded conversation draws the same thing it drew
+    live.
+
+    The point of naming these is that "not answered" is not one thing. `not_found`
+    is the only one of them that is a statement about the corpus, and therefore the
+    only one that may be dressed as "not found in company documents" with a route
+    to HR attached: an out-of-scope reply and a refusal say something else
+    entirely, and drawing either of them as a failed search tells the reader the
+    documents have a gap where the truth is that the question was never theirs or
+    was never answered on purpose.
+    """
+
+    ANSWER = "answer"
+    NOT_FOUND = "not_found"
+    OUT_OF_SCOPE = "out_of_scope"
+    CONVERSATIONAL = "conversational"
+    RESTRICTED = "restricted"
+
+
+# The vocabulary the wire used before `kind` existed, kept so a client that has
+# not been redeployed still draws these replies recognisably. `kind` is what
+# everything current reads.
+LEGACY_STATUS: dict[ResponseKind, str] = {
+    ResponseKind.ANSWER: "answered",
+    ResponseKind.NOT_FOUND: "not-found",
+    ResponseKind.OUT_OF_SCOPE: "out-of-scope",
+    ResponseKind.CONVERSATIONAL: "greeting",
+    ResponseKind.RESTRICTED: "restricted",
+}
 
 # In scope, and the documents genuinely do not cover it. Named HR because a
 # missing policy is a gap in what the corpus holds, and HR owns the corpus.
@@ -125,30 +166,37 @@ TITLE_MAX_CHARS = 50
 # no content at all, so every title silently fell back to truncation.
 TITLE_MAX_TOKENS = 256
 
-# Output budget for a greeting. Generous for two sentences, because the
-# configured model is a reasoning model that spends tokens thinking before it
+# Output budget for a conversational reply. Generous for three sentences, because
+# the configured model is a reasoning model that spends tokens thinking before it
 # writes anything: a budget of a few dozen was consumed by the thinking and the
 # call came back with no content at all.
-GREETING_MAX_TOKENS = 256
+CONVERSATIONAL_MAX_TOKENS = 256
 
-# How a greeting is answered when the model itself cannot be reached. Static
-# rather than absent: an outage should not turn "hello" into a lecture about
-# the corpus.
-GREETING_FALLBACK = (
-    "Hello! I'm the Internal Knowledge Assistant for Acme Technologies. "
-    "I answer questions from our company policies — ask me about leave, "
-    "working hours, benefits, IT setup, or conduct."
-)
+# A conversational message gets no retrieval and no policy context: there is
+# nothing to look up, and handing the policies over would only invite quoting them
+# at small talk. What it does get is the recent conversation, because the whole
+# content of a reply like "You're right, no question yet" is what was said in it.
+CONVERSATIONAL_USER_PROMPT = """Conversation so far:
+{conversation}
 
-# A greeting gets no retrieval and no policy context: there is nothing to look
-# up, and handing the policies over would only invite quoting them at small
-# talk. The model is told to be brief and to point at what it is for.
-GREETING_SYSTEM_PROMPT = (
-    "You are the Internal Knowledge Assistant for Acme Technologies, greeting "
-    "somebody who just said hello. Reply warmly in one or two short sentences: "
-    "greet them back, say you answer questions from the company policies, and "
-    "invite one. Name no policy and quote no document."
-)
+Message: {message}"""
+
+CONVERSATIONAL_SYSTEM_PROMPT = f"""{CAPABILITIES_BRIEF}
+
+The last message above is not a request for information: it is small talk, an
+acknowledgement, a remark or correction about the exchange itself, or a question
+about you. Reply to it in one to three short sentences, warm and direct, the way a
+colleague would. Acknowledge what they actually said — "you're right, no question
+yet", "sorry about that, tell me again" — rather than deflecting, and do not
+repeat an introduction you have already given.
+
+Hard limits:
+- Never state a company fact, policy, figure or process. You have no documents in
+  front of you on this path, so anything specific would be invention.
+- Never say that something is not in the documents, and never mention documents,
+  retrieval, indexing or searching at all.
+- Never promise anything beyond the abilities described above.
+- No lists, no headings, no markdown, no emoji."""
 
 
 def truncate_title(text: str, max_chars: int = TITLE_MAX_CHARS) -> str:
@@ -272,7 +320,10 @@ class Assistant:
         raise LlmUnavailable(reason)
 
     def _stream(
-        self, user_prompt: str, system_prompt: str = SYSTEM_PROMPT
+        self,
+        user_prompt: str,
+        system_prompt: str = SYSTEM_PROMPT,
+        max_tokens: int | None = None,
     ) -> Iterator[str]:
         """Yield answer text as NVIDIA produces it, with the same retry policy.
 
@@ -280,6 +331,10 @@ class Assistant:
         so the whole iteration is inside the attempt. The model is a reasoning
         model: it emits `reasoning_content` before any answer, and those deltas are
         skipped so only the answer itself reaches the browser.
+
+        `max_tokens` is the caller's own budget for the shorter replies, which are
+        not the answer's business: a three-sentence acknowledgement given an
+        answer's budget is an invitation to fill it.
         """
         if self._client is None:
             raise LlmUnavailable("NVIDIA_API_KEY is unset")
@@ -297,7 +352,7 @@ class Assistant:
                     ],
                     temperature=settings.llm_temperature,
                     top_p=settings.llm_top_p,
-                    max_tokens=settings.llm_max_tokens,
+                    max_tokens=max_tokens or settings.llm_max_tokens,
                     stream=True,
                 )
                 for chunk in stream:
@@ -358,101 +413,113 @@ class Assistant:
         )
         time.sleep(delay)
 
-    def generate_title(self, first_message: str) -> str:
-        """A short label for a conversation, from its first user message.
+    def generate_title(self, first_question: str) -> str:
+        """A short label for a conversation, from the first real question in it.
 
-        The model names the thread once, right after its first exchange, so a
-        new conversation appears on the sidebar as something to read rather than
-        as "New conversation". The reply is a title but can still carry quotes
-        or run long, so it is always cleaned and bounded; if the model is
-        unavailable, the message itself is truncated to the same length.
+        The model names the thread once, right after that exchange, so a new
+        conversation appears on the sidebar as something to read rather than as
+        "New conversation". The caller decides which message is worth naming —
+        a greeting is not, and a sidebar of conversations called "Hey" is worse
+        than a sidebar of untitled ones.
+
+        The reply is a title but can still carry quotes or run long, so it is
+        always cleaned and bounded; if the model is unavailable, the question
+        itself is truncated to the same length.
         """
         try:
             raw = self._complete(
-                first_message,
+                first_question,
                 system_prompt=TITLE_SYSTEM_PROMPT,
                 max_tokens=TITLE_MAX_TOKENS,
             )
         except LlmUnavailable as exc:
             logger.warning("title generation skipped, truncating instead: %s", exc.reason)
-            return truncate_title(first_message)
+            return truncate_title(first_question)
 
         cleaned = raw.strip().strip('"').strip("'").rstrip(".")
         return truncate_title(cleaned)
 
     def ask_stream(
-        self, question: str, history: Sequence[tuple[str, str]] = ()
+        self,
+        question: str,
+        history: Sequence[tuple[str, str]] = (),
+        classification: Classification | None = None,
     ) -> Iterator[dict]:
         """Answer as a sequence of events, so the caller can render it as it lands.
 
         Emits a `status` saying the answer is being worked on, one `delta` per
-        piece of answer text, and exactly one `done` carrying the final answer.
+        piece of answer text, and exactly one `done` carrying the final answer and
+        the `kind` of reply it is. Every kind streams the same way: the difference
+        between an answer and a reply that cites nothing is drawn by the client,
+        not by a different shape of stream.
 
         The citations ride only on that closing `done` event, never on an event
         of their own part way through. A client that draws citations while the
         answer is still being written is asserting the sources before it has the
         text they are supposed to support, and `done` can still replace the answer
-        with `NOT_FOUND` or `PERSONAL`, which cite nothing at all. So `done` is the
-        authority on everything: it decides what the answer was and which sources
-        belong to it, and a client renders the citation block only once it arrives.
+        with a refusal or a `NOT_FOUND`, which cite nothing at all. So `done` is
+        the authority on everything: it decides what the answer was, which kind of
+        reply it is, and which sources belong to it.
 
         `history` is the recent turns as `(role, text)` pairs, oldest first and
         excluding the message being answered. It is what lets a follow-up be
-        recognised as one, and what a follow-up's answer is written against.
-        """
-        classification = self.classify(question, history)
+        recognised as one, what a follow-up's answer is written against, and what
+        a conversational reply acknowledges.
 
-        # Small talk and out-of-scope are answered before anything is retrieved.
-        # Both are cases where the documents cannot help: there is nothing to look
-        # up in the first case, and in the second there is no answer to be found
-        # however many chunks are read. Retrieving first and filtering afterwards
-        # was how an off-topic question used to come back as "not found in the
-        # company documents", which claims a gap in the corpus that is not there.
-        if classification.category is Category.GREETING:
+        `classification` is the caller's decision, when it has already made one:
+        naming a conversation is the same problem as answering the message, and
+        both are decided by the same call, so the route passes its result in
+        rather than paying for a second classification.
+        """
+        classification = classification or self.classify(question, history)
+
+        # Small talk, out-of-scope requests and refusals are all answered before
+        # anything is retrieved. They are cases where the documents cannot help:
+        # there is nothing to look up in the first, no answer to be found in the
+        # second however many chunks are read, and the third is not an answer at
+        # all. Retrieving first and filtering afterwards was how an off-topic
+        # question came back as "not found in the company documents", which claims
+        # a gap in the corpus that is not there.
+        if classification.category is Category.CONVERSATIONAL:
             yield {"type": "status", "stage": "writing"}
-            answer = self.greet(question)
-            yield {"type": "delta", "text": answer}
+            pieces: list[str] = []
+            for piece in self.conversational_pieces(question, history):
+                pieces.append(piece)
+                yield {"type": "delta", "text": piece}
             yield {
                 "type": "done",
-                "answer": answer,
-                "answered": True,
-                "status": "greeting",
-                "sources": [],
+                **_result(
+                    _finish_conversational(pieces), ResponseKind.CONVERSATIONAL
+                ),
             }
             return
 
         if classification.category is Category.OUT_OF_SCOPE:
+            yield {"type": "status", "stage": "writing"}
+            yield {"type": "delta", "text": OUT_OF_SCOPE_MSG}
             yield {
                 "type": "done",
-                "answer": OUT_OF_SCOPE_MSG,
-                "answered": False,
-                "status": "out-of-scope",
-                "sources": [],
-                "confidence": None,
+                **_result(OUT_OF_SCOPE_MSG, ResponseKind.OUT_OF_SCOPE),
             }
             return
 
-        if classification.category is Category.PERSONAL:
+        if classification.category is Category.RESTRICTED:
+            yield {"type": "status", "stage": "writing"}
+            yield {"type": "delta", "text": PERSONAL_MSG}
             yield {
                 "type": "done",
-                "answer": PERSONAL_MSG,
-                "answered": False,
-                "status": "restricted",
-                "sources": [],
-                "confidence": None,
+                **_result(PERSONAL_MSG, ResponseKind.RESTRICTED),
             }
             return
 
         candidates = self._retrieve(classification.query)
 
+        # From here on the message is a genuine in-scope question, so this is the
+        # one path that may report a gap in the corpus.
         if not candidates:
             yield {
                 "type": "done",
-                "answer": FALLBACK_MSG,
-                "answered": False,
-                "status": "not-found",
-                "sources": [],
-                "confidence": None,
+                **_result(FALLBACK_MSG, ResponseKind.NOT_FOUND),
             }
             return
 
@@ -483,72 +550,43 @@ class Assistant:
         if "PERSONAL" == text:
             yield {
                 "type": "done",
-                "answer": PERSONAL_MSG,
-                "answered": False,
-                "status": "restricted",
-                "sources": [],
-                "confidence": None,
+                **_result(PERSONAL_MSG, ResponseKind.RESTRICTED),
             }
         elif "NOT_FOUND" in text:
             yield {
                 "type": "done",
-                "answer": FALLBACK_MSG,
-                "answered": False,
-                "status": "not-found",
-                "sources": [],
-                "confidence": None,
+                **_result(FALLBACK_MSG, ResponseKind.NOT_FOUND),
             }
         else:
             yield {
                 "type": "done",
-                "answer": text,
-                "answered": True,
-                "sources": sources,
-                "confidence": confidence,
+                **_result(text, ResponseKind.ANSWER, sources, confidence),
             }
 
-    def ask(self, question: str, history: Sequence[tuple[str, str]] = ()) -> dict:
+    def ask(
+        self,
+        question: str,
+        history: Sequence[tuple[str, str]] = (),
+        classification: Classification | None = None,
+    ) -> dict:
         """The same answer as `ask_stream`, in one piece rather than as events."""
-        classification = self.classify(question, history)
+        classification = classification or self.classify(question, history)
 
-        if classification.category is Category.GREETING:
-            answer = self.greet(question)
-            return {
-                "answer": answer,
-                "answered": True,
-                "status": "greeting",
-                "sources": [],
-                "confidence": None,
-            }
+        if classification.category is Category.CONVERSATIONAL:
+            return _result(
+                self.conversational_reply(question, history), ResponseKind.CONVERSATIONAL
+            )
 
         if classification.category is Category.OUT_OF_SCOPE:
-            return {
-                "answer": OUT_OF_SCOPE_MSG,
-                "answered": False,
-                "status": "out-of-scope",
-                "sources": [],
-                "confidence": None,
-            }
+            return _result(OUT_OF_SCOPE_MSG, ResponseKind.OUT_OF_SCOPE)
 
-        if classification.category is Category.PERSONAL:
-            return {
-                "answer": PERSONAL_MSG,
-                "answered": False,
-                "status": "restricted",
-                "sources": [],
-                "confidence": None,
-            }
+        if classification.category is Category.RESTRICTED:
+            return _result(PERSONAL_MSG, ResponseKind.RESTRICTED)
 
         candidates = self._retrieve(classification.query)
 
         if not candidates:
-            return {
-                "answer": FALLBACK_MSG,
-                "answered": False,
-                "status": "not-found",
-                "sources": [],
-                "confidence": None,
-            }
+            return _result(FALLBACK_MSG, ResponseKind.NOT_FOUND)
 
         confidence = retrieval_confidence(candidates)
         user_prompt, system_prompt = _generation_prompt(
@@ -558,53 +596,41 @@ class Assistant:
         logger.info("answered %r via %s", question, settings.llm_model)
 
         if "PERSONAL" == text:
-            return {
-                "answer": PERSONAL_MSG,
-                "answered": False,
-                "status": "restricted",
-                "sources": [],
-                "confidence": None,
-            }
+            return _result(PERSONAL_MSG, ResponseKind.RESTRICTED)
         if "NOT_FOUND" in text:
-            return {
-                "answer": FALLBACK_MSG,
-                "answered": False,
-                "status": "not-found",
-                "sources": [],
-                "confidence": None,
-            }
+            return _result(FALLBACK_MSG, ResponseKind.NOT_FOUND)
 
-        return {
-            "answer": text,
-            "answered": True,
-            "sources": [_source(candidate) for candidate in candidates],
-            "confidence": confidence,
-        }
+        return _result(
+            text,
+            ResponseKind.ANSWER,
+            [_source(candidate) for candidate in candidates],
+            confidence,
+        )
 
     def classify(
         self, question: str, history: Sequence[tuple[str, str]] = ()
     ) -> Classification:
         """What this message is, decided before anything is retrieved.
 
-        Greeting and personal-record questions are matched by pattern, with no
-        model call: both are exact-match judgements that a model could only make
+        Obvious small talk and personal-record questions are matched by pattern,
+        with no model call: both are exact-match judgements a model could only make
         less reliably, and a greeting must not stop working when the model does.
-        Everything else goes to the model with the recent turns attached, because
-        a follow-up cannot be recognised from its own words and an out-of-scope
-        question can be worded in too many ways to list.
+        Everything else goes to the model with the recent turns attached, because a
+        remark about the conversation cannot be told from a question by pattern, a
+        follow-up cannot be recognised from its own words, and an out-of-scope
+        request can be worded in too many ways to list.
 
         A model that cannot be reached is treated as saying nothing useful, which
-        `parse_classification` reads as `QUESTION`: the ordinary retrieval path
-        decides, exactly as it did before classification existed. The alternative
-        — treating an outage as out-of-scope — would have every question answered
-        with "that isn't something I can help with" for as long as the outage
-        lasted.
+        `parse_classification` reads as `COMPANY_QUESTION`: the ordinary retrieval
+        path decides, exactly as it did before classification existed. The
+        alternative — treating an outage as out-of-scope — would have every
+        question answered with "that isn't something I can help with" for as long
+        as the outage lasted.
         """
-        if is_greeting(question):
-            return Classification(Category.GREETING, question)
+        by_rule = classify_by_rules(question)
 
-        if is_personal_question(question):
-            return Classification(Category.PERSONAL, question)
+        if by_rule is not None:
+            return Classification(by_rule, question)
 
         try:
             reply = self._complete(
@@ -614,7 +640,7 @@ class Assistant:
             )
         except LlmUnavailable as exc:
             logger.warning("classification skipped, treating as a question: %s", exc.reason)
-            return Classification(Category.QUESTION, question)
+            return Classification(Category.COMPANY_QUESTION, question)
 
         classification = parse_classification(reply, question)
         logger.info(
@@ -637,25 +663,46 @@ class Assistant:
 
         return classification
 
-    def greet(self, question: str) -> str:
-        """A polite reply to small talk, from the model and nothing else.
+    def conversational_pieces(
+        self, message: str, history: Sequence[tuple[str, str]] = ()
+    ) -> Iterator[str]:
+        """The reply to a message that is not a request for information.
 
-        No retrieval and no policy context: there is nothing to ground it in,
-        and the model is told to keep it to a greeting. Falls back to a static
-        reply when the model cannot be reached, so an outage does not turn
-        "hello" into an error.
+        Nothing is retrieved and no policy context is handed over: there is nothing
+        to ground a reply in, and giving the model the documents here would only
+        invite quoting them at small talk. What it does get is the conversation, so
+        "you're right, no question yet" is a reply to what was actually said rather
+        than an introduction the reader has already read.
+
+        Streamed like any other answer, so the exchange feels the same as one being
+        answered from a document.
+
+        A question about what this assistant is, and what it covers, is answered
+        from `app/rag/capabilities.py` rather than generated at all. That is the
+        one reply in the system where an improvised answer is a promise: a model
+        asked what it can do will describe whatever would read best, including
+        abilities this deployment does not have.
         """
+        if asks_about_capabilities(message):
+            yield CAPABILITIES_REPLY
+            return
+
         try:
-            raw = self._complete(
-                question,
-                system_prompt=GREETING_SYSTEM_PROMPT,
-                max_tokens=GREETING_MAX_TOKENS,
+            yield from self._stream(
+                _conversational_prompt(message, history),
+                system_prompt=CONVERSATIONAL_SYSTEM_PROMPT,
+                max_tokens=CONVERSATIONAL_MAX_TOKENS,
             )
         except LlmUnavailable as exc:
-            logger.warning("greeting answered statically: %s", exc.reason)
-            return GREETING_FALLBACK
+            # Anything already emitted is kept: it is the best half of a reply that
+            # exists, and `_finish_conversational` decides what is usable.
+            logger.warning("conversational reply interrupted: %s", exc.reason)
 
-        return raw.strip() or GREETING_FALLBACK
+    def conversational_reply(
+        self, message: str, history: Sequence[tuple[str, str]] = ()
+    ) -> str:
+        """`conversational_pieces` as one piece of text, for the unstreamed path."""
+        return _finish_conversational(list(self.conversational_pieces(message, history)))
 
     def _retrieve(self, query: str) -> list[Candidate]:
         """The chunks worth answering from, or none at all.
@@ -697,6 +744,78 @@ def _source(candidate: Candidate) -> dict:
     }
 
 
+def _result(
+    answer: str,
+    kind: ResponseKind,
+    sources: Sequence[dict] | None = None,
+    confidence: int | None = None,
+) -> dict:
+    """One reply, as the API reports it.
+
+    `kind` is what the response is; `answered` and `status` are what it used to be
+    reported as, kept so a client that predates `kind` still draws something
+    recognisable. `answered` is now exactly "a grounded answer", which is the
+    narrower and truer meaning of the word: an out-of-scope reply, a refusal and a
+    gap in the corpus all cite nothing, and only the first of them ever was an
+    answer.
+
+    Sources and a confidence figure ride only on an answer. They are evidence, and
+    there is no evidence behind any of the other kinds — reporting a figure on a
+    refusal would imply the refusal was measured against something.
+    """
+    return {
+        "answer": answer,
+        "kind": kind.value,
+        "answered": kind is ResponseKind.ANSWER,
+        "status": LEGACY_STATUS[kind],
+        "sources": list(sources) if sources else [],
+        "confidence": confidence if kind is ResponseKind.ANSWER else None,
+    }
+
+
+def _finish_conversational(pieces: Sequence[str]) -> str:
+    """The reply a conversational stream settles on.
+
+    A stream that broke part way through leaves a fragment, and a fragment that
+    stops mid-sentence is worse than a whole shorter sentence: the reader is left
+    with a truncated thought that looks like the assistant trailing off. So the
+    fragment is cut back to its last complete sentence, and when there is not one —
+    an outage before the first full stop, most often — the static reply stands in.
+
+    The client's `done` event carries this, and `done` replaces whatever the
+    deltas wrote, so trimming here is what the reader ends up with.
+    """
+    text = " ".join("".join(pieces).split())
+
+    if text and text[-1] in ".!?…":
+        return text
+
+    cut = max(text.rfind(mark) for mark in ".!?…") if text else -1
+
+    return text[: cut + 1] if cut > 0 else CONVERSATIONAL_FALLBACK
+
+
+def _conversation(history: Sequence[tuple[str, str]], per_turn_chars: int) -> str:
+    """The recent turns as a conversation, oldest first, each one bounded."""
+    return "\n".join(
+        f"{'Employee' if role == 'user' else 'Assistant'}: {' '.join(text.split())[:per_turn_chars]}"
+        for role, text in history
+    )
+
+
+def _conversational_prompt(message: str, history: Sequence[tuple[str, str]]) -> str:
+    """What the responder is given: the exchange so far, and the message itself.
+
+    The exchange is the whole point of this path. A reply to "there is no question"
+    is only right if the model can see that it is the second turn and that the first
+    was a greeting, and a reply to "that's not what I asked" is only right if it can
+    see the question that was ignored.
+    """
+    turns = _conversation(history, 600) or "(this is the first message)"
+
+    return CONVERSATIONAL_USER_PROMPT.format(conversation=turns, message=message)
+
+
 def _generation_prompt(
     classification: Classification,
     candidates: Sequence[Candidate],
@@ -717,14 +836,9 @@ def _generation_prompt(
     if classification.category is not Category.FOLLOW_UP:
         return USER_PROMPT.format(context=context, question=classification.query), SYSTEM_PROMPT
 
-    conversation = "\n".join(
-        f"{'Employee' if role == 'user' else 'Assistant'}: {' '.join(text.split())[:600]}"
-        for role, text in history
-    )
-
     return (
         FOLLOW_UP_USER_PROMPT.format(
-            conversation=conversation,
+            conversation=_conversation(history, 600),
             context=context,
             question=classification.query,
         ),
