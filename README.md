@@ -38,7 +38,7 @@ backend/
 │   └── rag/
 │       ├── __init__.py
 │       ├── engine.py      # RAG assistant (classify + retrieve + generate)
-│       ├── guard.py       # Message classification (conversational / question / follow-up / out of scope / restricted)
+│       ├── guard.py       # Classification and the confidentiality guard (conversational / question / follow-up / expansion / out of scope / restricted)
 │       ├── capabilities.py # What the assistant is and covers, for questions about itself
 │       ├── ingest.py      # Document loading & indexing
 │       └── retrieval.py   # Hybrid retrieval: vector + keyword, merged with RRF
@@ -54,6 +54,8 @@ backend/
 │   ├── test_conversations.py
 │   ├── test_engine_stream.py
 │   ├── test_conversational.py # Everything that is not a request, answered without retrieval
+│   ├── test_confidentiality.py # What the guard refuses, and what it must not
+│   ├── test_expansion.py       # Continuing an answer from the passages it used
 │   ├── test_hybrid_retrieval.py  # Both searches, and their fusion
 │   └── test_intent.py      # Which path a message takes before retrieval
 ├── Dockerfile
@@ -313,11 +315,12 @@ before it.
 | --- | --- | --- |
 | Conversational | "hey", "thanks", "ok", "there is no question", "who are you?" | A short reply that acknowledges what was said. No retrieval. |
 | Company question | "How many sick days do I get?" | Retrieved and answered from the documents, with citations. |
-| Follow-up | "anything else I should know?" | Rewritten into a standalone question first — *what else does the Code of Conduct document cover?* — then retrieved as above. |
+| Follow-up | "what about contractors?" | Rewritten into a standalone question first — *what does the Code of Conduct say about contractors?* — then retrieved as above. |
+| Expansion | "anything else?", "tell me more" | Continued from the passages the last answer cited, minus the ones it already showed. Never a gap in the corpus. |
 | Out of scope | "how many presidents has Ghana had?" | A statement of what the assistant is for. No retrieval. |
-| Restricted | "what is my salary?" | The confidentiality notice. No retrieval. |
+| Restricted | "what is Ama's salary?", "what is my salary?" | The confidentiality notice. No retrieval. |
 
-Three rules decide the awkward cases, and all three exist because the alternative
+Four rules decide the awkward cases, and all four exist because the alternative
 was a wrong answer rather than a missing one:
 
 - **Judge by intent, not punctuation.** No question mark does not mean there is no
@@ -329,6 +332,10 @@ was a wrong answer rather than a missing one:
 - **When it is unclear, it is conversational.** Being wrongly conversational costs
   the reader one more message. Being wrongly refused, or wrongly sent to the
   documents, makes the product look broken.
+- **A follow-up is not an expansion.** A follow-up brings a new subject and is
+  retrieved as one; an expansion brings none and is continued from where the last
+  answer stopped. "what about contractors?" is the first, "anything else?" the
+  second, and the difference is the subject rather than the politeness.
 
 Greetings, acknowledgements and questions about the assistant itself are decided by
 a rule check with no model call at all, so "ok" costs a reply rather than a reply
@@ -337,16 +344,77 @@ validated against a strict schema: an unreadable or unknown category falls back 
 *company question*, so a classifier quirk can never turn an answer the documents
 hold into a refusal.
 
-A follow-up is rewritten rather than retrieved as written because "anything else"
-matches nothing in any document, which is how a follow-up used to end as a
-false "not found in the company documents".
+### The confidentiality guard
+
+`RESTRICTED` is a request for private information about a specific individual —
+the asker's own records or a named, identified or described other person's — in
+any of these categories: salary, pay, bonus, payslip or any other figure about
+compensation; performance reviews, ratings or improvement plans; disciplinary,
+grievance or investigation records; health, the reason for leave, or personal and
+family circumstances; an individual's contact details where they are not an
+official company contact; termination or redundancy status.
+
+It is decided **before retrieval**, and that ordering is the fix rather than a
+detail. The refusal used to depend on the corpus holding something about the
+person, and it never does: the documents are policies, not payroll, so "what is
+Ama Konadu's salary?" found no chunks, was reported as a gap in the documents, and
+sent the reader to HR over a question HR would not answer either.
+
+It is enforced in two layers, and the order matters:
+
+1. **Rules first**, in one editable block at the top of `app/rag/guard.py`: the
+   asker's own records as before, plus third-party possessives, pronouns, roles,
+   named people receiving something, and passives about a person ("who is being
+   investigated"). No model call, and nothing the model can talk the guard out of.
+2. **The classifier as the backstop**, for the phrasings no pattern anticipates —
+   "how much does Kofi bank" is the same request as "what is Kwame's salary?" and
+   matches no pattern. Name patterns are bypassed by rephrasing, so a guard made
+   only of them is not a guard.
+
+The guard is applied **again to the standalone query after a follow-up is
+rewritten**, because "and his bonus?" is harmless-looking as a message and the
+rewrite is what retrieval would receive. A follow-up to a refused turn stays
+refused, however it is phrased.
+
+What it must **not** refuse is the other half, and that is where the risk sits: a
+previous bug refused a plain compensation paraphrase, so questions about how the
+rules work stay answerable, including the ones that contain the same nouns.
+"How is salary determined", "when is salary paid", "can I receive my salary before
+the due date", "what are the leave entitlements", "how do I request a salary
+review" and "what does the compensation policy cover" are all ordinary questions.
+A capitalised word in a document title — "the Code of Conduct", "the Security
+Policy" — is not a colleague, and an organisational possessive ("the company's
+salary policy") is not a person's.
+
+The notice is the same one for the asker's own records and a colleague's, and says
+what is not shared rather than whether any record exists: "there is no record of
+that" would answer the question the reader was refused.
+
+### Continuing an answer
+
+An expansion is never rewritten, because it names no subject, and a rewrite is
+what made it fail. It is continued from the **passages the previous answer cited**,
+with every chunk this thread has already shown removed, so the generator is handed
+what the reader has not seen yet. Chunk ids are derived from the passage itself and
+stored with the citation, so this survives a reload rather than working only in
+the tab that asked.
+
+When those passages are used up — and the corpus is chunked by section, so one
+answer can read all of them — the reply is `no_more_info`: *that covers everything
+the documents say on this topic*. Not `not_found`, which claims the corpus has a
+gap, and not a repeated search that finds the same passages again.
+
+A topic-shifting follow-up keeps the rewrite, and if the rewrite retrieves nothing
+the question it continues is tried in its place: a paraphrase is a worse handle on
+the corpus than the question the reader actually asked. Only when that finds
+nothing either is the turn a gap in the corpus.
 
 Only the retrieval path may report a gap in the corpus. That is the whole reason
 each response carries a `kind` rather than an "answered: false": *not found* means
 the documents do not cover an in-scope question, so HR can supply the missing
 policy, and every other reply that cites nothing means something else — out of
 scope was never something HR has an answer to, a conversational turn never asked,
-and a refusal was withheld on purpose.
+a refusal was withheld on purpose, and a topic was finished rather than missing.
 
 **Which chunks answer it?** Retrieval is hybrid (`app/rag/retrieval.py`). Vector
 similarity and BM25 keyword matching each return candidates, and the two ranked
@@ -567,15 +635,21 @@ draws each outcome as its own thing rather than inferring it from the citations:
 | --- | --- | --- |
 | `answer` | Answered from the documents. | Yes |
 | `not_found` | In scope, and the documents do not cover it. HR owns the gap. | No |
+| `no_more_info` | "Anything else?" on a topic those passages have already covered. Not a gap. | No |
 | `out_of_scope` | A real request that was never something this assistant answers. | No |
 | `conversational` | Not a request: a greeting, an acknowledgement, a remark, a question about the assistant. | No |
-| `restricted` | The asker's own records, which are not shared through here. | No |
+| `restricted` | A person's private records, the asker's or anybody else's. Not shared through here. | No |
 
 `not_found` is produced by exactly one path — retrieval and generation for a real
 in-scope question with no support in the documents — and it is the only kind that
 may be drawn as "not found in company documents" with a route to HR attached.
 Drawing any of the others that way is what made "there is no question" come back
 as a false gap in the corpus.
+
+Each citation carries a `chunk_id`: a hash of the document, section and text of
+the passage, stable across restarts of the index. It is how a continuation knows
+which passages it has already shown, and it is stored with the message rather than
+held in memory, so "anything else?" works the same after a reload.
 
 `done` also carries the older `status` and `answered` for a client that has not
 been redeployed, and every stored message carries both, so a thread written before
