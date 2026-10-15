@@ -38,7 +38,8 @@ backend/
 │   └── rag/
 │       ├── __init__.py
 │       ├── engine.py      # RAG assistant (classify + retrieve + generate)
-│       ├── guard.py       # Message classification (greeting / question / follow-up / out of scope)
+│       ├── guard.py       # Message classification (conversational / question / follow-up / out of scope / restricted)
+│       ├── capabilities.py # What the assistant is and covers, for questions about itself
 │       ├── ingest.py      # Document loading & indexing
 │       └── retrieval.py   # Hybrid retrieval: vector + keyword, merged with RRF
 ├── data/                  # Policy markdown documents (13 files)
@@ -52,7 +53,7 @@ backend/
 │   ├── test_auth.py        # Auth, at the level of the HTTP contract
 │   ├── test_conversations.py
 │   ├── test_engine_stream.py
-│   ├── test_greeting.py    # Greetings answered without retrieval
+│   ├── test_conversational.py # Everything that is not a request, answered without retrieval
 │   ├── test_hybrid_retrieval.py  # Both searches, and their fusion
 │   └── test_intent.py      # Which path a message takes before retrieval
 ├── Dockerfile
@@ -302,27 +303,50 @@ missing and `embedding_configured` for the retrieval key.
 Two decisions happen before anything is retrieved, and both of them exist because
 the alternative was an answer that was wrong rather than one that was missing.
 
-**Which of four things is this message?** The classifier (`app/rag/guard.py`) sees
-the message *and the last few turns of the conversation*, because a follow-up
-cannot be recognised from its own words — "and if I'm part time?" is a complete,
+**What kind of message is this?** The classifier (`app/rag/guard.py`) sees the
+message *and the last few turns of the conversation*, because a follow-up cannot
+be recognised from its own words — "and if I'm part time?" is a complete,
 in-scope, self-contained question that only means something because of what came
 before it.
 
 | Category | Example | What happens |
 | --- | --- | --- |
-| Greeting | "hello", "thanks" | A short introduction. No retrieval. |
-| Question | "How many sick days do I get?" | Retrieved and answered from the documents, with citations. |
+| Conversational | "hey", "thanks", "ok", "there is no question", "who are you?" | A short reply that acknowledges what was said. No retrieval. |
+| Company question | "How many sick days do I get?" | Retrieved and answered from the documents, with citations. |
 | Follow-up | "anything else I should know?" | Rewritten into a standalone question first — *what else does the Code of Conduct document cover?* — then retrieved as above. |
 | Out of scope | "how many presidents has Ghana had?" | A statement of what the assistant is for. No retrieval. |
+| Restricted | "what is my salary?" | The confidentiality notice. No retrieval. |
+
+Three rules decide the awkward cases, and all three exist because the alternative
+was a wrong answer rather than a missing one:
+
+- **Judge by intent, not punctuation.** No question mark does not mean there is no
+  question, and a question mark does not mean there is a company question.
+- **Out of scope requires a request.** "how many presidents has Ghana had?" asks
+  for something. "there is no question" asks for nothing, and forcing it into the
+  nearest category is what answered a remark about the chat with a refusal, and a
+  false gap in the corpus.
+- **When it is unclear, it is conversational.** Being wrongly conversational costs
+  the reader one more message. Being wrongly refused, or wrongly sent to the
+  documents, makes the product look broken.
+
+Greetings, acknowledgements and questions about the assistant itself are decided by
+a rule check with no model call at all, so "ok" costs a reply rather than a reply
+plus a classification. Everything else goes to the classifier, whose reply is
+validated against a strict schema: an unreadable or unknown category falls back to
+*company question*, so a classifier quirk can never turn an answer the documents
+hold into a refusal.
 
 A follow-up is rewritten rather than retrieved as written because "anything else"
 matches nothing in any document, which is how a follow-up used to end as a
 false "not found in the company documents".
 
-Out of scope and not-found say opposite things, and are kept apart deliberately:
-*not found* means the documents do not cover an in-scope question, so HR can
-supply the missing policy; *out of scope* means the question was never something
-HR has an answer to, so sending somebody there would be actively unhelpful.
+Only the retrieval path may report a gap in the corpus. That is the whole reason
+each response carries a `kind` rather than an "answered: false": *not found* means
+the documents do not cover an in-scope question, so HR can supply the missing
+policy, and every other reply that cites nothing means something else — out of
+scope was never something HR has an answer to, a conversational turn never asked,
+and a refusal was withheld on purpose.
 
 **Which chunks answer it?** Retrieval is hybrid (`app/rag/retrieval.py`). Vector
 similarity and BM25 keyword matching each return candidates, and the two ranked
@@ -533,22 +557,33 @@ JSON object per `data:` line:
 | `status` | The answer is being written, before any of it exists yet. |
 | `delta` | A piece of the answer text. Repeat until `done`. |
 | `done` | The complete answer and its citations. Sent exactly once, and it is the authoritative one. |
-| `title` | The conversation's name, after the first exchange only. |
+| `title` | The conversation's name, sent once the first *question* has been answered — not on a greeting. |
 | `error` | The answer could not be finished. Any partial text stays visible. |
 
-`done` carries a `status` naming what the turn turned out to be, so a client can
-draw each outcome as its own thing rather than inferring it:
+`done` carries a required `kind` naming what the turn turned out to be, so a client
+draws each outcome as its own thing rather than inferring it from the citations:
 
-| `status` | Meaning | Cites |
+| `kind` | Meaning | Cites |
 | --- | --- | --- |
-| *(absent)* | Answered from the documents. | Yes |
-| `not-found` | In scope, and the documents do not cover it. HR owns the gap. | No |
-| `out-of-scope` | Never something this assistant answers. Not a gap in the corpus. | No |
+| `answer` | Answered from the documents. | Yes |
+| `not_found` | In scope, and the documents do not cover it. HR owns the gap. | No |
+| `out_of_scope` | A real request that was never something this assistant answers. | No |
+| `conversational` | Not a request: a greeting, an acknowledgement, a remark, a question about the assistant. | No |
 | `restricted` | The asker's own records, which are not shared through here. | No |
-| `greeting` | Small talk, answered without retrieval. | No |
 
-The wire spells these in `kebab-case`, and a client should treat an unrecognised
-one as an ordinary answer rather than as a failure.
+`not_found` is produced by exactly one path — retrieval and generation for a real
+in-scope question with no support in the documents — and it is the only kind that
+may be drawn as "not found in company documents" with a route to HR attached.
+Drawing any of the others that way is what made "there is no question" come back
+as a false gap in the corpus.
+
+`done` also carries the older `status` and `answered` for a client that has not
+been redeployed, and every stored message carries both, so a thread written before
+the upgrade still renders as what it was. `answered` now means exactly "a grounded
+answer", which is the narrower and truer meaning of the word.
+
+A client should treat an unrecognised `kind` as an ordinary reply rather than as a
+failed search.
 
 `done` also carries `confidence`: how closely the retrieved passages matched the
 question, **1 to 10**, or `null`.
@@ -567,11 +602,11 @@ and it is the honest reading. `grievance` scores 1/10 because the chunk that
 answers it has a cosine of 0.149: the answer is right and the match is marginal,
 and the figure is about the second of those.
 
-`null` is returned for every turn built from no passages — a greeting, a refusal,
-an out-of-scope reply, or a question the corpus does not cover. Not `0`: there
-was nothing to match, which is a different thing from matching badly, and a low
-number beside an answer with no sources would read as a poor answer rather than as
-the absence of one.
+`null` is returned for every turn built from no passages — a conversational reply,
+a refusal, an out-of-scope reply, or a question the corpus does not cover. Not `0`:
+there was nothing to match, which is a different thing from matching badly, and a
+low number beside an answer with no sources would read as a poor answer rather than
+as the absence of one.
 
 ```
 data: {"type":"status","stage":"writing"}
@@ -594,6 +629,11 @@ The citations ride only on `done`, never on an event of their own part way
 through. `done` can still replace the answer with a refusal that cites nothing,
 so a client that drew sources before the text would be showing evidence for an
 answer that had not been given. Render the citation block when `done` arrives.
+
+A conversation is named from the first message that was a real question, not from
+the first message. A thread opened with "hey" stays "New conversation" until
+something is asked of it, because naming it from a greeting is how a sidebar fills
+with conversations called "Hey" that say nothing about what is in them.
 
 The turn is only written to history when the stream completes, so a request
 abandoned half way leaves no half-answer behind.
