@@ -167,17 +167,23 @@ describe('authInterceptor', () => {
       .expectOne(`${API_BASE_URL}/api/conversations?client_id=1`)
       .flush({ detail: 'expired' }, { status: 401, statusText: 'Unauthorized' });
 
-    // One refresh, and the rotated CSRF token with it.
+    // One refresh, and the rotated CSRF token with it. The cookie the refresh
+    // landed with is stored by the browser; the token the header needs is learned
+    // the way this app always learns it, from the echo endpoint.
     setCsrfCookie('token-after-refresh');
     http.expectOne(`${API_BASE_URL}/api/auth/refresh`).flush({
       user: { id: 'u1', name: 'Ama Konadu', email: 'ama@acmetech.example', role: 'employee' },
     });
+    // The refresh is a promise, so the token fetch it leads into is only on its
+    // way once it has resolved.
+    await settle();
+    http.expectOne(`${API_BASE_URL}/api/auth/csrf`).flush({ csrf_token: 'token-after-refresh' });
     await settle();
 
     // The original request, sent again.
     const replayed = http.expectOne(`${API_BASE_URL}/api/conversations?client_id=1`);
 
-    // The header has to be rebuilt from the cookie that arrived with the refresh. A
+    // The header has to be rebuilt from the token that arrived with the refresh. A
     // replay carrying the token the server has already replaced would be refused, so
     // the retry would fail for a reason that has nothing to do with the expiry.
     expect(replayed.request.headers.get('X-CSRF-Token')).toBe('token-after-refresh');
@@ -202,6 +208,10 @@ describe('authInterceptor', () => {
     http
       .expectOne(`${API_BASE_URL}/api/auth/refresh`)
       .flush({ user: { id: 'u1', name: 'Ama', email: 'a@acmetech.example', role: 'employee' } });
+    // The token that goes with the session the refresh just issued, learned the
+    // way this app always learns it.
+    await settle();
+    http.expectOne(`${API_BASE_URL}/api/auth/csrf`).flush({ csrf_token: 'a-token' });
     await settle();
 
     // The replay is refused too, and this is the case the guard against a refresh

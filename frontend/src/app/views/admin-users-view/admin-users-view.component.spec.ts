@@ -100,19 +100,27 @@ describe('AdminUsersViewComponent', () => {
 
       expect(request.request.method).toBe('PATCH');
       expect(request.request.body).toEqual({ role: 'employee' });
-      request.flush({ ...USERS[0] });
-      http.expectOne(USERS_URL).flush(PAGE);
+      request.flush({ ...USERS[0], role: 'employee' });
       await render();
+
+      // Put onto the row in place: the server answered with the corrected
+      // account, and re-reading the whole list would rebuild every row to
+      // change one.
+      expect(element().textContent).toContain('ama@acmetech.example');
+      http.expectNone(USERS_URL);
     });
 
     it('resets a password and shows it once', async () => {
       button('Password').click();
       await render();
 
-      const field = element().querySelectorAll<HTMLInputElement>(
-        'app-form-field input',
-      );
-      const password = Array.from(field).find((input) => input.type === 'password') as HTMLInputElement;
+      // The field asked for by name, rather than the first password input: the
+      // "Add a user" dialog keeps a password field in the document too, even
+      // while it is closed, and a find by type would type into that one.
+      const field = Array.from(element().querySelectorAll<HTMLElement>('app-form-field')).find(
+        (candidate) => candidate.querySelector('label')?.textContent?.trim().startsWith('New password'),
+      ) as HTMLElement;
+      const password = field.querySelector('input') as HTMLInputElement;
       password.value = 'brand-new-password-1!';
       password.dispatchEvent(new Event('input'));
       fixture.detectChanges();
@@ -146,8 +154,12 @@ describe('AdminUsersViewComponent', () => {
 
       expect(request.request.method).toBe('DELETE');
       request.flush({ status: 'deleted' });
-      http.expectOne(USERS_URL).flush({ ...PAGE, users: [], total: 0 });
       await render();
+
+      // The row is lifted out of the list already in hand, so the page is not
+      // re-read: only a page emptied out from under the pager needs the server.
+      expect(element().textContent).not.toContain('ama@acmetech.example');
+      http.expectNone(USERS_URL);
     });
   });
 

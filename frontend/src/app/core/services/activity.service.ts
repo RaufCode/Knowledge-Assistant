@@ -54,8 +54,10 @@ export class ActivityService {
    * a number nobody can act on.
    */
   readonly items = computed<ActivityItem[]>(() =>
-    this.requestsState()
-      .flatMap(toRequestActivity)
+    [
+      ...this.conversationsState().flatMap(toConversationActivity),
+      ...this.requestsState().flatMap(toRequestActivity),
+    ]
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .slice(0, ACTIVITY_LIMIT),
   );
@@ -123,6 +125,25 @@ export class ActivityService {
       takeUntilDestroyed(this.destroyRef),
     );
   }
+}
+
+/**
+ * One conversation as an event.
+ *
+ * A conversation is activity about the knowledge base rather than about a person:
+ * it was named from its first question, so its title is what the row is about, and
+ * "received a question" is what being last used means. Unnamed yet is real — a
+ * conversation in front of nobody is still not nothing — and is said plainly rather
+ * than dressed up as a topic it does not have.
+ */
+function toConversationActivity(row: Conversation): ActivityItem {
+  return {
+    id: `conversation-${row.id}`,
+    actor: row.title ?? 'A new conversation',
+    summary: 'received a question',
+    createdAt: row.updatedAt,
+    icon: 'message-square-text',
+  };
 }
 
 /**

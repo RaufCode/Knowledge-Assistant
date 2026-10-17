@@ -355,6 +355,7 @@ describe('ChatSidebarComponent', () => {
     fixture.detectChanges();
     await fixture.whenStable();
 
+
     expect(TestBed.inject(Router).url).toBe('/login');
   });
 });

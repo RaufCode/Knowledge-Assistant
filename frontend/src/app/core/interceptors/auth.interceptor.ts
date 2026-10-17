@@ -107,7 +107,14 @@ export const authInterceptor: HttpInterceptorFn = (request, next) => {
       return from(auth.refresh()).pipe(
         switchMap((user) =>
           user
-            ? next(withHeader.clone({ setHeaders: authHeaders(auth) }))
+            ? // The refreshed session arrives with a token the tab has never seen.
+              // This app and the API are on different hosts, so `document.cookie`
+              // cannot read it; the echo endpoint is the only way to learn it. Asking
+              // before the replay is what keeps a retry from being refused for the
+              // very reason the refresh just fixed.
+              from(auth.refreshCsrfToken()).pipe(
+                switchMap(() => next(request.clone({ setHeaders: authHeaders(auth) }))),
+              )
             : // The refresh was refused, so the session is genuinely over. Whatever
               // was on screen belonged to it and is no longer visible.
               endSession(auth, router, error),
