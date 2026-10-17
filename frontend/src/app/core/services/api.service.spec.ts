@@ -22,6 +22,12 @@ describe('ApiService', () => {
   let http: HttpTestingController;
 
   beforeEach(() => {
+    // A token, so a stream does not go looking for one. The refresh would be a
+    // request of its own, unflushed here and impossible to tell apart from a
+    // misuse of the testing backend; the streaming suite proves the recovery path
+    // separately, against the token it controls.
+    document.cookie = 'ika_csrf=api-spec-token; path=/';
+
     TestBed.configureTestingModule({
       providers: [provideHttpClient(), provideHttpClientTesting()],
     });
@@ -32,6 +38,7 @@ describe('ApiService', () => {
 
   afterEach(() => {
     http.verify();
+    document.cookie = 'ika_csrf=; path=/; max-age=0';
     vi.unstubAllGlobals();
   });
 

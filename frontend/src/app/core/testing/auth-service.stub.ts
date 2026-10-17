@@ -89,14 +89,24 @@ export class AuthServiceStub {
   }
 
   /**
-   * No CSRF token to offer.
+   * A token, so streams need no refresh round trip first.
    *
-   * Null rather than a value: the tests that care about the header assert on it
-   * against a real `AuthService` and a real cookie, and a stub that invented one
-   * would let a broken interceptor pass.
+   * The spec asserts on what the stream sent straight after `ask`, and a stub
+   * without a token would defer the request behind a token fetch, which is
+   * transport detail this stub has no reason to simulate.
    */
-  readCsrfToken(): null {
-    return null;
+  readCsrfToken(): string {
+    return 'stub-csrf-token';
+  }
+
+  /**
+   * Nothing to refresh.
+   *
+   * Present so the stream's recovery path has something to call; the tests
+   * that care about a real token and a real cookie use the real service.
+   */
+  refreshCsrfToken(): Observable<void> {
+    return of(undefined);
   }
 
   /**
@@ -132,6 +142,17 @@ export class AuthServiceStub {
   }
 
   /** Puts a person in a role, the way `GET /api/auth/me` would. */
+  /**
+   * Ends the local session, as the real service does.
+   *
+   * Present because the sidebar signs out through it before it routes: a stub
+   * without it threw before anything navigated, and the person "signed out" into a
+   * route they never left.
+   */
+  clear(): void {
+    this.setRole('anonymous');
+  }
+
   setRole(role: Role | 'anonymous', name = 'Ama Konadu'): void {
     if (role === 'anonymous') {
       this.userState.set(null);

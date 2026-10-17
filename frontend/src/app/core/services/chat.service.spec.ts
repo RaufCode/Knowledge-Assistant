@@ -1,6 +1,7 @@
 import { provideHttpClient } from '@angular/common/http';
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { TestBed } from '@angular/core/testing';
+import { provideRouter, Router } from '@angular/router';
 
 import { API_BASE_URL } from '../api.config';
 import { ChatStreamEventDto } from '../models/api.model';
@@ -47,6 +48,7 @@ describe('ChatService', () => {
   let chat: ChatService;
   let conversations: ConversationService;
   let http: HttpTestingController;
+  let router: Router;
 
   /** The client id this suite sends, read from the one place that mints it. */
   let clientId: string;
@@ -119,6 +121,9 @@ describe('ChatService', () => {
         // in as an employee: this suite is about asking questions, and an employee
         // is the role that can.
         provideAuthStub(),
+        // The router the app navigates with, so a question asked on a fresh window
+        // can put its new conversation's address in the bar.
+        provideRouter([{ path: 'c/:id', children: [] }, { path: '**', children: [] }]),
       ],
     });
 
@@ -131,6 +136,7 @@ describe('ChatService', () => {
     chat = TestBed.inject(ChatService);
     conversations = TestBed.inject(ConversationService);
     http = TestBed.inject(HttpTestingController);
+    router = TestBed.inject(Router);
   });
 
   afterEach(() => {
@@ -140,10 +146,17 @@ describe('ChatService', () => {
 
   /**
    * Answers the initial list load with a browser that already has conversations,
-   * and loads the first one's thread.
+   * then opens one of them.
+   *
+   * Two steps because they are two things. Loading the list no longer opens
+   * anything: a window with no conversation named in its address is a window with no
+   * conversation in it, and the sidebar saying otherwise was the disagreement this
+   * split removed.
    */
   const givenRestoredConversations = (): void => {
     http.expectOne(listUrl()).flush(RESTORED_LIST);
+
+    chat.openConversation('conv-1');
 
     http.expectOne(threadUrl('conv-1')).flush({
       id: 'conv-1',
@@ -165,14 +178,6 @@ describe('ChatService', () => {
         },
       ],
     });
-  };
-
-  /**
-   * Answers the list re-read that follows a completed answer, when the test does
-   * not care what the corrected list contains.
-   */
-  const flushSummaryRefresh = (payload: ConversationListPayload = RESTORED_LIST): void => {
-    http.expectOne(listUrl()).flush(payload);
   };
 
   /**
@@ -219,11 +224,24 @@ describe('ChatService', () => {
   const messages = () => chat.messages();
 
   describe('the thread it restores', () => {
-    it('opens the most recent conversation rather than an empty one', () => {
+    it('opens nothing on a load, so the window has no conversation in it', () => {
+      http.expectOne(listUrl()).flush(RESTORED_LIST);
+
+      // Loading the app says "start something". Opening the newest thread here made
+      // a blank window with yesterday's conversation lit up in the sidebar, and sent
+      // the next question into it.
+      expect(chat.activeConversationId()).toBeNull();
+      expect(chat.isEmpty()).toBe(true);
+      expect(chat.hasMessages()).toBe(false);
+      expect(conversations.conversations().map((item) => item.id)).toEqual([
+        'conv-1',
+        'conv-2',
+      ]);
+    });
+
+    it('opens the conversation the address names, and nothing else', () => {
       givenRestoredConversations();
 
-      // The list is the backend's, ordered by when each conversation was last
-      // active, and a reload is not a reason to start a new one.
       expect(chat.activeConversationId()).toBe('conv-1');
       expect(chat.hasMessages()).toBe(true);
       expect(chat.threadTitle()).toBe('Annual leave');
@@ -387,7 +405,6 @@ describe('ChatService', () => {
       chat.ask('Can I carry it over?');
       pushEvent({ type: 'delta', text: 'Yes' });
       await streamAnswer('Yes, up to five days.', true, [SOURCE]);
-      flushSummaryRefresh();
 
       const answer = messages().at(-1);
 
@@ -406,7 +423,6 @@ describe('ChatService', () => {
 
       chat.ask('What is the wifi password?');
       await streamAnswer('I could not find that in the documents.', false);
-      flushSummaryRefresh();
 
       // "Not in the documents" is a confident statement about the corpus, and there
       // is nothing to retry about it.
@@ -453,6 +469,7 @@ describe('ChatService', () => {
       http.expectOne(listUrl()).flush({
         conversations: [{ id: 'conv-1', title: null, updated_at: '2026-09-30T09:00:00' }],
       });
+      chat.openConversation('conv-1');
       http.expectOne(threadUrl('conv-1')).flush({
         id: 'conv-1',
         title: null,
@@ -473,22 +490,16 @@ describe('ChatService', () => {
       closeStream();
       await settle();
 
-      // The completion also re-reads the list, which now carries the title the
-      // backend stored.
-      flushSummaryRefresh({
-        conversations: [
-          { id: 'conv-1', title: 'Annual leave allowance', updated_at: '2026-09-30T09:30:00' },
-        ],
-      });
-
       // The title arrives after the answer, because naming is a second model call
       // that runs beside the first answer rather than in front of it. It is applied
-      // wherever the conversation is named, so the sidebar and the header agree.
+      // wherever the conversation is named, so the sidebar and the header agree —
+      // and the sidebar is not refetched for it, which is what would make the name
+      // flicker in after the list came back without one.
       expect(chat.threadTitle()).toBe('Annual leave allowance');
       expect(conversations.conversations()[0].title).toBe('Annual leave allowance');
     });
 
-    it('re-reads the list once an answer lands, so the conversation moves up it', async () => {
+    it('moves the answered conversation up the list without re-reading it', async () => {
       givenRestoredConversations();
 
       chat.ask('Can I carry it over?');
@@ -496,13 +507,9 @@ describe('ChatService', () => {
 
       // Answering stamps the conversation as active, and the list is ordered by
       // that. Left alone, a conversation answered now would stay at the bottom of
-      // the sidebar until the next reload.
-      http.expectOne(listUrl()).flush({
-        conversations: [
-          { id: 'conv-1', title: 'Annual leave', updated_at: '2026-09-30T09:30:00' },
-          { id: 'conv-2', title: 'Expenses', updated_at: '2026-09-28T09:00:00' },
-        ],
-      });
+      // the sidebar until the next reload; re-read in full to move one row rebuilds
+      // every row under the reader's eyes.
+      http.expectNone(listUrl());
 
       expect(conversations.conversations()[0].id).toBe('conv-1');
     });
@@ -582,6 +589,7 @@ describe('ChatService', () => {
       http.expectOne(listUrl()).flush({
         conversations: [{ id: 'conv-1', title: 'Leave', updated_at: '2026-09-30T09:00:00' }],
       });
+      chat.openConversation('conv-1');
       http.expectOne(threadUrl('conv-1')).flush({
         id: 'conv-1',
         title: 'Leave',
@@ -631,7 +639,6 @@ describe('ChatService', () => {
 
       chat.ask('How much annual leave do I get?');
       await streamAnswer('1.75 days per month.', true, [], 'answered', 5);
-      flushSummaryRefresh();
 
       // The field exists so a reader can see how well the question matched the
       // documents. If it is dropped anywhere between the stream and the card it is
@@ -644,7 +651,6 @@ describe('ChatService', () => {
 
       chat.ask('hello');
       await streamAnswer("Hello! I'm the assistant.", true, [], 'greeting', null);
-      flushSummaryRefresh();
 
       // Not zero. A greeting cites nothing, so there is nothing to have been
       // confident about and a low number would read as a poor answer.
@@ -652,7 +658,7 @@ describe('ChatService', () => {
     });
 
     it('reads it back off a reloaded thread, so both paths agree', async () => {
-      givenRestoredConversations();
+      http.expectOne(listUrl()).flush(RESTORED_LIST);
 
       chat.openConversation('conv-1');
       http.expectOne(threadUrl('conv-1')).flush({
@@ -765,7 +771,7 @@ describe('ChatService', () => {
     });
 
     it('opens an existing conversation and loads its thread', () => {
-      givenRestoredConversations();
+      http.expectOne(listUrl()).flush(RESTORED_LIST);
 
       chat.openConversation('conv-2');
 
@@ -826,23 +832,25 @@ describe('ChatService', () => {
       expect(messages().map((message) => message.id)).toEqual(['e1']);
     });
 
-    it('reports a conversation that is not there as missing rather than empty', () => {
+    it('closes a conversation that is not there, rather than showing it empty', () => {
       givenRestoredConversations();
 
       chat.openConversation('gone');
       http
-        .expectOne(`${API_BASE_URL}/api/conversations/gone`)
+        .expectOne(threadUrl('gone'))
         .flush({ detail: 'Not Found' }, { status: 404, statusText: 'Not Found' });
 
-      // It leaves the list, which is the list's own recovery, and the open
-      // conversation is reported as gone. An empty thread would read as a
-      // conversation that lost its history, which is the opposite of what happened.
+      // It leaves the list, which is the list's own recovery, and the open thread is
+      // closed. An empty thread would read as a conversation that lost its history,
+      // which is the opposite of what happened; the view routes to the assistant's
+      // own entry, where nothing is selected.
       expect(conversations.conversations().map((item) => item.id)).toEqual(['conv-1', 'conv-2']);
       expect(chat.isMissing()).toBe(true);
+      expect(chat.activeConversationId()).toBeNull();
     });
 
     it('discards a thread that arrives for a conversation the user has left', () => {
-      givenRestoredConversations();
+      http.expectOne(listUrl()).flush(RESTORED_LIST);
 
       chat.openConversation('conv-2');
       const slow = http.expectOne(threadUrl('conv-2'));

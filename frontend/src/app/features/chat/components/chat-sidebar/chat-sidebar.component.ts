@@ -896,6 +896,6 @@ export class ChatSidebarComponent {
   /** Opens the conversation a row stands for. */
   protected openConversation(conversationId: string): void {
     this.layout.closeAfterNavigation();
-    void this.router.navigate(['/response', conversationId]);
+    void this.router.navigate(['/c', conversationId]);
   }
 }

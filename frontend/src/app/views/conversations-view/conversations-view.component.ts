@@ -91,7 +91,7 @@ export class ConversationsViewComponent {
   /** Opens a conversation, showing its whole thread. */
   protected openConversation(conversationId: string): void {
     this.layout.closeAfterNavigation();
-    void this.router.navigate(['/response', conversationId]);
+    void this.router.navigate(['/c', conversationId]);
   }
 
   /** Names a conversation from its row. */

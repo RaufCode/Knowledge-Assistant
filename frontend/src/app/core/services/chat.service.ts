@@ -1,5 +1,6 @@
 import { DestroyRef, Injectable, computed, inject, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { Router } from '@angular/router';
 import {
   Observable,
   catchError,
@@ -9,6 +10,7 @@ import {
   of,
   reduce,
   switchMap,
+  tap,
   throwError,
 } from 'rxjs';
 
@@ -57,6 +59,7 @@ export class ChatService {
   private readonly api = inject(ApiService);
   private readonly conversations = inject(ConversationService);
   private readonly identity = inject(IdentityService);
+  private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
 
   private readonly askingState = signal(false);
@@ -85,6 +88,15 @@ export class ChatService {
 
   /** True while a question is being sent or an answer is being retrieved. */
   readonly isLoading = this.askingState.asReadonly();
+
+  /**
+   * True while the first message of a conversation is creating that conversation.
+   *
+   * Disables the composer for exactly that gap. Sharing the create request already
+   * stops a double click opening two conversations; this stops it looking like it
+   * might.
+   */
+  readonly isCreating = this.conversations.isCreating;
 
   /** The open conversation's messages, oldest first. */
   readonly messages = this.conversations.messages;
@@ -140,9 +152,9 @@ export class ChatService {
    *
    * This is the only place a conversation is created, and it is created here because
    * this is the first moment there is something to put in one. Opening the app, or
-   * pressing "New conversation", leaves no conversation on the server and none in the
-   * sidebar: both of those only empty the thread, and the id is taken when a question
-   * is actually sent.
+   * pressing "New chat", leaves no conversation on the server and none in the
+   * sidebar: both of those only empty the thread, and the id is taken when a
+   * question is actually sent.
    *
    * Both halves of the exchange are recorded before the request goes out, so the
    * thread shows the question and its pending answer straight away rather than
@@ -151,7 +163,10 @@ export class ChatService {
    * The conversation is resolved first, because there is nothing to add a message
    * to until there is one. A question asked on a first visit waits for the list to
    * arrive rather than being dropped, which is the difference between a question
-   * that works and one that vanishes the first time it is asked.
+   * that works and one that vanishes the first time it is asked. When this question
+   * is the one that brings the conversation into being, the address bar is updated
+   * to it: a window whose URL names no conversation is a conversation that cannot
+   * be reloaded, bookmarked or shared.
    */
   ask(question: string): void {
     const trimmed = question.trim();
@@ -177,7 +192,14 @@ export class ChatService {
           // question starts one. The create is shared, so a second question sent
           // before the first answer lands joins this conversation rather than opening
           // another alongside it.
-          return this.conversations.createConversation().pipe(map((created) => created.id));
+          return this.conversations
+            .createConversation()
+            .pipe(
+              tap((created) => {
+                void this.router.navigate(['/c', created.id], { replaceUrl: true });
+              }),
+              map((created) => created.id),
+            );
         }),
         switchMap((conversationId) => {
           const exchange = this.conversations.appendExchange(trimmed);

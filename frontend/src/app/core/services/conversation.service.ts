@@ -82,9 +82,22 @@ export class ConversationService {
    * In-flight creation, shared so concurrent callers get the same conversation.
    *
    * Two calls at once would leave an empty conversation in the list that the user
-   * never opened and never asked anything in.
+   * never opened and never asked anything in. It is also what the send button is
+   * disabled on, because the gap between the click and the id is exactly the gap in
+   * which a second click would arrive.
    */
   private pendingCreate: Observable<Conversation> | null = null;
+
+  /**
+   * True while the first message of a conversation is being written to the server.
+   *
+   * Narrow on purpose: it covers creating the conversation, not answering the
+   * question. A question asked in a conversation that already exists is not a double
+   * click waiting to happen — it is the reader carrying on — and disabling the
+   * composer through a whole streamed answer made the app feel like it had stopped
+   * listening.
+   */
+  private readonly creatingState = signal(false);
 
   /**
    * Titles that arrived before their conversation is listed.
@@ -107,6 +120,9 @@ export class ConversationService {
 
   /** True while the list is being fetched for the first time. */
   readonly isLoading = this.loadingState.asReadonly();
+
+  /** True while the first message of a conversation is creating that conversation. */
+  readonly isCreating = this.creatingState.asReadonly();
 
   /** True once a list load has finished, successfully or not. */
   readonly isLoaded = this.loadedState.asReadonly();
@@ -179,9 +195,7 @@ export class ConversationService {
    * reported as a link to nothing.
    */
   readonly isMissing = computed(() => {
-    const missing = this.missingState();
-
-    if (missing === null || missing !== this.activeIdState()) {
+    if (this.missingState() === null) {
       return false;
     }
 
@@ -315,12 +329,20 @@ export class ConversationService {
   }
 
   /**
-   * Fetches this browser's conversations and opens the most recent one.
+   * Fetches this browser's conversations. Nothing is created, and nothing is opened.
    *
-   * Nothing is created here. Opening the app, or finding no conversations at all,
-   * leaves no conversation behind: there is nothing to have asked, so there is
-   * nothing to keep. A conversation is created when a question is actually sent —
-   * see `ChatService.ask` — which is the first moment there is anything in one.
+   * Opening the app, or finding no conversations at all, leaves no conversation
+   * behind and none selected: there is nothing to have asked, so there is nothing to
+   * keep and nothing to highlight. A conversation is created when a question is
+   * actually sent — see `ChatService.ask` — which is the first moment there is
+   * anything in one.
+   *
+   * It used to open the most recent conversation here, and that was the app
+   * answering a question nobody asked. Loading the assistant's own entry says "start
+   * something"; quietly selecting yesterday's thread made a blank window with
+   * somebody else's conversation lit up in the sidebar, and sent the next question
+   * into it. Which conversation is open is now decided by the route and by nothing
+   * else.
    */
   load(): void {
     this.loadingState.set(true);
@@ -339,31 +361,6 @@ export class ConversationService {
         this.conversationsState.set(conversations);
         this.loadingState.set(false);
         this.loadedState.set(true);
-
-        const mostRecent = conversations[0];
-
-        if (!mostRecent) {
-          // A first visit. The thread stays empty and no conversation is opened,
-          // which is the state the view already knows how to describe: a conversation
-          // waiting for its first question. Asking one creates the conversation, so
-          // nothing is on the server until there is a question on it.
-          this.markSettled();
-          return;
-        }
-
-        // A conversation the route already asked for wins over the newest one. The
-        // list and the thread come back independently, and opening the most recent
-        // here unconditionally would replace the conversation a refresh was showing
-        // with a different one, which is the same as losing it.
-        //
-        // Only when the route named one. Landing on the ask screen with no
-        // conversation in the URL is asking for a blank window, and quietly
-        // selecting the newest conversation made its row carry the active colour
-        // while a different — empty — window was on screen. The highlight says
-        // "this is the one you are reading", and on a fresh window none of them is.
-        if (this.activeIdState() === null) {
-          this.openConversation(mostRecent.id);
-        }
 
         this.markSettled();
       });
@@ -411,6 +408,7 @@ export class ConversationService {
     if (!this.pendingCreate) {
       // A new conversation must be visible, whatever the sidebar was filtering.
       this.clearSearch();
+      this.creatingState.set(true);
 
       this.pendingCreate = this.api.createConversation(this.identity.clientId()).pipe(
         map((response) => {
@@ -434,9 +432,17 @@ export class ConversationService {
         }),
         tap({
           // Cleared on both paths, so a failed create can be retried rather than
-          // leaving a cached error behind forever.
-          next: () => (this.pendingCreate = null),
-          error: () => (this.pendingCreate = null),
+          // leaving a cached error behind forever — and so the composer comes back
+          // either way, because a send button left disabled after a failed send
+          // reads as a broken app rather than as a failed request.
+          next: () => {
+            this.pendingCreate = null;
+            this.creatingState.set(false);
+          },
+          error: () => {
+            this.pendingCreate = null;
+            this.creatingState.set(false);
+          },
         }),
         shareReplay({ bufferSize: 1, refCount: false }),
       );
@@ -478,8 +484,11 @@ export class ConversationService {
   /**
    * Opens an existing conversation and loads its thread.
    *
-   * An id that is not this browser's is a 404, which leaves the view with nothing
-   * to render rather than showing a conversation that is not there.
+   * A conversation that is gone, or that belongs to another account, is a 404. It
+   * leaves the thread closed and nothing selected rather than showing a
+   * conversation that is not there: the caller routes to the assistant entry, which
+   * is a window with no conversation in it — the same state as opening the app, and
+   * the only state in which nothing in the sidebar is lit up.
    */
   openConversation(conversationId: string): void {
     this.activeIdState.set(conversationId);
@@ -493,13 +502,18 @@ export class ConversationService {
         catchError((error: unknown) => {
           // A conversation that is gone is not worth retrying, and it is not worth
           // an error on screen either: the list no longer offering it is half the
-          // recovery, and the thread saying so is the other half. It is recorded
-          // rather than swapped for another conversation, because a link that
-          // silently showed a different thread would be a worse lie than saying the
-          // one asked for is not there.
+          // recovery, and a blank window to start again in is the other half. It is
+          // recorded rather than swapped for another conversation, because a link
+          // that silently showed a different thread would be a worse lie than
+          // showing none.
           if (error instanceof ApiError && error.status === 404) {
-            this.missingState.set(conversationId);
             this.forget(conversationId);
+            // Closed first, so the empty window the user is left with is not
+            // reported as a conversation that is merely on its way. Recorded last
+            // because closing clears the record: a `startUnsaved` after it would
+            // have wiped the very thing this branch exists to say.
+            this.startUnsaved();
+            this.missingState.set(conversationId);
           } else {
             console.error('Could not load the conversation', error);
           }
@@ -613,7 +627,7 @@ export class ConversationService {
     this.patchMessage(messageId, (message) => ({
       ...message,
       text,
-      status: 'failed',
+      kind: 'failed',
       sources: [],
       documentCount: 0,
       confidence: null,
@@ -625,7 +639,7 @@ export class ConversationService {
     this.patchMessage(messageId, (message) => ({
       ...message,
       text: '',
-      status: 'pending',
+      kind: 'pending',
       sources: [],
       documentCount: 0,
       confidence: null,

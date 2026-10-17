@@ -101,6 +101,23 @@ export const routes: Routes = [
       ),
   },
   {
+    // One conversation, by its own id, which never changes — so a link to a thread
+    // still works however long afterwards it is followed.
+    //
+    // `/c/:id` rather than `/response/:id`: the page it shows is a conversation, not
+    // a response, and the address a reader copies out of the bar should say which.
+    // `response/:id` below stays as the old spelling rather than becoming a dead
+    // link, because it is in bookmarks and in anything somebody was sent before the
+    // rename.
+    path: 'c/:id',
+    title: 'Conversation · Internal Knowledge Assistant',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./views/response-view/response-view.component').then(
+        (module) => module.ResponseViewComponent,
+      ),
+  },
+  {
     path: 'response',
     title: 'Answer · Internal Knowledge Assistant',
     canActivate: [authGuard],

@@ -1,5 +1,4 @@
 import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
-import { Router } from '@angular/router';
 
 import { AuthService } from '../../core/services/auth.service';
 import { ChatService } from '../../core/services/chat.service';
@@ -51,7 +50,13 @@ const GREETINGS: ((firstName: string) => string)[] = [
         </div>
 
         <div class="mt-8 w-full max-w-[640px]">
-          <app-question-input [isBusy]="chat.isLoading()" (ask)="onAsk($event)" />
+          <!--
+            Disabled while the first message is creating the conversation it is
+            about to be sent in. One click is one conversation: the shared create
+            already stops two conversations being opened, and this stops it looking
+            as though it might.
+          -->
+          <app-question-input [isBusy]="chat.isLoading() || chat.isCreating()" (ask)="onAsk($event)" />
         </div>
       </div>
     </div>
@@ -103,8 +108,6 @@ export class DashboardViewComponent {
    */
   private readonly visitSeed = signal(Math.random());
 
-  private readonly router = inject(Router);
-
   constructor() {
     // This screen is a blank window, so nothing is open in it.
     //
@@ -122,15 +125,19 @@ export class DashboardViewComponent {
   private readonly conversations = inject(ConversationService);
 
   /**
-   * Asks a question and routes to the response view.
+   * Asks a question.
    *
-   * The route carries no id: `/response` follows the newest turn, so the question
-   * just sent is the one that opens. That also means the view does not have to
-   * wait for the request to start before it can navigate.
+   * No navigation follows it, because there is nothing yet to navigate to: this
+   * window has no conversation in it, which is the state on screen. The
+   * conversation is created by the question itself and the address bar is pointed at
+   * it as soon as there is an id — one decision, made where the conversation is
+   * made, rather than two that can disagree.
    */
   protected onAsk(question: string): void {
+    // No navigation here. There is no conversation to go to yet — this window has
+    // none, and that is the state the reader is looking at. `ChatService.ask`
+    // creates the conversation and then points the address bar at it, so the URL
+    // changes when there is a conversation to name rather than before.
     this.chat.ask(question);
-
-    void this.router.navigate(['/response']);
   }
 }
