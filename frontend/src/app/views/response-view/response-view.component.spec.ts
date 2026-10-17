@@ -1,8 +1,9 @@
 import { signal } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
-import { ActivatedRoute, convertToParamMap, ParamMap, provideRouter } from '@angular/router';
+import { ActivatedRoute, convertToParamMap, ParamMap, Router, provideRouter } from '@angular/router';
 import { BehaviorSubject } from 'rxjs';
 
+import { AuthService } from '../../core/services/auth.service';
 import { ChatService } from '../../core/services/chat.service';
 import { Message } from '../../core/models/message.model';
 import { ResponseViewComponent } from './response-view.component';
@@ -39,6 +40,7 @@ interface ChatStub {
   isMissing: () => boolean;
   messages: () => Message[];
   isLoading: () => boolean;
+  isCreating: () => boolean;
   isPreparing: () => boolean;
   openConversation: (conversationId: string) => void;
   ask: (question: string) => void;
@@ -65,6 +67,7 @@ describe('ResponseViewComponent', () => {
       isMissing: () => missing(),
       messages: () => messages(),
       isLoading: () => false,
+      isCreating: () => false,
       isPreparing: () => false,
       openConversation: (conversationId) => opened.push(conversationId),
       ask: (question) => asked.push(question),
@@ -78,6 +81,7 @@ describe('ResponseViewComponent', () => {
       providers: [
         provideRouter([]),
         { provide: ChatService, useValue: chat },
+        { provide: AuthService, useValue: { assistantPath: () => '/' } },
         {
           provide: ActivatedRoute,
           useValue: { paramMap: paramMap.asObservable() },
@@ -238,7 +242,7 @@ describe('ResponseViewComponent', () => {
     });
   });
 
-  it('says a conversation that is gone is not found, not that it is empty', async () => {
+  it('sends a conversation that is gone back to a window with none', async () => {
     empty = signal(false);
     missing = signal(true);
     messages = signal([]);
@@ -246,8 +250,12 @@ describe('ResponseViewComponent', () => {
     await fixture.whenStable();
 
     // An empty thread would read as a conversation that has lost its history, which
-    // is the opposite of what a deleted link means.
-    expect(element().textContent).toContain('Conversation not found');
+    // is the opposite of what a deleted link means, and leaving the address bar
+    // naming it means every question typed here would go nowhere. The assistant's
+    // own entry is a window with no conversation in it — the same state as opening
+    // the app, and the only one where nothing in the sidebar is lit.
+    expect(TestBed.inject(Router).url).toBe('/');
+    expect(element().textContent).not.toContain('Conversation not found');
     expect(element().textContent).not.toContain('No questions yet');
   });
 

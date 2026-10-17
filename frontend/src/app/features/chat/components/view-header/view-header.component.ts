@@ -1,10 +1,11 @@
 import { Location } from '@angular/common';
-import { ChangeDetectionStrategy, Component, inject, input } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, input } from '@angular/core';
 import { Router } from '@angular/router';
 
 import { LayoutService } from '../../../../core/services/layout.service';
 import { ButtonComponent } from '../../../../shared/components/button/button.component';
 import { IconComponent } from '../../../../shared/components/icon/icon.component';
+import { APP_NAME } from '../../../../shared/utils/constants';
 
 /**
  * The header strip every view sits under: the sidebar toggle and the view
@@ -70,14 +71,14 @@ import { IconComponent } from '../../../../shared/components/icon/icon.component
     }
 
     <span class="truncate font-headings text-base font-semibold text-foreground lg:hidden">
-      Knowledge Assistant
+      {{ APP_NAME }}
     </span>
 
-    @if (title()) {
+    @if (heading()) {
       <h1
         class="hidden min-w-0 truncate px-10 text-center font-headings text-base font-semibold text-foreground sm:text-lg lg:block"
       >
-        {{ title() }}
+        {{ heading() }}
       </h1>
     }
 
@@ -102,8 +103,22 @@ export class ViewHeaderComponent {
   /** Layout state, so the toggle always matches what is on screen. */
   protected readonly layout = inject(LayoutService);
 
-  /** Primary heading of the view. */
+  /** The product, named below `lg` where the view title is not shown. */
+  protected readonly APP_NAME = APP_NAME;
+
+  /**
+   * Primary heading of the view.
+   *
+   * Optional, and the fallbacks are what the assistant's own entry point is for. A
+   * window with no conversation in it used to have no heading at all above `lg`,
+   * which left the bar looking broken rather than empty; and the alternative — naming
+   * it "New conversation" — claimed there was a conversation, which is the one thing
+   * that window is not there to have.
+   */
   readonly title = input('');
+
+  /** What the bar says when the view has no title of its own. */
+  protected readonly heading = computed(() => this.title() || APP_NAME);
 
   /**
    * Label for the back control, and the signal that there is one at all.

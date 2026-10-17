@@ -8,6 +8,16 @@ export const MIN_QUESTION_LENGTH = 3;
 export const MAX_QUESTION_LENGTH = 500;
 
 /**
+ * The product's own name, for the places that have nothing more specific to say.
+ *
+ * The header falls back to it on a window with no conversation in it. That window
+ * has no title — there is no conversation to name — and the two things it could
+ * otherwise say are both wrong: "New conversation" claims there is one, and the
+ * title of a conversation that was there earlier claims this is it.
+ */
+export const APP_NAME = 'Knowledge Assistant';
+
+/**
  * Placeholder shown in the composer when it is empty.
  *
  * "Ask anything" promised more than the assistant delivers. It answers from a fixed
