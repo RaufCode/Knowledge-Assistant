@@ -11,11 +11,17 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    func,
     select,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 from app.config import settings
+from app.rag.capabilities import (
+    INVITATION_MARKER,
+    UNREADABLE_OPENINGS,
+    is_unreadable_reply,
+)
 
 _args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
 engine = create_engine(settings.database_url, connect_args=_args, pool_pre_ping=True)
@@ -363,6 +369,16 @@ def last_exchange(
     return question, answer
 
 
+# How many of a conversation's replies are scanned to find the run of unreadable
+# ones at the end of it. Three is what the reply that follows changes at, so a
+# thread longer than this cannot give a different answer.
+UNREADABLE_SCAN_ROWS = 6
+
+# The openings of the unreadable replies, as one pattern. The stored reply says
+# which one it is in its own words, which is what lets the count be read back from
+# a conversation that has been reloaded rather than remembered.
+UNREADABLE_LIKE = "|".join(f"{opening}%" for opening in UNREADABLE_OPENINGS)
+
 # The assistant turns that count as a subject worth continuing: one that answered,
 # or searched for, an in-scope question. A greeting, a small talk reply, an
 # out-of-scope refusal and a confidentiality notice are none of them — they say
@@ -438,6 +454,89 @@ def cited_chunk_ids(db: SessionLocal, conversation_id: str) -> frozenset[str]:
         for source in (sources or [])
         if isinstance(source, dict) and source.get("chunk_id")
     )
+
+
+def assistant_replies(db: SessionLocal, conversation_id: str) -> int:
+    """How many replies this conversation has had.
+
+    What a greeting is answered with depends on it: the first one says what this
+    assistant is for, and the ones after it say something else, because a reply
+    that repeats its invitation every turn is a sign-off with extra steps.
+    """
+    return (
+        db.scalar(
+            select(func.count(Message.id)).where(
+                Message.conversation_id == conversation_id,
+                Message.role == "assistant",
+            )
+        )
+        or 0
+    )
+
+
+def says_the_invitation(db: SessionLocal, conversation_id: str) -> bool:
+    """Whether any reply in this conversation has already said what it is for.
+
+    Read out of the messages rather than counted in memory: a conversation that has
+    been reloaded must still know it has made its introduction, or it would make it
+    again as though this were the first turn.
+    """
+    return (
+        db.scalar(
+            select(Message.id)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.role == "assistant",
+                Message.content.contains(INVITATION_MARKER),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def unreadable_replies(db: SessionLocal, conversation_id: str) -> tuple[int, int]:
+    """How many unreadable replies this conversation has had: in a row, and ever.
+
+    Both counts, because they decide two different things. The run at the end of
+    the thread decides how much help to offer next — a first slip is a shrug, a
+    third is examples and a fourth is patience — and the total decides which of the
+    first two is used, so repeated slips are not answered identically forever.
+
+    Scanned over the thread's own messages rather than kept as state, so a reload
+    changes neither number and two conversations cannot share one.
+    """
+    contents = db.scalars(
+        select(Message.content).where(
+            Message.conversation_id == conversation_id,
+            Message.role == "assistant",
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(UNREADABLE_SCAN_ROWS)
+    ).all()
+
+    streak = 0
+
+    for content in contents:
+        if not is_unreadable_reply(content):
+            break
+
+        streak += 1
+
+    # The run is bounded by the scan; beyond it the answer is the same either way,
+    # since anything past the third is the same reply.
+    total = (
+        db.scalar(
+            select(func.count(Message.id)).where(
+                Message.conversation_id == conversation_id,
+                Message.role == "assistant",
+                Message.content.like(UNREADABLE_LIKE),
+            )
+        )
+        or 0
+    )
+
+    return min(streak, 3), total
 
 
 def get_user(db: SessionLocal, user_id: str) -> User | None:

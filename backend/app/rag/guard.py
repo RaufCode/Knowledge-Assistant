@@ -57,6 +57,27 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+# A word, as these rules read one: letters and digits, nothing else. Case is kept,
+# because capitalisation is evidence in both directions here — an acronym exempts a
+# message and a name in the middle of one does the same.
+#
+# An apostrophe is a boundary: "what's" is two words and one letter, not one word
+# that is in neither dictionary.
+_WORD = re.compile(r"[a-zA-Z0-9]+")
+
+# Emoji, and the skin-tone and joiner sequences that hang off them. Broad on
+# purpose: a run of emoji is a laugh, and a miss here reads as "no emoji" and sends
+# an emoji-only message to the spelling check instead.
+EMOJI_RUN = re.compile(
+    "["
+    "\U0001f000-\U0001faff"
+    "☀-➿"
+    "⬀-⯿"
+    "️"
+    "‍"
+    "]+"
+)
+
 
 # =============================================================================
 # The confidentiality guard
@@ -550,6 +571,80 @@ CONVERSATIONAL_ADDRESSEES = {
     "all",
 }
 
+# The greetings themselves, as a set apart from the rest of the conversational
+# vocabulary.
+#
+# Split out because a conversation whose first message is a greeting is *named*
+# differently from one whose first message is a thank-you or a laugh, and both are
+# answered the same way. "thanks" and "hey" are the same kind of turn and not the
+# same kind of conversation to look at in a list a week later.
+GREETING_WORDS = {
+    "hi",
+    "hii",
+    "hello",
+    "helloo",
+    "hey",
+    "heyy",
+    "yo",
+    "hiya",
+    "howdy",
+    "greetings",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "good day",
+    "morning",
+    "afternoon",
+    "evening",
+}
+
+# Laughter, and the reactions typed as one.
+#
+# Kept apart from `CONVERSATIONAL_WORDS` because of *where* it is checked. Laughter
+# is spelled with the same few letters over and over — "hhhhh", "hahaha", "lolvl",
+# "kkk" — which is exactly what the unintelligible rule looks for, so a laugh that
+# reached it would be told it could not be understood. It is therefore recognised
+# first, and recognised for what it is: somebody finding something funny, or
+# pressing a key repeatedly, neither of which is a question about the documents.
+#
+# Deliberately generous about how it is spelled and never about what follows it:
+# "hahaha" is a laugh, "haha so what is the leave policy" is a question that
+# happens to open with one.
+LAUGHTER_WORDS = {
+    "haha",
+    "hahaha",
+    "hahahaha",
+    "hehe",
+    "heh",
+    "lol",
+    "lmao",
+    "rofl",
+    "hah",
+    "hihi",
+    "hihihi",
+    "hmmmm",
+    "hm",
+    "lolll",
+    "hahahaha",
+    "hhhh",
+    "hhhhh",
+    "hhhhhh",
+    "kkk",
+    "kkkk",
+    "kkkkk",
+}
+
+# Laughter that is a letter rather than a word, so only the run itself is checked.
+#
+# Two of a kind is enough here, because `normalise` folds a longer run down to two
+# before this ever sees it: "hhhhh" reaches this as "hh". The gibberish check wants
+# the stricter shape and has its own pattern for it.
+LAUGHTER_RUN = re.compile(r"^(.)\1+$")
+
+# One key held down: four of the same letter, which is never a word and never a
+# laugh either — it is what a hand on the keyboard produces.
+HELD_KEY_RUN = re.compile(r"^(.)\1{3,}$")
+
 # Upper bound on a normalised message, so a sentence never qualifies on a word
 # inside it. "hello, what is the leave policy?" is a question, and answering it
 # with a greeting would be refusing to do the actual job.
@@ -560,6 +655,367 @@ MAX_CONVERSATIONAL_LENGTH = 32
 # short enough that a real question which happens to mention a topic — "what about
 # parental leave and how do I claim it during maternity?" — is left alone.
 MAX_CONTEXT_DEPENDENT_LENGTH = 32
+
+# How long a run of one letter has to be before it stops being a laugh and starts
+# being a keyboard held down. Four is the shortest run that is never English.
+MAX_REPEATED_LETTERS = 4
+
+# Consonants in a row without a vowel breaking them. Four is long enough that no
+# ordinary word has it and short enough to catch a burst keyboard.
+MAX_CONSONANT_CLUSTER = 4
+
+# Letters long enough for "has no vowel at all" to be evidence. "hmm" is two and is
+# a word anyway; "vdghj" is five and is a hand on the keyboard.
+MIN_VOWELLESS_LENGTH = 5
+
+# The keyboard rows, in the order the keys sit. A run of four from the middle of a
+# row is nobody typing: "asdf", "qwer", "hjkl" and their neighbours are what a hand
+# lands on when it lands on the keyboard instead of on the keys it meant.
+_KEYBOARD_ROWS = ("qwertyuiop", "asdfghjkl", "zxcvbnm")
+
+# The vowels, and the letter `y`, which stands in for one often enough that
+# excluding it invents noise.
+VOWELS = frozenset("aeiouy")
+
+# Casual English, Ghanaian English and pidgin, which are ordinary words here and
+# which no standard dictionary carries.
+#
+# Their absence from the word list would otherwise be read as gibberish, which is
+# the one thing this check must never do to somebody writing in the language they
+# were taught at home: "chale, how do I set up the VPN?" is a question, and a
+# question deserves an answer however it is phrased.
+CASUAL_WORDS = frozenset(
+    """
+    abeg abegs abrasive abusua accent accents ache achike adafo adeyemi afa
+    agbo ajo akwa ama ankara ase asiawo aye baako baale baze been there better
+    beta but haha chale chale check checka chop chops dan dey doo ebe ee fi
+    finally fit fok fokusi fre naija naa nope nth oga oge oh okay omo ope
+    owo oyaw ori oyin pitch please proper proper Ghana ghanaian pidgin english
+    wassup wetted wetin whats whatyeah yawa yawa yawa naa abeg abeg guy
+    guys something someone anything someone people person place
+    """.split()
+)
+
+# Everyday English, kept small on purpose.
+#
+# This list does one job: it decides that a message *is* English. It never decides
+# that a message is a question, and it never needs to be complete — one familiar
+# word in a message is enough to spare it, and any real question contains several.
+# The vocabulary of the indexed documents is added to it at runtime, so a word the
+# company actually uses is recognised even when it is not common English.
+#
+# What is deliberately not here is any word only a name would be. People are named
+# in messages, and a name that no dictionary carries is a person rather than a
+# mistyped word.
+COMMON_WORDS = frozenset(
+    """
+    about above access according account across act action activity actual add
+    addition address administration advance advice affect after afternoon again
+    against age agency agenda agree ahead air all allow almost alone along already
+    also always among amount an and another answer any anyone anything apart
+    appeal appear apply application approach approve approval april are area
+    argument around arrange arrival as ask aspect assessment assistance
+    associate association at attend attendance attitude attribute audience
+    author authority available avoid away back bad bank base basis be beam
+    because become bed before begin beginning behalf behaviour behind being
+    believe below benefit benefits beside best better between beyond big bill
+    birthday board body bonus book both bottom break bring budget build
+    business but buy by call camera can cancel candidate capacity capital
+    car card care career carry case cash casual category cause cell centre
+    certain chair challenge chance change charge check child choice choose
+    circumstance claim class clean clear client clock close club code coffee
+    cold collection college colour come commercial commission committee common
+    communication company compare complete computer condition conduct conference
+    confirm consider console contact contain content context continue contract
+    control convention conversation copy cost could count country couple course
+    cover create credit crime cultural culture cup current custom customer cut
+    daily damage dance danger data date day deal dear death decide decision
+    deep default define degree deliver demand department depend describe design
+    desk detail develop development device die difference different difficult
+    dinner direct direction director discuss discussion display distance
+    distribution do doctor document documentation does door down download draft
+    draw drive drop drug during duty each early earn earth east easy eat
+    economic economy edge edit education effect effort either elect election
+    else email employee employer employment end energy engine engineer english
+    enjoy enough enter enterprise environment equal equipment error especially
+    essay essential establish estate estimate ethics even evening event ever
+    every everybody everyone everything evidence exact example exceed excellent
+    except exchange executive exercise exist expect expense experience
+    experiment expert explain export express extend extra eye face facility
+    fact factor fail fair fall false family far fashion fast father fault
+    favour favor fear feature federal fee feed feel female few field fight
+    figure file fill film final finance financial find fine finger finish
+    fire firm first fiscal fit five fix flag flat flight floor flow flower
+    fly focus follow food foot football for force foreign forget form former
+    forward four frame free french frequency fresh friend from front fuel full
+    fun function fund furniture further future gain game garden gas general
+    generate get gift girl give glass global go goal good government grade
+    grant graph great green ground group grow growth guard guess guest guide
+    gun guy hair half hall hand handle happen happy hard hat have he head
+    health hear heart heat heavy height hello help hence her here herself hi
+    high him himself his history hit hold holiday home hope horse hospital
+    hot hotel hour house how however huge human hundred hurt husband i ice idea
+    identity if image imagine impact implement import important improve in
+    include increase indeed independent index individual industry inform
+    information initial injury inside install institution instruction insurance
+    intend interest internal international interview into introduce investment
+    invite involve iron is issue it item its itself job join joint journey
+    judge jump just keep key kick kid kill kind king kitchen knee knew know
+    knowledge labour labor lack lady lake land language large last late later
+    laugh law lawyer lay layer lead leader learn least leave left leg legal
+    length less lesson let letter level library licence license lie life lift
+    light like limit line link lip list listen little live loan local location
+    lock log long look lose loss lost lot loud love low luck lunch machine
+    magazine mail main maintain major make male man manage manager manner many
+    map march mark market marriage material matter may maybe me mean measure
+    meat mechanism media medical medium meet meeting member memory mention menu
+    message metal method middle might mile milk million mind mine minute miss
+    mission mistake mix mobile model modern moment money monitor month moral
+    more morning most mother motion motor mountain mouse mouth move movement
+    movie much music must my myself name narrow nation national natural nature
+    near necessary neck need negative neighbour neighbour net network never new
+    news newspaper next nice night nine no node noise none nor normal north
+    nose not note nothing notice now number object objective obligation observe
+    obtain occasion occur ocean of off offer office officer official often oil
+    ok okay old on once one online only open operate operation opinion
+    opportunity option or orange order ordinary organisation organization
+    other others our out outcome outside over own owner pack package page pain
+    paint pair paper parent park part particular partner party pass password
+    past path patient pattern pay payment peace peak pen people per percent
+    perfect perform performance perhaps period permanent permission person
+    personal phone photograph phrase physical pick picture piece place plan
+    planning plant plastic plate play player please point police policy
+    political politics poor popular population port position positive
+    possible post pound power practice prefer premium prepare present
+    president press pressure pretty prevent previous price primary prime
+    principle print prior private prize probably problem procedure process
+    produce product production profession professional professor profit
+    programme program project property propose protect protocol prove provide
+    public publish pull purchase purpose push put quality quarter question
+    quick quickly quiet quite quote race radio rain raise range rate rather
+    reach read ready real realise realize reason receive recent recognise
+    recognize recommend record recover red reduce refer reflect refuse regard
+    region register regular regulation relate relationship release relevant
+    reliable relief religion rely remain remember remind remote remove
+    rent repair repeat replace reply report represent request require research
+    reserve resident resolve resource respect respond response responsible
+    restaurant result retain retire return reveal revenue review reward rich
+    right ring rise risk river road role roll room root round route routine
+    row rule run safe safety sail salary sale same sample save say scale
+    scene schedule scheme school science score screen script search season
+    seat second secret section sector security see seek seem sell send sense
+    sentence separate series serious serve service session set settle seven
+    several shall shape share sharp she sheet shelf ship shoot short should
+    shoulder show side sign signal significant silence similar simple simply
+    since sing single sister sit site situation six size skill skin sleep
+    slide slow small so social society soft software solution some somebody
+    someone something sometimes son song soon sorry sort sound source south
+    space speak special specific speech speed spend spirit spot spread staff
+    stage stand standard star start state statement station status stay step
+    still stock stop store story straight strange strategy street strength
+    strong structure student study stuff style subject submit substance succeed
+    success such sudden suffer suggest suit summer sun supply support suppose
+    sure surface system table take talk tall task tax teach team technical
+    technique technology telephone television tell temperature ten term terms
+    test text than thank that the their them themselves then theory there
+    these they thing think third this those though thought thousand threat
+    three through throw thus time today together tomorrow tone tonight too
+    tool top total touch tour tourist toward town trade traditional traffic
+    train transfer transport travel treat treatment tree trial trip trouble
+    truck true trust truth try turn twelve twenty twice two type typical under
+    understand union unit university unless until up update upon upper use
+    useful usual usually value various very view village visit voice volume
+    vote wage wait wake walk wall want war warm warn wash waste watch water
+    way we wear weather wedding week weekend welcome well west what whatever
+    when where whether which while white who whole whom whose why wide wife
+    will win wind window wine wing winter wire wise wish with within without
+    woman wonder wood word work worker world worry worth would write writer
+    wrong yard yeah year yellow yes yesterday yet you young your yourself zero
+    zone
+    """.split()
+)
+
+
+def is_greeting(text: str) -> bool:
+    """Whether this message opens a conversation rather than continuing one.
+
+    Greetings are conversational like any other pleasantry, and are named apart
+    from them: a conversation that began with "Hey" is recognisable in the list as
+    one somebody opened rather than one somebody used, and it keeps that name for
+    good because a conversation is named once and never renamed.
+    """
+    cleaned = normalise(text)
+
+    if not cleaned:
+        return False
+
+    if cleaned in GREETING_WORDS:
+        return True
+
+    head, _, tail = cleaned.rpartition(" ")
+
+    return bool(tail) and head in GREETING_WORDS and tail in CONVERSATIONAL_ADDRESSEES
+
+
+def is_laughter(text: str) -> bool:
+    """Whether this message is a laugh, an emoji, or a key held down.
+
+    Recognised before anything else that could mistake one for nonsense, and never
+    reaching retrieval or the model: a laugh is not a request, and answering it as
+    an unrecognised message would be telling somebody the assistant could not read
+    their own laugh.
+    """
+    cleaned = normalise(text)
+
+    if not cleaned or len(cleaned) > MAX_CONVERSATIONAL_LENGTH:
+        return False
+
+    if cleaned in LAUGHTER_WORDS:
+        return True
+
+    # One character repeated and nothing else: "hhhhh", "kkkk", "jjjjj". Any other
+    # word in the message means it is a message that happens to contain one.
+    if LAUGHTER_RUN.match(cleaned):
+        return True
+
+    # Emoji on their own, or a word wrapped in them. This is the only place a
+    # message is reduced to its emoji before anything else reads it.
+    without_emoji = EMOJI_RUN.sub("", cleaned)
+
+    if without_emoji != cleaned and normalise(without_emoji) in LAUGHTER_WORDS | {""}:
+        return True
+
+    return False
+
+
+def is_unintelligible(text: str, vocabulary: frozenset[str] = frozenset()) -> bool:
+    """Whether this message is a keyboard accident rather than a message.
+
+    The wrong answer is expensive in both directions and the two are not equal:
+    calling gibberish unintelligible costs somebody one more try, while calling a
+    real question unintelligible refuses to answer a question the documents hold.
+    So this says yes only when it is sure, and every exemption below exists to
+    make "sure" mean sure. Anything it is not sure about is left to the classifier,
+    which can see the conversation this one-word reading cannot.
+
+    Laughter is checked by the caller before this, because a laugh is a run of
+    letters too and is not unintelligible.
+
+    `vocabulary` is the indexed documents' own vocabulary, added to the built-in
+    one: a word the company actually uses is a real word even when no dictionary
+    carries it.
+    """
+    tokens = _WORD.findall(text)
+
+    if not tokens:
+        return False
+
+    known = COMMON_WORDS | CASUAL_WORDS | vocabulary
+
+    # An acronym, a figure or a capitalised name anywhere in the message exempts the
+    # whole of it. "SSO login" is a person asking about single sign-on, and reading
+    # it as gibberish because two of its three words are not in a dictionary would
+    # refuse a question the documents answer. Read with the capitalisation the
+    # message was sent with, which is the whole of the evidence.
+    if any(_is_exempt(token) for token in tokens):
+        return False
+
+    # One familiar word is enough. Every real message has several, and this is the
+    # rule that keeps "whats the leav policy" — one misspelt word in an ordinary
+    # sentence — out of this path.
+    if any(token.lower() in known for token in tokens):
+        return False
+
+    # A capitalised word in the middle of a sentence is a name, and people are
+    # named in messages. A sentence's own first word is not evidence of anything,
+    # which is why it does not count here.
+    if _names_a_person(text):
+        return False
+
+    if any(_is_nonsense(token.lower()) for token in tokens):
+        return True
+
+    # Nothing known and nothing obviously typed by accident: several words in a
+    # row none of which is a word is a foreign language or a typo rather than a
+    # hand on the keyboard, and the classifier is better placed than a spelling
+    # check to say what it is.
+    return len(tokens) > 1
+
+
+def _is_exempt(token: str) -> bool:
+    """Whether this token could not be gibberish on its own.
+
+    Two letters, digits, and anything written in capitals. "VPN", "2FA" and "18"
+    are not words, and treating them as unreadable would refuse the questions that
+    use them — which are the questions this assistant exists to answer.
+    """
+    if len(token) < 3:
+        return True
+
+    if token.isdigit():
+        return True
+
+    return token.isupper()
+
+
+def _names_a_person(text: str) -> bool:
+    """Whether the message contains a capitalised word that is not its first.
+
+    A name is not a dictionary word and never will be, so a message carrying one is
+    addressed to a person rather than mistyped. Only capitalisation inside the
+    sentence counts: "Asdfgh" at the start is a hand on the keyboard, and "Kofi
+    Mensah" in the middle of one is not.
+    """
+    _, _, tail = text.strip().partition(" ")
+
+    return any(word[:1].isupper() for word in tail.split())
+
+
+def _is_nonsense(token: str) -> bool:
+    """Whether this token is the shape of a keyboard accident.
+
+    Four signals, all of them about how the letters sit rather than what they
+    spell: no vowel in a long word, a run along a keyboard row, a cluster of
+    consonants, and one letter held down.
+    """
+    if len(token) >= MIN_VOWELLESS_LENGTH and not set(token) & VOWELS:
+        return True
+
+    if any(_keyboard_run(row, token) for row in _KEYBOARD_ROWS):
+        return True
+
+    if _consonant_cluster(token) >= MAX_CONSONANT_CLUSTER:
+        return True
+
+    if HELD_KEY_RUN.match(token) and len(token) >= MAX_REPEATED_LETTERS:
+        return True
+
+    return False
+
+
+def _keyboard_run(row: str, token: str) -> bool:
+    """Whether the token contains four keys from the same physical row."""
+    run = 0
+
+    for character in token:
+        run = run + 1 if character in row else 0
+
+        if run >= 4:
+            return True
+
+    return False
+
+
+def _consonant_cluster(token: str) -> int:
+    """The longest run of consonants in the token."""
+    longest = 0
+    run = 0
+
+    for character in token:
+        run = 0 if character in VOWELS else run + 1
+        longest = max(longest, run)
+
+    return longest
 
 
 def normalise(text: str) -> str:
@@ -588,6 +1044,12 @@ def is_obvious_conversational(text: str) -> bool:
         return False
 
     if cleaned in CONVERSATIONAL_WORDS or cleaned in CAPABILITY_QUESTIONS:
+        return True
+
+    # Laughter, before the obvious check finishes and long before the gibberish
+    # check: "hhhhh" is a run of letters that no word list knows, and reading it as
+    # a keyboard accident would answer a laugh with "did your keyboard slip?".
+    if is_laughter(text):
         return True
 
     head, _, tail = cleaned.rpartition(" ")

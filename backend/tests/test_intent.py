@@ -347,7 +347,7 @@ class RoutingTest(unittest.TestCase):
             [event["type"] for event in events], ["status", "delta", "done"]
         )
 
-    def test_an_acknowledgement_neither_retrieves_nor_reaches_the_classifier(self):
+    def test_an_acknowledgement_neither_retrieves_nor_reaches_a_model(self):
         asked: list[str] = []
         assistant = assistant_answering([])
         assistant.retriever = recording_retriever(asked)
@@ -356,10 +356,11 @@ class RoutingTest(unittest.TestCase):
 
         self.assertEqual(done["kind"], "conversational")
         self.assertEqual(asked, [])
-        # Exactly one model call, and it is the reply itself. A second one would
-        # have been the classifier, which the rules made unnecessary: the point of
-        # the fast path is that "ok" costs a reply and not a round trip on top of it.
-        self.assertEqual(len(assistant.asked), 1)
+        # No call at all, not even one for the classifier: the rules recognised this
+        # and the reply itself comes from the pool. An acknowledgement is the common
+        # case on a busy conversation, and a round trip per "ok" is a round trip per
+        # "ok".
+        self.assertEqual(assistant.asked, [])
 
     def test_a_personal_record_question_is_refused_without_retrieval(self):
         asked: list[str] = []

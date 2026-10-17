@@ -42,6 +42,7 @@ from app.rag.engine import (
     TITLE_SYSTEM_PROMPT,
     Assistant,
     PreviousAnswer,
+    title_for_first_message,
 )
 from app.rag.guard import Category, Classification
 from app.rag.retrieval import Candidate
@@ -74,6 +75,9 @@ class StubAssistant:
         previous: "PreviousAnswer | None" = None,
     ) -> Classification:
         return Classification(Category.COMPANY_QUESTION, question)
+
+    def title_for(self, question: str, classification: Classification) -> str | None:
+        return title_for_first_message(question, classification)
 
     def ask_stream(
         self,
@@ -202,6 +206,53 @@ class ConversationTestCase(unittest.TestCase):
             json={"client_id": client_id, "content": question},
             headers=self.csrf_headers(),
         )
+
+    def real_assistant(self, replies=("There is more to say about this.",), repeat=True):
+        """The real assistant, with only the model scripted.
+
+        Everything else — the classification, the conversational pool, the unreadable
+        replies, the title rules — is the code the app runs, which is the only way a
+        test of those can mean anything. `asked` records every model call, so a path
+        that should cost nothing can be pinned as costing nothing.
+        """
+        assistant = main.state["assistant"]
+        asked: list[str] = []
+        scripted = list(replies)
+        retrieval = ScriptedRetrieval()
+
+        def complete(user_prompt: str, system_prompt: str = "", max_tokens=None) -> str:
+            asked.append(user_prompt)
+
+            if system_prompt == TITLE_SYSTEM_PROMPT:
+                return "About this"
+
+            if scripted:
+                return scripted.pop(0)
+
+            # Repeated rather than exhausted: the classifier and the generator are
+            # the same scripted model, and a classifier call eating the only scripted
+            # reply turns every answer after it into an empty one.
+            return replies[0] if repeat else ""
+
+        def stream(user_prompt: str, system_prompt: str = "", max_tokens=None):
+            yield complete(user_prompt, system_prompt, max_tokens)
+
+        # `__class__` rather than a constructor call: no client and no index, both of
+        # which are not wanted in a test that never reaches the model.
+        assistant.__class__ = Assistant
+        assistant.__dict__.update({"_complete": complete, "_stream": stream})
+        assistant.retrieval = retrieval
+        assistant.asked = asked
+
+        main.state["assistant"] = assistant
+
+        return retrieval, asked
+
+    def titled_conversation(self, conversation_id: str):
+        """A conversation's stored name, read the way a reload would read it."""
+        return self.client.get(
+            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_A}
+        ).json()["title"]
 
     def conversations_in_db(self) -> list[str]:
         return list(self.db.scalars(select(Conversation.id)).all())
@@ -693,36 +744,8 @@ class NothingToContinueTest(ConversationTestCase):
     VPN = "IT & VPN Guide"
 
     def scripted_assistant(self) -> "ScriptedRetrieval":
-        assistant = main.state["assistant"]
-
-        asked: list[str] = []
-        retrieval = ScriptedRetrieval()
-
-        def complete(user_prompt: str, system_prompt: str = "", max_tokens=None) -> str:
-            asked.append(user_prompt)
-
-            # One reply for everything, because the classifier is called on the same
-            # scripted model as the generator and must not eat the answer. A reply
-            # that names no category reads as an ordinary question, which is what
-            # the questions below are.
-            if system_prompt == TITLE_SYSTEM_PROMPT:
-                return "About this"
-
-            return "There is more to say about this."
-
-        def stream(user_prompt: str, system_prompt: str = "", max_tokens=None):
-            yield complete(user_prompt, system_prompt, max_tokens)
-
-        # `__new__` rather than a constructor call: the client is not wanted and
-        # the index is not either, since retrieval here is scripted.
-        assistant.__class__ = Assistant
-        assistant.__dict__.update({"_complete": complete, "_stream": stream})
-        assistant.retrieval = retrieval
-        assistant.asked = asked
-
-        main.state["assistant"] = assistant
-
-        return retrieval
+        """The real assistant, with only the model scripted."""
+        return self.real_assistant()[0]
 
     def reply(self, response) -> dict:
         """The `done` event of a streamed turn: what the turn actually answered."""
@@ -791,15 +814,20 @@ class NothingToContinueTest(ConversationTestCase):
         self.assertEqual({each["document"] for each in leave_again["sources"]}, {self.LEAVE})
         self.assertEqual({each["document"] for each in vpn_again["sources"]}, {self.VPN})
 
-    def test_a_conversation_is_not_named_by_a_message_that_only_asks_for_more(self):
+    def test_it_is_named_for_asking_for_more_and_for_nothing_else(self):
+        # A conversation is named once by its first message, whatever that message
+        # is, so this one is called "Quick chat" rather than being left untitled.
+        # What the title may not be is the message: "anything else?" in a sidebar is
+        # a conversation about the conversation.
         self.scripted_assistant()
         conversation_id = self.new_conversation()
 
         events = read_events(self.ask(conversation_id, "anything else?").text)
 
-        # The title waits for a real question, so the sidebar does not fill with
-        # conversations named "anything else".
-        self.assertNotIn("title", [event["type"] for event in events])
+        self.assertEqual(
+            [event["title"] for event in events if event["type"] == "title"],
+            ["Quick chat"],
+        )
 
 
 class ScriptedRetrieval:
@@ -850,9 +878,23 @@ def candidate(text: str, document: str, section: str):
 
 
 class TitleGenerationTest(ConversationTestCase):
-    def test_a_greeting_does_not_name_the_conversation(self):
-        # Naming a thread "Hey" is how the sidebar fills with conversations that
-        # have no subject in them. The title waits for the first real question.
+    """A conversation is named once, by its first message, and never renamed.
+
+    The rule replaced an earlier one that waited for the first real question. That
+    one left a greeting-first conversation untitled until something was asked in it,
+    and then named it after the question rather than after the conversation, so the
+    row a reader was looking at changed under them.
+    """
+
+    def titled(self, conversation_id: str):
+        return self.titled_conversation(conversation_id)
+
+    def test_a_greeting_names_it_and_a_later_question_does_not_rename_it(self):
+        # A conversation is named by its first message, whatever that message was,
+        # and named for good. The earlier rule — a greeting waits, and the first
+        # real question names the thread — made a sidebar row say something about a
+        # conversation that was not the one it stood for, and changed under the
+        # reader's feet.
         class GreetingFirstAssistant(StubAssistant):
             def classify(self, question, history=None, previous=None) -> Classification:
                 category = (
@@ -867,30 +909,75 @@ class TitleGenerationTest(ConversationTestCase):
         conversation_id = self.new_conversation()
 
         greeting = read_events(self.ask(conversation_id, "Hey").text)
-        remark = read_events(self.ask(conversation_id, "there is no question").text)
+        titles = [event for event in greeting if event["type"] == "title"]
 
-        self.assertNotIn("title", [event["type"] for event in greeting])
-        self.assertNotIn("title", [event["type"] for event in remark])
-        detail = self.client.get(
-            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_A}
-        ).json()
-        self.assertIsNone(detail["title"])
+        self.assertEqual([event["title"] for event in titles], ["Greeting"])
+        self.assertEqual(self.titled(conversation_id), "Greeting")
 
-        # And the first real question names it, from that question rather than from
-        # the greeting that opened the thread.
+        # The question that follows is answered, and the name does not move.
         asked = read_events(
             self.ask(conversation_id, "How much annual leave do I get?").text
         )
-        self.assertEqual(asked[-1]["type"], "title")
-        # From the question, not from either of the messages before it.
-        self.assertIn("annual", asked[-1]["title"].lower())
-        self.assertNotIn("hey", asked[-1]["title"].lower())
-        self.assertNotIn("question", asked[-1]["title"].lower())
 
-        detail = self.client.get(
-            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_A}
-        ).json()
-        self.assertEqual(detail["title"], asked[-1]["title"])
+        self.assertEqual([event for event in asked if event["type"] == "title"], [])
+        self.assertEqual(self.titled(conversation_id), "Greeting")
+
+    def test_a_thank_you_first_is_a_quick_chat(self):
+        self.answering_as(Category.CONVERSATIONAL, "thanks")
+        conversation_id = self.new_conversation()
+
+        events = read_events(self.ask(conversation_id, "thanks").text)
+
+        self.assertEqual(
+            [event["title"] for event in events if event["type"] == "title"],
+            ["Quick chat"],
+        )
+
+    def test_an_unreadable_first_message_is_named_for_being_unreadable(self):
+        self.answering_as(Category.CONVERSATIONAL, "vdghgjkhh")
+        conversation_id = self.new_conversation()
+
+        events = read_events(self.ask(conversation_id, "vdghgjkhh").text)
+
+        # Not the keyboard accident, which would put it in a sidebar for as long as
+        # the conversation exists.
+        self.assertEqual(
+            [event["title"] for event in events if event["type"] == "title"],
+            ["Unclear message"],
+        )
+
+    def answering_as(self, category: Category, *messages: str) -> None:
+        """A stub that treats the named messages as the kind they are.
+
+        Everything else stays a company question, which is what makes a conversation
+        worth naming the long way round.
+        """
+
+        class CategorisingAssistant(StubAssistant):
+            def classify(self, question, history=None, previous=None) -> Classification:
+                if question.strip().lower() in {message.lower() for message in messages}:
+                    return Classification(category, question)
+
+                return Classification(Category.COMPANY_QUESTION, question)
+
+        main.state["assistant"] = CategorisingAssistant()
+
+    def test_a_refused_first_message_is_named_without_the_detail(self):
+        class RestrictedAssistant(StubAssistant):
+            def classify(self, question, history=None, previous=None) -> Classification:
+                return Classification(Category.RESTRICTED, question)
+
+        main.state["assistant"] = RestrictedAssistant()
+
+        conversation_id = self.new_conversation()
+
+        events = read_events(self.ask(conversation_id, "What is Kwame's salary?").text)
+        titles = [event["title"] for event in events if event["type"] == "title"]
+
+        self.assertEqual(titles, ["Restricted request"])
+        # The name outlives the conversation in a list somebody else can see, and it
+        # says nothing about whose salary was asked for.
+        self.assertNotIn("Kwame", self.titled(conversation_id))
 
     def test_a_question_the_documents_do_not_cover_still_names_the_conversation(self):
         # The question is what names a thread, not whether it could be answered:
@@ -1037,6 +1124,84 @@ class TitleGenerationTest(ConversationTestCase):
         # The answer arrived and the conversation ended up named, without the
         # client ever having seen the title event.
         self.assertEqual(detail["title"], "About: How much leave?")
+
+
+class ConversationCountersTest(ConversationTestCase):
+    """How far along a conversation is, read from the conversation itself.
+
+    The unreadable-reply streak and the once-only introduction are both counted out
+    of the messages this conversation holds, never remembered between requests. That
+    is what makes them survive a reload, and what stops two conversations in the
+    same browser from sharing one count.
+    """
+
+    def test_two_slips_in_a_row_offer_examples_on_the_second(self):
+        self.real_assistant()
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "vdghgjkhh")
+        self.ask(conversation_id, "asdfgh")
+
+        detail = self.client.get(
+            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_A}
+        ).json()
+
+        # The streak was counted out of the stored messages, not out of anything the
+        # process remembered between the two requests.
+        self.assertIn("Still not catching it", detail["messages"][-1]["content"])
+
+    def test_the_count_is_a_conversation_s_and_not_the_browser_s(self):
+        self.real_assistant()
+        first = self.new_conversation()
+        second = self.new_conversation()
+
+        self.ask(first, "vdghgjkhh")
+        self.ask(first, "asdfgh")
+
+        # The second conversation has said nothing, so it is at the beginning of the
+        # sequence rather than continuing the first one's.
+        self.ask(second, "jkljkl")
+        detail = self.client.get(
+            f"/api/conversations/{second}", params={"client_id": CLIENT_A}
+        ).json()
+
+        self.assertIn("couldn't quite make that out", detail["messages"][-1]["content"])
+
+    def test_a_rename_survives_everything_that_follows_it(self):
+        conversation_id = self.new_conversation()
+
+        renamed = self.client.patch(
+            f"/api/conversations/{conversation_id}",
+            json={"client_id": CLIENT_A, "title": "Leave, carefully"},
+            headers=self.csrf_headers(),
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+
+        for question in ["How much annual leave do I get?", "anything else?", "thanks"]:
+            self.ask(conversation_id, question)
+
+        detail = self.client.get(
+            f"/api/conversations/{conversation_id}", params={"client_id": CLIENT_A}
+        ).json()
+
+        # The name is the reader's own and nothing afterwards touches it: not a
+        # later message, not a reload, not the thread growing underneath it.
+        self.assertEqual(detail["title"], "Leave, carefully")
+
+    def test_a_renamed_conversation_is_not_renamed_again_by_a_later_turn(self):
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "Hey")
+        self.client.patch(
+            f"/api/conversations/{conversation_id}",
+            json={"client_id": CLIENT_A, "title": "My leave"},
+            headers=self.csrf_headers(),
+        )
+
+        events = read_events(self.ask(conversation_id, "and my notice period?").text)
+
+        self.assertEqual([event for event in events if event["type"] == "title"], [])
+        self.assertEqual(self.titled_conversation(conversation_id), "My leave")
 
 
 class NoExpiryTest(ConversationTestCase):

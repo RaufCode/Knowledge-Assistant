@@ -20,6 +20,7 @@ from app.database import (
     Message,
     SessionLocal,
     User,
+    assistant_replies,
     cited_chunk_ids,
     cited_documents,
     create_conversation,
@@ -29,11 +30,17 @@ from app.database import (
     last_exchange,
     list_owned_conversations,
     recent_turns,
+    says_the_invitation,
     touch,
+    unreadable_replies,
 )
 from app.dependencies import get_current_user, get_db, open_db, require_csrf
-from app.rag.engine import Assistant, LlmUnavailable, PreviousAnswer
-from app.rag.guard import Category
+from app.rag.engine import (
+    Assistant,
+    LlmUnavailable,
+    PreviousAnswer,
+    title_for_first_message,
+)
 from app.rag.ingest import build_index
 from app.rate_limit import limiter, rate_limit_exceeded_handler
 from app.schemas_auth import check_password_policy
@@ -310,23 +317,42 @@ def delete_conversation(
 def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None:
     """What this message follows, as far as answering it needs to know.
 
-    Everything the classifier and the retrieval both need, and all of it read from
-    the messages stored under *this* conversation's id: whether the last turn was a
-    refusal, which passages it cited, which passages this thread has already shown,
-    which documents it has cited, and whether it holds a topic worth continuing at
-    all. Nothing here is module state, nothing is keyed by client, and a reload
-    changes none of it — so a reader who refreshes and then asks "anything else?"
-    gets the same continuation, and a reader who opens a second conversation gets
-    none of the first one's.
+    Everything the classifier, the conversation pool and the retrieval all need, and
+    all of it read from the messages stored under *this* conversation's id: whether
+    the last turn was a refusal, which passages it cited, which passages this thread
+    has already shown, which documents it has cited, whether it holds a topic worth
+    continuing at all, how many replies it has had, whether it has already said what
+    this assistant is for, and how many unreadable replies are at the end of it.
+    Nothing here is module state, nothing is keyed by client, and a reload changes
+    none of it — so a reader who refreshes and then asks "anything else?" gets the
+    same continuation, and a reader who opens a second conversation gets none of the
+    first one's.
 
-    Returns None for a conversation with no answers in it, which is what makes a
+    None only for a conversation with nothing in it yet, which is what makes a
     context-dependent first message ("anything else?") something to say so about
-    rather than something to answer.
+    rather than something to answer. A conversation holding only greetings has a
+    record — it just has no topic — and its replies still count towards the pool
+    that answers the next greeting.
     """
+    reply_count = assistant_replies(db, conversation_id)
+
+    if reply_count == 0:
+        return None
+
     topic = has_usable_topic(db, conversation_id)
+    invited = says_the_invitation(db, conversation_id)
+    unreadable_streak, unreadable_seen = unreadable_replies(db, conversation_id)
 
     if not topic:
-        return None
+        # Nothing to continue, but something said. The counters still come from the
+        # conversation rather than from memory, which is what keeps the greeting
+        # pool and the unreadable count right across a reload.
+        return PreviousAnswer(
+            assistant_replies=reply_count,
+            invitation_given=invited,
+            unreadable_streak=unreadable_streak,
+            unreadable_seen=unreadable_seen,
+        )
 
     question, answer = last_exchange(db, conversation_id)
 
@@ -338,6 +364,10 @@ def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None
             has_topic=True,
             cited=cited_chunk_ids(db, conversation_id),
             documents=cited_documents(db, conversation_id),
+            assistant_replies=reply_count,
+            invitation_given=invited,
+            unreadable_streak=unreadable_streak,
+            unreadable_seen=unreadable_seen,
         )
 
     return PreviousAnswer(
@@ -348,6 +378,10 @@ def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None
         cited=cited_chunk_ids(db, conversation_id),
         documents=cited_documents(db, conversation_id),
         has_topic=True,
+        assistant_replies=reply_count,
+        invitation_given=invited,
+        unreadable_streak=unreadable_streak,
+        unreadable_seen=unreadable_seen,
     )
 
 
@@ -402,27 +436,27 @@ def send_message(
 
     def events() -> Iterator[str]:
         try:
-            # Classified here rather than inside `ask_stream` so that the same
-            # decision decides both what is said and whether the conversation is
-            # named: naming it from "hey" is how the sidebar fills with
-            # conversations called "Hey". Passed back in rather than asked for a
-            # second time — it is one classification, with two consequences.
+            # Classified here rather than inside `ask_stream`, so that one
+            # decision decides what is said *and* what the conversation is called.
+            # Passed back in rather than asked for a second time.
             classification = state["assistant"].classify(
                 req.content, history, previous
             )
 
-            # Naming the conversation is a second model call, so it runs beside the
-            # answer rather than in front of it. Only an untitled conversation gets
-            # one, and only a real question is worth naming: until a question is
-            # asked the thread stays "New conversation", and the first one is what
-            # names it.
+            # A conversation is named once, by its first message, whatever that
+            # message turned out to be. The trigger is the conversation having no
+            # name, not the message being worth naming: a thread that opens with a
+            # greeting and is asked a real question an hour later is a greeting
+            # thread, and renaming it when the question arrives makes the sidebar
+            # say something about a conversation that is not the one being read.
             title_job = None
+            fixed_title = None
 
-            if conversation.title is None and classification.category in (
-                Category.COMPANY_QUESTION,
-                Category.FOLLOW_UP,
-            ):
-                title_job = TitleJob(conversation.id, classification.query).start()
+            if conversation.title is None:
+                fixed_title = state["assistant"].title_for(req.content, classification)
+
+                if fixed_title is None:
+                    title_job = TitleJob(conversation.id, classification.query).start()
 
             for event in state["assistant"].ask_stream(
                 req.content, history, classification, previous
@@ -452,10 +486,21 @@ def send_message(
                     touch(db, conversation)
                     yield sse(event)
 
-                    if title_job is not None:
+                    # The name is the last thing the stream says, and it is always
+                    # sent: a rule-based one is already known, and a generated one
+                    # has had its own wait beside the answer rather than in front of
+                    # it. A name that arrives late is still better than none, and a
+                    # name that never arrives leaves the row labelled "New
+                    # conversation" rather than failing the answer that did.
+                    title = fixed_title
+
+                    if title is None and title_job is not None:
                         title = title_job.title(wait_seconds=TITLE_WAIT_SECONDS)
-                        if title:
-                            yield sse({"type": "title", "title": title})
+
+                    announced = settle_title(conversation, title, db) if title else None
+
+                    if announced:
+                        yield sse({"type": "title", "title": announced})
                 else:
                     yield sse(event)
         except LlmUnavailable as exc:
@@ -486,6 +531,34 @@ def send_message(
 TITLE_WAIT_SECONDS = 10
 
 
+def settle_title(conversation: Conversation, title: str, db: Session) -> str | None:
+    """Puts a name on a conversation, and returns the name to announce.
+
+    Re-read first, because the answer is generated while somebody else may be
+    naming: the thread that wrote this title may already have stored it, and a name
+    typed into the sidebar between this turn starting and this line running is the
+    reader's own name for their own conversation and is not this code's to replace.
+
+    Three outcomes, and the difference matters:
+
+    - unnamed, so the name is written here and announced;
+    - already this name, because the naming thread got there first — announced, since
+      it is the conversation's name and the sidebar has not been told;
+    - some other name, which is somebody's own and is neither written over nor
+      announced.
+    """
+    db.refresh(conversation)
+
+    if conversation.title is None:
+        conversation.title = title
+        conversation.updated_at = datetime.now(timezone.utc)
+        db.commit()
+
+        return title
+
+    return title if conversation.title == title else None
+
+
 class TitleJob:
     """Names a conversation that has something to be named after, on its own thread.
 
@@ -494,6 +567,11 @@ class TitleJob:
     reader is watching or, if it were left until after the last event, be thrown
     away by a client that hangs up first. On a thread it costs the answer
     nothing, and the name is stored whether or not anyone is still listening.
+
+    The store is best-effort and the job is a convenience: the name this produces
+    is the same one the caller would have used had the call come back in time, and a
+    conversation that cannot be named is left untitled rather than failing an answer
+    that has already been delivered.
     """
 
     def __init__(self, conversation_id: str, first_question: str) -> None:

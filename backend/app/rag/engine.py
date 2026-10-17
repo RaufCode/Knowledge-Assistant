@@ -14,6 +14,8 @@ from app.rag.capabilities import (
     CAPABILITIES_BRIEF,
     CAPABILITIES_REPLY,
     CONVERSATIONAL_FALLBACK,
+    pleasantry_reply,
+    unreadable_reply,
 )
 from app.rag.guard import (
     CLASSIFIER_SYSTEM_PROMPT,
@@ -22,7 +24,9 @@ from app.rag.guard import (
     asks_about_capabilities,
     build_classifier_prompt,
     classify_by_rules,
+    is_greeting,
     is_restricted_request,
+    is_unintelligible,
     needs_earlier_context,
     parse_classification,
 )
@@ -105,6 +109,20 @@ class PreviousAnswer:
     # small talk, out-of-scope replies and refusals do not count, so a thread that
     # has only those has no topic and "anything else?" is not a question about it.
     has_topic: bool = False
+    # How many replies this conversation has had, and whether one of them has
+    # already said what the assistant is for. What a greeting is answered with
+    # depends on both: the invitation is offered once, and the rest rotate.
+    #
+    # Counted from this conversation's own messages rather than kept in memory,
+    # because a conversation is the only thing that should be able to know how far
+    # along it is, and a reload must not restart the count.
+    assistant_replies: int = 0
+    invitation_given: bool = False
+    # How many unreadable replies are at the end of the thread, and how many there
+    # have ever been in it. The first chooses how much help to offer, the second
+    # rotates it. Both are read out of the messages, so a refresh changes neither.
+    unreadable_streak: int = 0
+    unreadable_seen: int = 0
 
 
 # The vocabulary the wire used before `kind` existed, kept so a client that has
@@ -264,11 +282,28 @@ HISTORY_MESSAGES = 4
 # output budget: labelling a conversation never needs the answer's context, and
 # letting it share the answer's budget would let the model ramble.
 TITLE_SYSTEM_PROMPT = (
-    "You name conversation threads. From the first user message in a fresh "
-    "conversation, give it a short title of at most six words that a person "
-    "would recognise later in a list of conversations. Reply with only the "
-    "title: no quotes, no surrounding text and no trailing period."
+    "You name conversation threads. From the first user message in a conversation, "
+    "give it a title of at most six words and at least three, in sentence case, "
+    "that a person would recognise later in a list of conversations. Reply with "
+    "only the title: no quotes, no surrounding text, no trailing period and no "
+    "full stop."
 )
+
+# What a conversation is called when the model cannot be asked, and when the first
+# message did not say anything to name it by.
+#
+# Fixed words rather than the message itself, because each of these says what the
+# conversation turned out to be, and a sidebar row is the only place anybody ever
+# reads it again.
+GREETING_TITLE = "Greeting"
+QUICK_CHAT_TITLE = "Quick chat"
+UNCLEAR_TITLE = "Unclear message"
+
+# A conversation that began with a request the assistant will not answer is named
+# for the request and not for what was asked. A title is the one piece of the
+# conversation that outlives it in a list somebody else can see through a shared
+# screen, and "What is Kwame's salary?" is not something to write where it stays.
+RESTRICTED_TITLE = "Restricted request"
 
 # Fallback for when the model is unreachable or its title comes back unusable.
 # Single-line, and bounded so the longest title still fits a sidebar row.
@@ -325,6 +360,36 @@ def truncate_title(text: str, max_chars: int = TITLE_MAX_CHARS) -> str:
     return cut
 
 
+def title_for_first_message(
+    question: str, classification: Classification, vocabulary: frozenset[str] = frozenset()
+) -> str | None:
+    """The name this conversation gets from its first message, or None to ask.
+
+    A conversation is named once, by its first message, and never renamed: a name
+    that changed with the topic would make a sidebar unreadable, because the only
+    way to find a conversation again is to recognise its name.
+
+    Only a message with something to name is sent to the model. The rest are named
+    by rule — and named by what the conversation turned out to be rather than by
+    what was typed, which matters most for the two that must not repeat the message:
+    an unreadable one keeps no keyboard accident in the list forever, and a refused
+    one keeps neither a name nor a detail of somebody's private business.
+    """
+    if classification.category is Category.RESTRICTED:
+        return RESTRICTED_TITLE
+
+    if classification.category is not Category.CONVERSATIONAL:
+        return None
+
+    if is_unintelligible(question, vocabulary):
+        return UNCLEAR_TITLE
+
+    if is_greeting(question):
+        return GREETING_TITLE
+
+    return QUICK_CHAT_TITLE
+
+
 class LlmUnavailable(Exception):
     """No answer could be produced from the configured NVIDIA model.
 
@@ -338,6 +403,13 @@ class LlmUnavailable(Exception):
 
 
 class Assistant:
+    # The indexed documents' own vocabulary, for deciding that a message is readable.
+    # A class-level default rather than an attribute of `__init__` alone, so an
+    # assistant built without an index — the shape the tests use, and the shape a
+    # deployment without documents would have — still has the built-in word list to
+    # fall back on instead of an `AttributeError` on the first "hey".
+    _vocabulary: frozenset[str] = frozenset()
+
     def __init__(self, index: VectorStoreIndex):
         # `vector_candidates`, not `top_k`: the depth is what decides which chunks
         # the keyword leg is allowed to rescue, and a retriever built at `top_k`
@@ -349,13 +421,13 @@ class Assistant:
         # keyword side is built from its docstore rather than from a second copy
         # of the corpus elsewhere. Built once, here, because scoring it is a pass
         # over 62 chunks and doing that per question would cost more than it saves.
-        #
+        self._keywords = KeywordIndex(index.docstore.docs.values())
         # `documents` is the same corpus read the other way round, for the
         # expansion path: whole documents by title, out of the store, rather than
         # a ranked window out of a search.
         self.retrieval = HybridRetriever(
             self.retriever,
-            KeywordIndex(index.docstore.docs.values()),
+            self._keywords,
             documents=IndexedDocuments(index),
             top_k=settings.top_k,
             vector_candidates=settings.vector_candidates,
@@ -365,6 +437,10 @@ class Assistant:
             recall_floor=settings.recall_floor,
             recall_candidates=settings.recall_candidates,
         )
+        # The corpus's own vocabulary, for deciding that a message is not a
+        # keyboard accident: a word these documents use is a real word, whether or
+        # not a dictionary of English carries it.
+        self._vocabulary = self._keywords.vocabulary
         # Built once so the HTTP connection is reused across turns. Only built
         # when a key is present, so a missing key surfaces as a 503 from /chat
         # rather than an OpenAI client-init error escaping as a 500.
@@ -532,18 +608,31 @@ class Assistant:
         )
         time.sleep(delay)
 
-    def generate_title(self, first_question: str) -> str:
-        """A short label for a conversation, from the first real question in it.
+    def title_for(
+        self, question: str, classification: Classification
+    ) -> str | None:
+        """`title_for_first_message`, with this deployment's own vocabulary.
 
-        The model names the thread once, right after that exchange, so a new
-        conversation appears on the sidebar as something to read rather than as
-        "New conversation". The caller decides which message is worth naming —
-        a greeting is not, and a sidebar of conversations called "Hey" is worse
-        than a sidebar of untitled ones.
+        The words the indexed documents use are part of what makes a message
+        readable, and they are only known here.
+        """
+        return title_for_first_message(question, classification, self._vocabulary)
+
+    def generate_title(self, first_question: str) -> str:
+        """A short label for a conversation, from the message that started it.
+
+        The model names the thread once, right after that first exchange, so a
+        conversation appears in the sidebar as something to read rather than as
+        "New conversation". Which message gets the model's attention is
+        `title_for_first_message`'s decision, not this one's: a greeting, a laugh
+        and a refused request are named by rule, and only a message that actually
+        says what the conversation is about is worth a model call.
 
         The reply is a title but can still carry quotes or run long, so it is
         always cleaned and bounded; if the model is unavailable, the question
-        itself is truncated to the same length.
+        itself is truncated to the same length — which is the fallback the answer
+        does not notice, because it happens on its own thread and long after the
+        answer has been delivered.
         """
         try:
             raw = self._complete(
@@ -603,15 +692,19 @@ class Assistant:
         if classification.category is Category.CONVERSATIONAL:
             yield {"type": "status", "stage": "writing"}
 
-            # The one conversational reply that is not generated: there is no
-            # earlier turn to acknowledge, so there is nothing to be warm about,
-            # and a model asked to invent a reply would say "let me know if you
-            # need anything else" — which is the message that brought us here.
-            if orphaned_context_question(question, previous):
-                yield {"type": "delta", "text": NO_PRIOR_TOPIC_MSG}
+            # The replies that are chosen rather than written. A greeting, a
+            # thank-you, a laugh, a keyboard accident and a message that needed an
+            # earlier turn all have exactly one right answer, and a model asked to
+            # improvise one produces a different sentence each time — including,
+            # eventually, a sign-off on a conversation that has not started.
+            fixed = self.fixed_conversational_reply(question, previous)
+
+            if fixed is not None:
+                for piece in _stream_pieces(fixed):
+                    yield {"type": "delta", "text": piece}
                 yield {
                     "type": "done",
-                    **_result(NO_PRIOR_TOPIC_MSG, ResponseKind.CONVERSATIONAL),
+                    **_result(fixed, ResponseKind.CONVERSATIONAL),
                 }
                 return
 
@@ -703,8 +796,10 @@ class Assistant:
         classification = classification or self.classify(question, history, previous)
 
         if classification.category is Category.CONVERSATIONAL:
-            if orphaned_context_question(question, previous):
-                return _result(NO_PRIOR_TOPIC_MSG, ResponseKind.CONVERSATIONAL)
+            fixed = self.fixed_conversational_reply(question, previous)
+
+            if fixed is not None:
+                return _result(fixed, ResponseKind.CONVERSATIONAL)
 
             return _result(
                 self.conversational_reply(question, history), ResponseKind.CONVERSATIONAL
@@ -780,6 +875,19 @@ class Assistant:
         # build on" would be answering a question nobody asked.
         if by_rule is Category.CONVERSATIONAL:
             return Classification(by_rule, question)
+
+        # A message that could not be read, and before anything else that could
+        # mistake it for one: before the context-dependent check below, so "and then"
+        # typed at the keyboard is not read as a follow-up with nothing to follow,
+        # and before the model, so it is never rewritten into a question nobody
+        # asked.
+        #
+        # Laughter has already been answered above — a laugh is a run of letters
+        # too, and this is the check that would otherwise take it.
+        if is_unintelligible(question, self._vocabulary):
+            logger.info("could not read %r; answering as unreadable", question)
+
+            return Classification(Category.CONVERSATIONAL, question)
 
         # A message that only means something against earlier turns, in a
         # conversation with none. Decided before the classifier, before the
@@ -958,6 +1066,56 @@ class Assistant:
 
         return text, ResponseKind.ANSWER, sources, retrieval_confidence(candidates)
 
+    def fixed_conversational_reply(
+        self, message: str, previous: PreviousAnswer | None
+    ) -> str | None:
+        """The reply to this message, when there is only one right reply.
+
+        Four kinds of message, all of which ask nothing of the documents and all of
+        which are better served by words chosen once than by words invented:
+
+        - a question about what this assistant is, answered from the capabilities
+          description rather than generated, because an improvised answer to "what
+          can you do?" is a promise nobody checked;
+        - a message that needed an earlier turn this conversation does not have,
+          which is said plainly rather than searched for;
+        - a message that could not be read, which gets a warmer reply the more of
+          them there have been;
+        - a greeting, a thank-you, an acknowledgement or a laugh, which gets one of
+          a small pool and says what this assistant is for exactly once.
+
+        None means the message is a remark about the exchange itself — "there is no
+        question", "that's not what I asked" — which is the one conversational
+        message that is genuinely a reply to something, and the one worth writing.
+        """
+        if asks_about_capabilities(message):
+            return CAPABILITIES_REPLY
+
+        # Before the gibberish check: "anything else?" with no earlier turn has a
+        # true answer whatever it is made of, and the answer is that there is
+        # nothing to continue.
+        if orphaned_context_question(message, previous):
+            return NO_PRIOR_TOPIC_MSG
+
+        streak = previous.unreadable_streak if previous else 0
+        seen = previous.unreadable_seen if previous else 0
+
+        # A greeting, a thank-you, an acknowledgement or a laugh is answered as one,
+        # and this is checked before the gibberish check below because a laugh is
+        # also a run of letters: "hhhhh" is in no word list, and reading it as a
+        # keyboard accident would answer somebody's laugh with "did your keyboard
+        # slip?".
+        if classify_by_rules(message) is Category.CONVERSATIONAL:
+            replies = previous.assistant_replies if previous else 0
+            invited = previous.invitation_given if previous else False
+
+            return pleasantry_reply(replies, invited)
+
+        if is_unintelligible(message, self._vocabulary):
+            return unreadable_reply(streak + 1, seen)
+
+        return None
+
     def conversational_pieces(
         self, message: str, history: Sequence[tuple[str, str]] = ()
     ) -> Iterator[str]:
@@ -972,16 +1130,10 @@ class Assistant:
         Streamed like any other answer, so the exchange feels the same as one being
         answered from a document.
 
-        A question about what this assistant is, and what it covers, is answered
-        from `app/rag/capabilities.py` rather than generated at all. That is the
-        one reply in the system where an improvised answer is a promise: a model
-        asked what it can do will describe whatever would read best, including
-        abilities this deployment does not have.
+        The messages that have one right reply never reach here: they are answered
+        from `fixed_conversational_reply`, which is also why this only has to write
+        the reply that is genuinely a response to the exchange.
         """
-        if asks_about_capabilities(message):
-            yield CAPABILITIES_REPLY
-            return
-
         try:
             yield from self._stream(
                 _conversational_prompt(message, history),

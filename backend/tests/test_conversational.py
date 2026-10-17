@@ -7,16 +7,20 @@ came back as "not found in the company documents".
 """
 
 import unittest
+from dataclasses import replace
 
 from app.rag.capabilities import (
     CAPABILITIES_BRIEF,
     CAPABILITIES_REPLY,
     CONVERSATIONAL_FALLBACK,
+    PLEASANTRY_INVITATION,
+    PLEASANTRY_REPLIES,
 )
 from app.rag.engine import (
     CONVERSATIONAL_SYSTEM_PROMPT,
     Assistant,
     LlmUnavailable,
+    PreviousAnswer,
 )
 from app.rag.guard import (
     Category,
@@ -134,21 +138,47 @@ class ConversationalShortCircuitTest(unittest.TestCase):
         """
         return Classification(Category.CONVERSATIONAL, message)
 
-    def test_stream_answers_without_retrieval(self):
-        assistant = self.assistant_answering("Hello! Ask me about leave or IT setup.")
+    def test_stream_answers_without_retrieval_or_a_model_call(self):
+        assistant = self.assistant_answering("a generated reply nobody should see")
 
         events = list(assistant.ask_stream("  hello!  "))
 
-        self.assertEqual([event["type"] for event in events], ["status", "delta", "done"])
+        self.assertEqual([event["type"] for event in events][0], "status")
+        self.assertEqual([event["type"] for event in events][-1], "done")
         done = events[-1]
-        self.assertEqual(done["answer"], "Hello! Ask me about leave or IT setup.")
         self.assertEqual(done["kind"], "conversational")
+        # From the pool rather than from the model. A greeting is the common case on
+        # a first visit, and a generated reply to one is a fresh set of words each
+        # time — including, eventually, a sign-off on a conversation that has not
+        # started. The scripted reply is here to prove it is not used.
+        self.assertEqual(done["answer"], PLEASANTRY_INVITATION)
+        self.assertNotEqual(done["answer"], "a generated reply nobody should see")
+        self.assertEqual(assistant.prompts, [])
         # Nothing to be confident about and nothing to cite: this was not built
         # from a single passage.
         self.assertIsNone(done["confidence"])
         self.assertEqual(done["sources"], [])
-        # The rules decided this one, so there was no classification call to make.
-        self.assertEqual(len(assistant.prompts), 1)
+
+    def test_ten_greetings_in_a_row_never_invite_a_reply_twice(self):
+        assistant = self.assistant_answering(["unused"] * 10)
+        conversation = PreviousAnswer()
+
+        replies = []
+
+        for turn in range(10):
+            previous = replace(conversation, assistant_replies=turn)
+            replies.append(
+                list(assistant.ask_stream("hello", previous=previous))[-1]["answer"]
+            )
+
+        # One introduction, then rotation. A reply that keeps asking whether it can
+        # help is a sign-off with extra steps, and ten of them is a conversation
+        # that sounds like it wants to end.
+        self.assertEqual(replies.count(PLEASANTRY_INVITATION), 1)
+        self.assertEqual(replies[0], PLEASANTRY_INVITATION)
+        self.assertEqual(assistant.prompts, [])
+        self.assertTrue(all(reply in PLEASANTRY_REPLIES for reply in replies[1:]))
+        self.assertGreater(len(set(replies[1:])), 1)
 
     def test_a_remark_about_the_exchange_is_answered_as_a_reply_not_a_refusal(self):
         assistant = self.assistant_answering(
@@ -195,13 +225,15 @@ class ConversationalShortCircuitTest(unittest.TestCase):
         self.assertIn("Hello! Ask me anything.", prompt)
         self.assertLess(prompt.index("Hey"), prompt.index("there is no question"))
 
-    def test_plain_answer_is_unchanged(self):
+    def test_the_streamed_and_unstreamed_paths_say_the_same_thing(self):
         assistant = self.assistant_answering("Good to hear from you.")
 
         result = assistant.ask("hello")
+        streamed = list(assistant.ask_stream("hello"))[-1]
 
-        self.assertEqual(result["answer"], "Good to hear from you.")
+        self.assertEqual(result["answer"], streamed["answer"])
         self.assertEqual(result["kind"], "conversational")
+        self.assertEqual(result["answer"], PLEASANTRY_INVITATION)
 
     def test_capabilities_are_answered_from_the_config_not_the_model(self):
         assistant = self.assistant_answering("I can do anything you like.")

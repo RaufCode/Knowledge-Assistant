@@ -178,6 +178,16 @@ class KeywordIndex:
     def __len__(self) -> int:
         return self._count
 
+    @property
+    def vocabulary(self) -> frozenset[str]:
+        """Every term the corpus actually uses.
+
+        Read by the gibberish check as a word list, so that a word this company
+        uses — `globalprotect`, `grievance`, `vpn` — is recognised as a real word
+        without being in any dictionary of English.
+        """
+        return frozenset(self._document_frequency)
+
     def _idf(self, term: str) -> float:
         """How much a term appearing in one chunk says about the question.
 
