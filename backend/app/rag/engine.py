@@ -23,11 +23,13 @@ from app.rag.guard import (
     build_classifier_prompt,
     classify_by_rules,
     is_restricted_request,
+    needs_earlier_context,
     parse_classification,
 )
 from app.rag.retrieval import (
     Candidate,
     HybridRetriever,
+    IndexedDocuments,
     KeywordIndex,
     chunk_key,
     retrieval_confidence,
@@ -92,7 +94,17 @@ class PreviousAnswer:
     question: str = ""
     answer: str = ""
     sources: tuple[Mapping[str, object], ...] = ()
+    # Every chunk id this conversation has shown, in any answer. The whole thread
+    # and not the last turn: a passage quoted four turns ago has been read, and
+    # quoting it again is not "more".
     cited: frozenset[str] = frozenset()
+    # Every document this conversation has cited, for the same reason.
+    documents: frozenset[str] = frozenset()
+    # Whether the conversation holds anything to continue at all: an earlier
+    # assistant turn that answered, or searched for, an in-scope question. Greetings,
+    # small talk, out-of-scope replies and refusals do not count, so a thread that
+    # has only those has no topic and "anything else?" is not a question about it.
+    has_topic: bool = False
 
 
 # The vocabulary the wire used before `kind` existed, kept so a client that has
@@ -114,6 +126,19 @@ PERSONAL_MSG = (
     "records such as leave balances, salaries or payslips. Please check the HR "
     "self-service portal on the intranet, or contact HR at hr@acmetech.example."
 )
+# A message that needs an earlier turn, in a conversation that has none. Said
+# plainly, because the alternative is answering it: retrieving "anything else?"
+# finds nothing, and a reader is told the documents do not cover it, which is a
+# claim about the corpus made by a message that never asked the corpus anything.
+#
+# Static, and about the conversation rather than about any policy, so it is
+# correct whatever the assistant covers.
+NO_PRIOR_TOPIC_MSG = (
+    "There's no earlier chat in this conversation to build on yet. Ask me a "
+    "question about company policies, onboarding, leave or IT setup and I'll "
+    "help from there."
+)
+
 # The documents behind the topic being continued are used up. Not a gap in the
 # corpus and not a failure: the reader has been given everything those sections
 # say, and the useful thing to do now is offer a different policy rather than a
@@ -324,9 +349,14 @@ class Assistant:
         # keyword side is built from its docstore rather than from a second copy
         # of the corpus elsewhere. Built once, here, because scoring it is a pass
         # over 62 chunks and doing that per question would cost more than it saves.
+        #
+        # `documents` is the same corpus read the other way round, for the
+        # expansion path: whole documents by title, out of the store, rather than
+        # a ranked window out of a search.
         self.retrieval = HybridRetriever(
             self.retriever,
             KeywordIndex(index.docstore.docs.values()),
+            documents=IndexedDocuments(index),
             top_k=settings.top_k,
             vector_candidates=settings.vector_candidates,
             keyword_candidates=settings.keyword_candidates,
@@ -572,6 +602,19 @@ class Assistant:
         # a gap in the corpus that is not there.
         if classification.category is Category.CONVERSATIONAL:
             yield {"type": "status", "stage": "writing"}
+
+            # The one conversational reply that is not generated: there is no
+            # earlier turn to acknowledge, so there is nothing to be warm about,
+            # and a model asked to invent a reply would say "let me know if you
+            # need anything else" — which is the message that brought us here.
+            if orphaned_context_question(question, previous):
+                yield {"type": "delta", "text": NO_PRIOR_TOPIC_MSG}
+                yield {
+                    "type": "done",
+                    **_result(NO_PRIOR_TOPIC_MSG, ResponseKind.CONVERSATIONAL),
+                }
+                return
+
             pieces: list[str] = []
             for piece in self.conversational_pieces(question, history):
                 pieces.append(piece)
@@ -660,6 +703,9 @@ class Assistant:
         classification = classification or self.classify(question, history, previous)
 
         if classification.category is Category.CONVERSATIONAL:
+            if orphaned_context_question(question, previous):
+                return _result(NO_PRIOR_TOPIC_MSG, ResponseKind.CONVERSATIONAL)
+
             return _result(
                 self.conversational_reply(question, history), ResponseKind.CONVERSATIONAL
             )
@@ -723,6 +769,32 @@ class Assistant:
         """
         by_rule = classify_by_rules(question)
 
+        # The guard first, and unconditionally: it is a refusal on grounds of what
+        # the data is, and a message that is both "what about" and about a person's
+        # salary is a refusal rather than a question about the conversation.
+        if by_rule is Category.RESTRICTED:
+            return Classification(by_rule, question)
+
+        # An acknowledgement is not a request for more of anything. "ok" in an empty
+        # conversation is "ok", and answering it with "there is no earlier chat to
+        # build on" would be answering a question nobody asked.
+        if by_rule is Category.CONVERSATIONAL:
+            return Classification(by_rule, question)
+
+        # A message that only means something against earlier turns, in a
+        # conversation with none. Decided before the classifier, before the
+        # rewrite and before retrieval, because the answer does not depend on what
+        # any of them would say: there is nothing to continue from, and the reader
+        # is told that instead of being given a search for a phrase that names no
+        # document.
+        #
+        # Nothing outside this conversation is consulted, and nothing outside it is
+        # remembered: `previous` is read from the messages stored under this
+        # conversation's id, or is None.
+        if orphaned_context_question(question, previous):
+            logger.info("no earlier turn to continue from; answering %r as chat", question)
+            return Classification(Category.CONVERSATIONAL, question)
+
         if by_rule is not None:
             if by_rule is Category.EXPANSION:
                 # A refusal has no passages behind it, so there is nothing an
@@ -737,7 +809,7 @@ class Assistant:
                 if _topic_is_exhausted(previous):
                     return Classification(Category.EXPANSION, question)
 
-                if not _has_previous_answer(previous):
+                if not _can_continue(previous):
                     # Nothing to continue from. "Anything else?" as the first
                     # message of a conversation is a follow-up with nothing to
                     # follow, so it takes the ordinary path and is judged on its
@@ -764,7 +836,9 @@ class Assistant:
             reply,
         )
 
-        if classification.category is Category.EXPANSION and not _has_previous_answer(
+        # An expansion the model found rather than the rules: the same question as
+        # above, and the same requirement of something to continue from.
+        if classification.category is Category.EXPANSION and not _can_continue(
             previous
         ):
             return Classification(Category.FOLLOW_UP, question)
@@ -807,7 +881,7 @@ class Assistant:
         history: Sequence[tuple[str, str]],
         previous: PreviousAnswer | None,
     ) -> Iterator[dict]:
-        """"Anything else?", answered from what the last answer had left.
+        """"Anything else?", answered from what those documents had left.
 
         Never a `not_found`: the documents the reader is on have not run out of
         *topics*, and telling somebody the indexed documents do not cover "anything
@@ -830,27 +904,28 @@ class Assistant:
     ) -> tuple[str, ResponseKind, list[dict], int | None]:
         """The continuation, as text, kind, citations and confidence.
 
-        Retrieval is anchored to the passages the last answer cited, with those
-        passages themselves removed, so what reaches the generator is what the
-        reader has not been shown yet. When there is nothing left, that is said
-        plainly rather than reported as a gap in the corpus.
+        Retrieval is anchored to the documents this conversation's answers cited,
+        read whole out of the store rather than out of a ranked window, with every
+        chunk the thread has shown held back. So "anything else?" after a thorough
+        first answer is answered from the sections of that document nobody quoted,
+        and only says the topic is exhausted once the whole of it has been read.
+
+        When there is nothing left, that is said plainly rather than reported as a
+        gap in the corpus.
         """
         exhausted = (EXHAUSTED_MSG, ResponseKind.NO_MORE_INFO, [], None)
 
-        if previous is None or not previous.sources or _topic_is_exhausted(previous):
+        if previous is None or not previous.documents or _topic_is_exhausted(previous):
             return exhausted
 
-        anchors = {
-            (str(source.get("document", "")), str(source.get("section", "")))
-            for source in previous.sources
-        }
-
         candidates = self.retrieval.retrieve_continuation(
-            previous.question or previous.answer, anchors, previous.cited
+            previous.question or previous.answer, previous.documents, previous.cited
         )
 
         if not candidates:
-            logger.info("nothing left in %d anchored passages to continue", len(anchors))
+            # Those documents are read out. The counts behind that are logged by
+            # the retrieval, which is where "there was nothing left" can be told
+            # apart from "nothing matched".
             return exhausted
 
         user_prompt = EXPANSION_USER_PROMPT.format(
@@ -1074,15 +1149,32 @@ def _stream_pieces(text: str) -> Iterator[str]:
     yield parts[-1]
 
 
-def _has_previous_answer(previous: PreviousAnswer | None) -> bool:
-    """Whether there is a previous answer this message can continue.
+def orphaned_context_question(
+    question: str, previous: PreviousAnswer | None
+) -> bool:
+    """Whether this message needs an earlier turn that this conversation lacks.
 
-    Only a grounded answer counts. A refusal, a small talk reply and an
-    out-of-scope reply have no passages behind them, so there is nothing an
-    expansion could continue from, and a reader asking "anything else?" after one
-    is better served by the ordinary path than by being told a topic is exhausted.
+    One condition, read in two places: the classifier uses it to decide that there
+    is nothing to classify, and the conversational path uses it to answer
+    statically instead of generating a reply about a conversation that does not
+    exist yet.
+
+    The scope is the conversation. `previous` is built from the messages stored
+    under the conversation id this request is for, and is None when there are none,
+    so a question that made sense in another thread is not answered from it.
     """
-    return previous is not None and bool(previous.sources)
+    return needs_earlier_context(question) and not (previous and previous.has_topic)
+
+
+def _can_continue(previous: PreviousAnswer | None) -> bool:
+    """Whether there is a document this message can be continued from.
+
+    Documents, not citations on the last turn: the topic a conversation is on
+    belongs to the thread, so a greeting typed after an answer does not take the
+    answer's place. What decides it is whether any of the thread's answers cited
+    anything.
+    """
+    return previous is not None and bool(previous.documents)
 
 
 def _topic_is_exhausted(previous: PreviousAnswer | None) -> bool:

@@ -23,6 +23,11 @@ the exact-term hit the vector search would have buried.
 The keyword side runs over the same chunk objects the vector index already holds,
 in this process. A second copy of the corpus in the database would be a second
 thing to keep in step with the first for no ranking gain.
+
+One path here is not a search at all, and is kept apart for that reason: an
+expansion — "anything else?" — names no document, so the question cannot be
+retrieved. It is answered from the documents the last answer cited, read whole
+rather than out of a ranked window. See `IndexedDocuments`.
 """
 
 import hashlib
@@ -32,6 +37,8 @@ import re
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+
+from llama_index.core.indices.vector_store.retrievers import VectorIndexRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +327,136 @@ def reciprocal_rank_fusion(ranked_lists: Sequence[Sequence[object]], k: int = RR
     return fused
 
 
+# How many unread chunks one expansion puts in front of the generator.
+#
+# Three is enough to carry a section, and the cap is what keeps a continuation
+# focused: the point of it is to add what the reader has not been shown, not to
+# answer the same question again at greater length. It is a cap and not a floor,
+# which is what makes exhaustion reachable — a document can genuinely be read to
+# the end, and then the honest reply is that there is nothing left in it.
+CONTINUATION_CHUNKS = 3
+
+
+def document_of(node: object) -> str:
+    """The document a chunk belongs to, as the citations name it.
+
+    The title, not the file: a citation says "Leave Policy > Annual Leave", and a
+    continuation anchored to the same words is anchored to the same place. Read
+    from metadata rather than from the file path, which the chunking step strips.
+    """
+    metadata = getattr(node, "metadata", {}) or {}
+
+    return str(metadata.get("policy_title", ""))
+
+
+class IndexedDocuments:
+    """Whole documents read out of the index, rather than a ranked window of it.
+
+    The ordinary path asks the index which chunks sit closest to a question and
+    hands the generator the best few. That cannot serve an expansion: "anything
+    else?" names no document, the window it would return is the same set of
+    passages the first answer was drawn from, and once those are held back as
+    already shown there is nothing left in the pool — so a document with unread
+    sections in it reads as exhausted while it is not.
+
+    This reads the other way round. The documents are named by the answer being
+    continued, *every* chunk of them is taken from the store, and the chunks this
+    conversation has already shown are removed. What is left is ranked against the
+    question that started the thread, so a passage the ordinary search never
+    scored can still be the one an expansion returns.
+
+    Built once, here, because the corpus does not change while the process runs:
+    the index is rebuilt on every start and never written to afterwards.
+    """
+
+    def __init__(self, index):
+        by_document: dict[str, list[object]] = {}
+
+        for node in index.docstore.docs.values():
+            by_document.setdefault(document_of(node), []).append(node)
+
+        self._index = index
+        # Ordered by id, so that anything this cannot rank still comes back in the
+        # same order on every run rather than in whatever order a dict happened to
+        # have.
+        self._by_document = {
+            title: sorted(nodes, key=lambda node: str(node.node_id))
+            for title, nodes in by_document.items()
+        }
+
+    def chunks_in(self, documents: Iterable[str]) -> list[object]:
+        """Every chunk of the named documents, in a stable order.
+
+        The whole document, not the passages one answer happened to quote: a
+        section nobody cited is exactly the section "anything else?" is asking
+        for, and anchoring to the last turn's citations would keep looking in the
+        place the reader has already been given.
+        """
+        return [
+            node
+            for title in sorted({str(document) for document in documents})
+            for node in self._by_document.get(title, ())
+        ]
+
+    def rank(
+        self, query: str, chunks: Sequence[object], limit: int = CONTINUATION_CHUNKS
+    ) -> list[Candidate]:
+        """The chunks closest to `query` in meaning, best first, at most `limit`.
+
+        Asked of the store for those chunk ids specifically rather than for the
+        best N overall, so the ranking covers every chunk of the document instead
+        of only the ones a corpus-wide search already thought were relevant.
+
+        No floor is applied here, deliberately, and the absence is the whole point:
+        `min_score` says whether a chunk is close enough to a question to be
+        evidence for it, and this is not that question. A section of a document
+        the reader is already on is relevant by membership of that document, and
+        applying the floor would reintroduce the defect this path exists to fix —
+        an unread section that matches the original question weakly being reported
+        as though it had been read.
+
+        The order comes from the similarity rather than from the fusion the
+        ordinary path uses, so `fused` carries nothing here and is left at zero;
+        `similarity` is what `sources` reports and what `confidence` is derived
+        from, and it is the real cosine either way.
+        """
+        if not chunks:
+            return []
+
+        by_id = {str(node.node_id): node for node in chunks}
+
+        try:
+            scored = VectorIndexRetriever(
+                self._index,
+                similarity_top_k=len(chunks),
+                node_ids=list(by_id),
+            ).retrieve(query)
+        except Exception as exc:  # noqa: BLE001
+            # The store could not be asked, which is an outage rather than an
+            # answer. Handing the unread passages back in reading order keeps the
+            # continuation going with no similarity behind it — the generator then
+            # reports no confidence, which is the honest figure for evidence that
+            # was never measured. Reporting exhaustion instead would claim the
+            # document had been read, which is the one thing we do not know.
+            logger.warning("could not rank the unread passages of a continuation: %s", exc)
+
+            return [
+                Candidate(node=node, fused=0.0) for node in list(by_id.values())[:limit]
+            ]
+
+        candidates = [
+            Candidate(
+                node=by_id[str(found.node_id)],
+                fused=0.0,
+                similarity=float(found.score or 0.0),
+            )
+            for found in scored
+            if str(found.node_id) in by_id
+        ]
+
+        return candidates[:limit]
+
+
 class HybridRetriever:
     """Vector similarity and keyword matching, merged, with an optional reranker."""
 
@@ -328,6 +465,7 @@ class HybridRetriever:
         vector_retriever,
         keyword_index: KeywordIndex,
         *,
+        documents: IndexedDocuments,
         top_k: int,
         vector_candidates: int,
         keyword_candidates: int,
@@ -339,6 +477,7 @@ class HybridRetriever:
     ):
         self._vector = vector_retriever
         self._keywords = keyword_index
+        self._documents = documents
         self._top_k = top_k
         self._vector_candidates = vector_candidates
         self._keyword_candidates = keyword_candidates
@@ -359,38 +498,52 @@ class HybridRetriever:
     def retrieve_continuation(
         self,
         query: str,
-        anchors: Iterable[tuple[str, str]],
+        documents: Iterable[str],
         already_shown: Iterable[str],
+        limit: int = CONTINUATION_CHUNKS,
     ) -> list[Candidate]:
-        """More of the passages an answer was drawn from, minus the ones it used.
+        """The rest of the documents an answer was drawn from, minus what it used.
 
         What "anything else?" needs, and why the ordinary path cannot serve it: the
         message names no document, so it retrieves against a topic it does not
-        have. Here the topic comes from the answer being continued — the same
-        documents and sections it cited — and the chunks it already quoted are
-        removed, so the generator is left with what it has not already said.
+        have. Here the topic comes from the answers already in this conversation —
+        the documents they cited — and every chunk of those documents is read out
+        of the store rather than out of a ranked window, with the chunks this
+        thread has shown held back. So an answer that quoted three sections of a
+        seven-section document is continued from the four nobody quoted, instead of
+        from whatever the same window happened to contain.
 
-        Empty means those sources are exhausted, which is a different fact from the
-        corpus having a gap, and the caller reports it as one.
+        Empty means those documents are read out, which is a different fact from
+        the corpus having a gap, and the caller reports it as one.
 
-        The ranking is the same search, over the same candidates, with the same
-        floors: this filters what that search produced rather than scoring anything
-        of its own, so a chunk that cannot win the fusion here could not have won it
-        in an ordinary answer either.
+        The counts are logged on every expansion. That log is the only way to tell
+        an honest "there is nothing left" from a search that found nothing: the
+        first says the document was read out, the second says the query matched
+        nothing, and the two are indistinguishable in the reply and not at all in
+        the numbers.
         """
-        wanted = {(document, section) for document, section in anchors}
+        wanted = {str(document) for document in documents}
         seen = set(already_shown)
 
         if not wanted:
             return []
 
-        return [
-            candidate
-            for candidate in self._rank(query)
-            if (candidate.node.metadata.get("policy_title"), candidate.node.metadata.get("section"))
-            in wanted
-            and chunk_key(candidate.node) not in seen
-        ][: self._top_k]
+        cited = self._documents.chunks_in(wanted)
+        remaining = [node for node in cited if chunk_key(node) not in seen]
+
+        logger.info(
+            "expanding over %d cited document(s): %d chunks in them, "
+            "%d already shown, %d remaining",
+            len(wanted),
+            len(cited),
+            len(cited) - len(remaining),
+            len(remaining),
+        )
+
+        if not remaining:
+            return []
+
+        return self._documents.rank(query, remaining, limit)
 
     def _rank(self, query: str) -> list[Candidate]:
         """Both searches, fused, reranked — the whole list, not truncated."""

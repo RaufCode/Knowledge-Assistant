@@ -19,7 +19,7 @@ part is exercised through an assistant whose `_complete` is a scripted stub.
 
 import unittest
 
-from app.rag.engine import PERSONAL_MSG, Assistant, PreviousAnswer
+from app.rag.engine import NO_PRIOR_TOPIC_MSG, PERSONAL_MSG, Assistant, PreviousAnswer
 from app.rag.guard import (
     MODEL_CATEGORIES,
     Category,
@@ -257,7 +257,7 @@ class GuardBeforeRetrievalTest(unittest.TestCase):
 
         self.assertEqual(done["kind"], "restricted")
 
-    def test_an_expansion_after_a_refusal_stays_a_refusal(self):
+    def test_a_refusal_is_not_a_topic_anything_else_can_continue(self):
         assistant = assistant_answering([])
         assistant.retrieval = type(
             "Retrieval", (), {"retrieve": staticmethod(lambda q: [])}
@@ -266,9 +266,25 @@ class GuardBeforeRetrievalTest(unittest.TestCase):
         previous = PreviousAnswer(kind="restricted", question="What is Kwame's salary?")
         done = list(assistant.ask_stream("anything else?", [], previous=previous))[-1]
 
-        # Even though the fast path read it as an expansion: there are no passages
-        # behind a refusal, and the reader is not being offered "that covers
-        # everything" about a topic they were never told.
+        # A refusal cites nothing, so there is no topic to continue and nothing to
+        # be told is exhausted either — the conversation has no earlier chat to
+        # build on, which is the honest description of it.
+        self.assertEqual(done["kind"], "conversational")
+        self.assertEqual(done["answer"], NO_PRIOR_TOPIC_MSG)
+
+    def test_a_follow_up_that_brings_its_own_subject_is_still_a_refusal(self):
+        assistant = assistant_answering([classification_reply("FOLLOW_UP", "And for part-timers?")])
+        assistant.retrieval = type(
+            "Retrieval", (), {"retrieve": staticmethod(lambda q: [])}
+        )()
+
+        previous = PreviousAnswer(kind="restricted", question="What is Kwame's salary?")
+        done = list(
+            assistant.ask_stream("and what is his bonus?", [], previous=previous)
+        )[-1]
+
+        # The guard is decided before the orphan check: a message that asks for a
+        # person's record is a refusal whatever the conversation behind it was.
         self.assertEqual(done["kind"], "restricted")
 
     def test_a_fresh_question_after_a_refusal_is_not_one(self):

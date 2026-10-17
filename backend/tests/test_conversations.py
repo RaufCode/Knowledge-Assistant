@@ -36,8 +36,15 @@ from app import main
 from app.config import settings
 from app.database import Base, Conversation, Message, User
 from app.dependencies import ACCESS_COOKIE, CSRF_COOKIE
-from app.rag.engine import LEGACY_STATUS, PreviousAnswer
+from app.rag.engine import (
+    LEGACY_STATUS,
+    NO_PRIOR_TOPIC_MSG,
+    TITLE_SYSTEM_PROMPT,
+    Assistant,
+    PreviousAnswer,
+)
 from app.rag.guard import Category, Classification
+from app.rag.retrieval import Candidate
 from app.security import create_access_token, hash_password, new_csrf_token
 
 SOURCE = {
@@ -671,6 +678,175 @@ class ContinuingAnAnswerTest(ConversationTestCase):
         self.assertEqual(answer["sources"][0]["chunk_id"], SOURCE["chunk_id"])
         stored = self.messages_in_db(conversation_id)[-1]
         self.assertEqual(stored.sources[0]["chunk_id"], SOURCE["chunk_id"])
+
+
+class NothingToContinueTest(ConversationTestCase):
+    """A follow-up with nothing behind it, asked in a conversation of its own.
+
+    Driven through the real assistant — real classification, real short circuit —
+    with only the model and the retrieval scripted, because what is under test is
+    the route: which conversation's record a turn is handed, and that no turn is
+    handed another conversation's.
+    """
+
+    LEAVE = "Leave Policy"
+    VPN = "IT & VPN Guide"
+
+    def scripted_assistant(self) -> "ScriptedRetrieval":
+        assistant = main.state["assistant"]
+
+        asked: list[str] = []
+        retrieval = ScriptedRetrieval()
+
+        def complete(user_prompt: str, system_prompt: str = "", max_tokens=None) -> str:
+            asked.append(user_prompt)
+
+            # One reply for everything, because the classifier is called on the same
+            # scripted model as the generator and must not eat the answer. A reply
+            # that names no category reads as an ordinary question, which is what
+            # the questions below are.
+            if system_prompt == TITLE_SYSTEM_PROMPT:
+                return "About this"
+
+            return "There is more to say about this."
+
+        def stream(user_prompt: str, system_prompt: str = "", max_tokens=None):
+            yield complete(user_prompt, system_prompt, max_tokens)
+
+        # `__new__` rather than a constructor call: the client is not wanted and
+        # the index is not either, since retrieval here is scripted.
+        assistant.__class__ = Assistant
+        assistant.__dict__.update({"_complete": complete, "_stream": stream})
+        assistant.retrieval = retrieval
+        assistant.asked = asked
+
+        main.state["assistant"] = assistant
+
+        return retrieval
+
+    def reply(self, response) -> dict:
+        """The `done` event of a streamed turn: what the turn actually answered."""
+        return [
+            event for event in read_events(response.text) if event["type"] == "done"
+        ][-1]
+
+    def test_the_first_message_of_a_conversation_has_nothing_to_build_on(self):
+        self.scripted_assistant()
+        conversation_id = self.new_conversation()
+
+        done = self.reply(self.ask(conversation_id, "anything else?"))
+
+        # Not a search for a phrase that names no document, and not a gap in the
+        # corpus: a statement that this conversation has no earlier turn.
+        self.assertEqual(done["kind"], "conversational")
+        self.assertEqual(done["answer"], NO_PRIOR_TOPIC_MSG)
+        self.assertEqual(done["sources"], [])
+        self.assertIsNone(done["confidence"])
+
+    def test_a_conversation_with_only_greetings_has_no_topic_to_continue(self):
+        self.scripted_assistant()
+        conversation_id = self.new_conversation()
+
+        self.ask(conversation_id, "Hey")
+        done = self.reply(self.ask(conversation_id, "tell me more"))
+
+        # A greeting is a turn, and not one that says anything about the corpus.
+        self.assertEqual(done["kind"], "conversational")
+        self.assertEqual(done["answer"], NO_PRIOR_TOPIC_MSG)
+
+    def test_a_second_conversation_borrows_nothing_from_the_first(self):
+        self.scripted_assistant()
+        first = self.new_conversation()
+        self.ask(first, "How much annual leave do I get?")
+
+        second = self.new_conversation()
+        done = self.reply(self.ask(second, "anything else?"))
+
+        # The first conversation answered about leave. This one has said nothing,
+        # and the leave topic is not something it may continue.
+        self.assertEqual(done["answer"], NO_PRIOR_TOPIC_MSG)
+        self.assertEqual(done["sources"], [])
+        # Nothing of the answer the other conversation gave: no passage from the
+        # leave topic, and no part of what was said about it.
+        self.assertNotIn("21 days", done["answer"])
+
+    def test_two_conversations_interleaved_keep_their_own_topics(self):
+        retrieval = self.scripted_assistant()
+        leave = self.new_conversation()
+        vpn = self.new_conversation()
+
+        self.ask(leave, "How much annual leave do I get?")
+        self.ask(vpn, "How do I set up the VPN?")
+
+        leave_again = self.reply(self.ask(leave, "anything else?"))
+        leave_documents, leave_shown = retrieval.continuations[-1]
+        vpn_again = self.reply(self.ask(vpn, "anything else?"))
+        vpn_documents, vpn_shown = retrieval.continuations[-1]
+
+        # Each continues from the documents its own answers cited, and holds back
+        # only the chunks its own thread has shown.
+        self.assertEqual(leave_documents, {self.LEAVE})
+        self.assertEqual(vpn_documents, {self.VPN})
+        self.assertTrue(leave_shown.isdisjoint(vpn_shown))
+        self.assertEqual({each["document"] for each in leave_again["sources"]}, {self.LEAVE})
+        self.assertEqual({each["document"] for each in vpn_again["sources"]}, {self.VPN})
+
+    def test_a_conversation_is_not_named_by_a_message_that_only_asks_for_more(self):
+        self.scripted_assistant()
+        conversation_id = self.new_conversation()
+
+        events = read_events(self.ask(conversation_id, "anything else?").text)
+
+        # The title waits for a real question, so the sidebar does not fill with
+        # conversations named "anything else".
+        self.assertNotIn("title", [event["type"] for event in events])
+
+
+class ScriptedRetrieval:
+    """Retrieval that answers from what it is asked about, and records the asking.
+
+    Enough for the route's subject — which documents a continuation was anchored
+    to, and which chunks it was told to hold back — without pretending to be a
+    search. How a continuation reads a document is `test_hybrid_retrieval.py`'s
+    subject, not this one's.
+    """
+
+    ANSWERS = {
+        "leave": ("Leave Policy", "Annual Leave", "Full-time employees are entitled to 21 days."),
+        "vpn": ("IT & VPN Guide", "Getting Started", "Install the GlobalProtect client."),
+    }
+
+    def __init__(self) -> None:
+        self.continuations: list[tuple[set[str], set[str]]] = []
+
+    def retrieve(self, query: str):
+        for fragment, (document, section, text) in self.ANSWERS.items():
+            if fragment in query.lower():
+                return [candidate(text, document, section)]
+
+        return []
+
+    def retrieve_continuation(self, query: str, documents, already_shown):
+        self.continuations.append((set(documents), set(already_shown)))
+
+        return [
+            candidate(f"More from {document}.", document, "More")
+            for document in sorted(documents)
+        ]
+
+
+def candidate(text: str, document: str, section: str):
+    """A retrieved passage, as the retriever would produce one."""
+
+    class _Node:
+        node_id = text[:12]
+        metadata = {"policy_title": document, "section": section}
+        score = 0.8
+
+        def get_content(self, metadata_mode=None):
+            return text
+
+    return Candidate(node=_Node(), fused=0.02, similarity=0.8, keyword=None)
 
 
 class TitleGenerationTest(ConversationTestCase):

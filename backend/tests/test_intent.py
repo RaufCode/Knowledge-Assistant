@@ -30,6 +30,7 @@ from app.rag.engine import (
     OUT_OF_SCOPE_MSG,
     Assistant,
     LlmUnavailable,
+    PreviousAnswer,
 )
 from app.rag.guard import (
     MODEL_CATEGORIES,
@@ -177,6 +178,83 @@ class ParseClassificationTest(unittest.TestCase):
                     f"CATEGORY: FOLLOW_UP\nQUESTION: {rewrite}", "anything else?"
                 )
                 self.assertEqual(result.query, expected)
+
+
+class ModelDecidedExpansionTest(unittest.TestCase):
+    """An expansion the classifier found, rather than the phrases in the rules.
+
+    "Anything else I should know about the dress code?" is an expansion to a
+    person reading it and reaches the model, so the decision has to survive being
+    made there as well — including the requirement that there is something to
+    continue from.
+    """
+
+    def expansion_assistant(self, replies) -> Assistant:
+        assistant = assistant_answering(replies)
+        assistant.retrieval = type(
+            "Retrieval",
+            (),
+            {
+                "retrieve": staticmethod(lambda q: []),
+                "retrieve_continuation": staticmethod(lambda q, d, s: []),
+            },
+        )()
+
+        return assistant
+
+    def test_an_expansion_the_model_finds_continues_the_thread(self):
+        asked: list[tuple] = []
+
+        assistant = self.expansion_assistant(
+            [classification_reply("EXPANSION", "anything else about the dress code?"), "Dress neatly."]
+        )
+        assistant.retrieval = type(
+            "Retrieval",
+            (),
+            {
+                "retrieve": staticmethod(lambda q: []),
+                "retrieve_continuation": staticmethod(
+                    lambda q, d, s: asked.append((set(d), set(s))) or []
+                ),
+            },
+        )()
+
+        done = list(
+            assistant.ask_stream(
+                "anything else about the dress code?",
+                [("user", "What is the dress code?")],
+                previous=PreviousAnswer(
+                    has_topic=True,
+                    question="What is the dress code?",
+                    answer="Dress neatly.",
+                    sources=({"document": "Employee Expectations", "section": "Dress Code"},),
+                    documents=frozenset({"Employee Expectations"}),
+                ),
+            )
+        )[-1]
+
+        self.assertEqual(done["kind"], "no_more_info")
+        # Read from the documents the thread cited, with the thread's chunks held
+        # back — the same shape the rule-decided expansion gets.
+        self.assertEqual(asked, [({"Employee Expectations"}, frozenset())])
+
+    def test_an_expansion_with_nothing_behind_it_is_a_follow_up(self):
+        asked: list[str] = []
+        assistant = self.expansion_assistant(
+            [classification_reply("EXPANSION", "anything else?"), "Casual on ordinary days."]
+        )
+        assistant.retrieval = type(
+            "Retrieval",
+            (),
+            {"retrieve": staticmethod(lambda q: asked.append(q) or [])},
+        )()
+
+        # No earlier turn at all: there is no document to continue from, so there is
+        # no expansion to make, and it is judged as the question it is.
+        done = list(assistant.ask_stream("anything else about the dress code?"))[-1]
+
+        self.assertNotEqual(done["kind"], "no_more_info")
+        self.assertEqual(asked, ["anything else about the dress code?"])
 
 
 class ClassifierPromptTest(unittest.TestCase):
@@ -338,7 +416,19 @@ class RoutingTest(unittest.TestCase):
             ("user", "What does the Code of Conduct say about behaviour?"),
             ("assistant", "Communicate respectfully, be accountable."),
         ]
-        events = list(assistant.ask_stream("what about contractors?", history))
+        # A conversation with an answer in it: "what about contractors?" means
+        # nothing without one, and is told so rather than retrieved.
+        events = list(
+            assistant.ask_stream(
+                "what about contractors?",
+                history,
+                previous=PreviousAnswer(
+                    has_topic=True,
+                    question="What does the Code of Conduct say about behaviour?",
+                    answer="Communicate respectfully, be accountable.",
+                ),
+            )
+        )
 
         # Retrieval got the standalone question, not the follow-up's wording.
         self.assertEqual(
@@ -363,7 +453,7 @@ class RoutingTest(unittest.TestCase):
             ("OUT_OF_SCOPE", "tell me a joke", [""] * 2),
             ("CONVERSATIONAL", "I was just saying hi", ["Sure, whenever you're ready."]),
             ("COMPANY_QUESTION", "What is the dental policy?", ["NOT_FOUND"]),
-            ("FOLLOW_UP", "anything else?", ["NOT_FOUND"]),
+            ("FOLLOW_UP", "what about contractors?", ["NOT_FOUND"]),
         ]:
             asked: list[str] = []
             assistant = assistant_answering(
@@ -373,7 +463,16 @@ class RoutingTest(unittest.TestCase):
                 "Retrieval", (), {"retrieve": staticmethod(lambda q: asked.append(q) or [])}
             )()
 
-            done = list(assistant.ask_stream(message, [("user", "What does the leave policy say?")]))[-1]
+            # A conversation with an answer in it, so a follow-up has something to
+            # be a follow-up to: the message is only tested for what it does once
+            # there is a thread to continue.
+            done = list(
+                assistant.ask_stream(
+                    message,
+                    [("user", "What does the leave policy say?")],
+                    previous=PreviousAnswer(has_topic=True),
+                )
+            )[-1]
 
             with self.subTest(category=category):
                 expected = "not_found" if category in {"COMPANY_QUESTION", "FOLLOW_UP"} else category.lower()

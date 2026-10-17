@@ -21,8 +21,10 @@ from app.database import (
     SessionLocal,
     User,
     cited_chunk_ids,
+    cited_documents,
     create_conversation,
     get_owned_conversation,
+    has_usable_topic,
     init_db,
     last_exchange,
     list_owned_conversations,
@@ -308,16 +310,35 @@ def delete_conversation(
 def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None:
     """What this message follows, as far as answering it needs to know.
 
-    Three things the classifier and the retrieval both need, all of them the
-    conversation's own record rather than anything held in memory: whether the
-    last turn was a refusal, which passages it cited, and which passages this
-    thread has already shown. A reload changes none of them, so a reader who
-    refreshes and then asks "anything else?" gets the same continuation.
+    Everything the classifier and the retrieval both need, and all of it read from
+    the messages stored under *this* conversation's id: whether the last turn was a
+    refusal, which passages it cited, which passages this thread has already shown,
+    which documents it has cited, and whether it holds a topic worth continuing at
+    all. Nothing here is module state, nothing is keyed by client, and a reload
+    changes none of it — so a reader who refreshes and then asks "anything else?"
+    gets the same continuation, and a reader who opens a second conversation gets
+    none of the first one's.
+
+    Returns None for a conversation with no answers in it, which is what makes a
+    context-dependent first message ("anything else?") something to say so about
+    rather than something to answer.
     """
+    topic = has_usable_topic(db, conversation_id)
+
+    if not topic:
+        return None
+
     question, answer = last_exchange(db, conversation_id)
 
     if answer is None:
-        return None
+        # An answer exists somewhere in the thread but the last turn is not one —
+        # a greeting after the answer, say. The topic is still there to continue,
+        # so it is reported, and there is no single answer to anchor it to.
+        return PreviousAnswer(
+            has_topic=True,
+            cited=cited_chunk_ids(db, conversation_id),
+            documents=cited_documents(db, conversation_id),
+        )
 
     return PreviousAnswer(
         kind=answer.kind,
@@ -325,6 +346,8 @@ def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None
         answer=answer.content,
         sources=tuple(answer.sources or ()),
         cited=cited_chunk_ids(db, conversation_id),
+        documents=cited_documents(db, conversation_id),
+        has_topic=True,
     )
 
 
@@ -354,9 +377,12 @@ def send_message(
     it. They are read before the new question is recorded, so the window holds the
     conversation as it stood rather than including the message being answered.
 
-    So is the last exchange itself: an answer carries which passages it cited, and
-    "anything else?" is answered from the same documents with those passages
-    removed rather than from a fresh search for a phrase that names nothing.
+    So is the last exchange itself, read from this conversation's messages and no
+    other: an answer carries which passages it cited, and "anything else?" is
+    answered from the same documents with those passages removed rather than from a
+    fresh search for a phrase that names nothing. A conversation with no answers in
+    it has nothing to continue, and says so rather than borrowing one from
+    elsewhere.
     """
     conversation = owned_conversation_or_404(db, conversation_id, user.id)
 

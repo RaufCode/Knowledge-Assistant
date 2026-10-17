@@ -316,7 +316,7 @@ before it.
 | Conversational | "hey", "thanks", "ok", "there is no question", "who are you?" | A short reply that acknowledges what was said. No retrieval. |
 | Company question | "How many sick days do I get?" | Retrieved and answered from the documents, with citations. |
 | Follow-up | "what about contractors?" | Rewritten into a standalone question first — *what does the Code of Conduct say about contractors?* — then retrieved as above. |
-| Expansion | "anything else?", "tell me more" | Continued from the passages the last answer cited, minus the ones it already showed. Never a gap in the corpus. |
+| Expansion | "anything else?", "tell me more" | Continued from the documents the last answer cited, minus the chunks this thread already showed. Never a gap in the corpus. |
 | Out of scope | "how many presidents has Ghana had?" | A statement of what the assistant is for. No retrieval. |
 | Restricted | "what is Ama's salary?", "what is my salary?" | The confidentiality notice. No retrieval. |
 
@@ -393,16 +393,38 @@ that" would answer the question the reader was refused.
 ### Continuing an answer
 
 An expansion is never rewritten, because it names no subject, and a rewrite is
-what made it fail. It is continued from the **passages the previous answer cited**,
-with every chunk this thread has already shown removed, so the generator is handed
-what the reader has not seen yet. Chunk ids are derived from the passage itself and
-stored with the citation, so this survives a reload rather than working only in
-the tab that asked.
+what made it fail. It is continued from the **documents this conversation's
+answers have cited**, with every chunk the thread has already shown removed, so
+the generator is handed what the reader has not seen yet. Chunk ids are derived
+from the passage itself and stored with the citation, so this survives a reload
+rather than working only in the tab that asked.
 
-When those passages are used up — and the corpus is chunked by section, so one
-answer can read all of them — the reply is `no_more_info`: *that covers everything
-the documents say on this topic*. Not `not_found`, which claims the corpus has a
-gap, and not a repeated search that finds the same passages again.
+Those documents are read **whole, out of the store** — not out of the ranked
+window the ordinary search returns. That distinction is the whole fix. As a
+filter over the window, a continuation could only return passages the ordinary
+search had already scored, so a thorough first answer used the window up and
+"anything else?" reported a topic exhausted while unread sections of the same
+document sat right there. A seven-section document now takes two expansions to
+exhaust, and the count is logged every time:
+
+```
+expanding over 1 cited document(s): 7 chunks in them, 6 already shown, 1 remaining
+```
+
+That log is how `no_more_info` is known to be honest: "nothing left in them" and
+"nothing matched" are the same reply, and only the numbers tell them apart.
+
+**No `MIN_SCORE` floor on this path**, deliberately. A floor asks whether a chunk
+is close enough to *this* question to be evidence for it, and this is not that
+question: a section of a document the reader is already on is on topic by
+membership of that document. Applying the floor would reintroduce the defect
+above — an unread section that matches the original question weakly being
+reported as though it had been read. The cap of three chunks, ordered by
+similarity, is what keeps the answer focused instead.
+
+When those documents are read out, the reply is `no_more_info`: *that covers
+everything the documents say on this topic*. Not `not_found`, which claims the
+corpus has a gap, and not a repeated search that finds the same passages again.
 
 A topic-shifting follow-up keeps the rewrite, and if the rewrite retrieves nothing
 the question it continues is tried in its place: a paraphrase is a worse handle on

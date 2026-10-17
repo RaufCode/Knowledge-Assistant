@@ -363,6 +363,58 @@ def last_exchange(
     return question, answer
 
 
+# The assistant turns that count as a subject worth continuing: one that answered,
+# or searched for, an in-scope question. A greeting, a small talk reply, an
+# out-of-scope refusal and a confidentiality notice are none of them — they say
+# nothing about the corpus, so "anything else?" after one has no topic to continue
+# and would otherwise be answered by searching documents nobody cited.
+USABLE_TOPIC_KINDS = ("answer", "not_found")
+
+
+def has_usable_topic(db: SessionLocal, conversation_id: str) -> bool:
+    """Whether this conversation holds an earlier answer worth continuing.
+
+    Scoped to the conversation id, always. The question of what "earlier" means is
+    answered from this thread's own messages and never from another thread, which
+    is what stops a reader who asked about leave in one conversation being told
+    their next one has earlier chat to build on.
+    """
+    return (
+        db.scalar(
+            select(Message.id)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.role == "assistant",
+                Message.kind.in_(USABLE_TOPIC_KINDS),
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def cited_documents(db: SessionLocal, conversation_id: str) -> frozenset[str]:
+    """Every document this conversation has cited, in any of its answers.
+
+    The continuation reads from whole documents rather than from the passages one
+    answer happened to quote, so the set is the thread's and not the last turn's.
+    """
+    rows = db.scalars(
+        select(Message.sources).where(
+            Message.conversation_id == conversation_id,
+            Message.role == "assistant",
+            Message.sources.is_not(None),
+        )
+    ).all()
+
+    return frozenset(
+        str(source["document"])
+        for sources in rows
+        for source in (sources or [])
+        if isinstance(source, dict) and source.get("document")
+    )
+
+
 def cited_chunk_ids(db: SessionLocal, conversation_id: str) -> frozenset[str]:
     """Every chunk id this conversation has already put in front of the reader.
 

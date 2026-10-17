@@ -20,11 +20,16 @@ the model is scripted.
 
 import unittest
 
+from llama_index.core import VectorStoreIndex
+from llama_index.core.embeddings import MockEmbedding
+from llama_index.core.schema import TextNode
+
 from app.rag.engine import (
     EXHAUSTED_MSG,
     Assistant,
     PreviousAnswer,
     _declined,
+    _source,
 )
 from app.rag.guard import Category, Classification, is_expansion
 from app.rag.retrieval import chunk_key
@@ -82,6 +87,8 @@ def previous_answer(sources, cited=(), question="What is the leave policy?", kin
         answer="Full-time staff get 25 days a year.",
         sources=tuple(sources),
         cited=frozenset(cited),
+        documents=frozenset(str(source["document"]) for source in sources),
+        has_topic=True,
     )
 
 
@@ -109,12 +116,17 @@ class ExpansionRecognitionTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(is_expansion(text), text)
 
-    def test_an_expansion_with_nothing_to_continue_falls_back_to_a_follow_up(self):
+    def test_an_expansion_with_nothing_to_continue_is_not_classified_at_all(self):
+        asked: list[str] = []
         assistant = assistant_answering([])
+        assistant.asked = asked
 
         classification = assistant.classify("anything else?")
 
-        self.assertIs(classification.category, Category.FOLLOW_UP)
+        # There is no question here to put to a classifier, and no earlier turn to
+        # continue: the conversation is simply empty.
+        self.assertIs(classification.category, Category.CONVERSATIONAL)
+        self.assertEqual(asked, [])
 
 
 class ContinuationTest(unittest.TestCase):
@@ -127,12 +139,12 @@ class ContinuationTest(unittest.TestCase):
         ]
         return previous_answer(sources, cited=[source["chunk_id"] for source in sources])
 
-    def test_it_retrieves_only_the_anchored_passages_and_not_the_shown_ones(self):
+    def test_it_retrieves_only_the_cited_documents_and_not_the_shown_chunks(self):
         asked: list[tuple] = []
 
         class Retrieval:
-            def retrieve_continuation(self, query, anchors, already_shown):
-                asked.append((query, set(anchors), set(already_shown)))
+            def retrieve_continuation(self, query, documents, already_shown):
+                asked.append((query, set(documents), set(already_shown)))
                 return [candidate("Carryover is capped at five days.")]
 
         assistant = assistant_answering(["Carryover is capped at five days."])
@@ -142,10 +154,10 @@ class ContinuationTest(unittest.TestCase):
         done = list(assistant.ask_stream("anything else?", previous=previous))[-1]
 
         self.assertEqual(done["kind"], "answer")
-        # Anchored to the documents the last answer cited, and holding back every
-        # chunk this thread has already shown.
-        query, anchors, already_shown = asked[0]
-        self.assertEqual(anchors, {("Leave Policy", "Annual Leave")})
+        # Anchored to the documents this thread cited, and holding back every chunk
+        # it has already shown.
+        query, documents, already_shown = asked[0]
+        self.assertEqual(documents, {"Leave Policy"})
         self.assertEqual(already_shown, {previous.sources[0]["chunk_id"]})
         self.assertEqual(query, "What is the leave policy?")
         # And the generator is told what was already covered, so it adds rather
@@ -155,7 +167,7 @@ class ContinuationTest(unittest.TestCase):
 
     def test_it_streams_like_any_other_answer(self):
         class Retrieval:
-            def retrieve_continuation(self, query, anchors, already_shown):
+            def retrieve_continuation(self, query, documents, already_shown):
                 return [candidate("Carryover is capped at five days.")]
 
         assistant = assistant_answering(["Carryover is capped at five days."])
@@ -171,7 +183,7 @@ class ContinuationTest(unittest.TestCase):
 
     def test_used_up_sources_say_so_and_never_not_found(self):
         class Retrieval:
-            def retrieve_continuation(self, query, anchors, already_shown):
+            def retrieve_continuation(self, query, documents, already_shown):
                 return []
 
         assistant = assistant_answering([])
@@ -190,7 +202,7 @@ class ContinuationTest(unittest.TestCase):
 
     def test_a_generator_that_finds_nothing_new_is_the_same_answer(self):
         class Retrieval:
-            def retrieve_continuation(self, query, anchors, already_shown):
+            def retrieve_continuation(self, query, documents, already_shown):
                 return [candidate("Carryover is capped at five days.")]
 
         assistant = assistant_answering(["NOT_FOUND"])
@@ -209,7 +221,7 @@ class ContinuationTest(unittest.TestCase):
             def retrieve(self, query):
                 raise AssertionError("the documents behind this topic are already read")
 
-            def retrieve_continuation(self, query, anchors, already_shown):
+            def retrieve_continuation(self, query, documents, already_shown):
                 raise AssertionError("and there is nothing left in them")
 
         assistant = assistant_answering([])
@@ -232,7 +244,7 @@ class ContinuationTest(unittest.TestCase):
             def retrieve(self, query):
                 raise AssertionError("an expansion must not run an ordinary search")
 
-            def retrieve_continuation(self, query, anchors, already_shown):
+            def retrieve_continuation(self, query, documents, already_shown):
                 raise AssertionError("nothing to anchor to")
 
         assistant = assistant_answering([])
@@ -380,6 +392,132 @@ class ChunkKeyTest(unittest.TestCase):
         self.assertNotEqual(base, chunk_key(node("25 days", "Leave Policy", "Carryover")))
         self.assertNotEqual(base, chunk_key(node("25 days", "HR Directory", "Annual Leave")))
         self.assertNotEqual(base, chunk_key(node("26 days", "Leave Policy", "Annual Leave")))
+
+
+class ReadingTheDocumentTest(unittest.TestCase):
+    """The expansion path end to end: how many "anything else?" a document takes.
+
+    Driven through a real index with real retrieval, because what is being counted
+    is a count. A stub returning whatever the test tells it to would assert the
+    test rather than the code, and the number that matters — expansions plus the
+    first answer, against the sections the document has — is exactly the one a
+    stub cannot produce.
+
+    The embedding is the library's mock, which scores every passage alike: which
+    section comes back first is not the subject here, but how many are delivered
+    before the document is used up is.
+    """
+
+    QUESTION = "What are the expectations for employees?"
+    SECTIONS = 7
+
+    def setUp(self) -> None:
+        nodes = [
+            TextNode(
+                text=f"Section {number}: employees are expected to behave professionally.",
+                id_=f"expectations/{number}",
+                metadata={
+                    "policy_title": "Employee Expectations",
+                    "section": f"Section {number}",
+                },
+            )
+            for number in range(1, self.SECTIONS + 1)
+        ]
+
+        # Built the way it is built in the app, so the wiring under test is the
+        # wiring that ships; only the model is scripted, because a real one needs
+        # a key.
+        assistant = Assistant(VectorStoreIndex(nodes, embed_model=MockEmbedding(embed_dim=8)))
+        self.asked: list[str] = []
+
+        def complete(user_prompt: str, system_prompt: str = "", max_tokens=None) -> str:
+            self.asked.append(user_prompt)
+            return "There is more to say."
+
+        def stream(user_prompt: str, system_prompt: str = "", max_tokens=None):
+            yield complete(user_prompt, system_prompt, max_tokens)
+
+        assistant._complete = complete
+        assistant._stream = stream
+        self.assistant = assistant
+
+        # What the first answer quoted: one section, as an ordinary answer does.
+        first = assistant.retrieval.retrieve(self.QUESTION)[:1]
+        self.sources = [_source(candidate) for candidate in first]
+        self.shown = {each["chunk_id"] for each in self.sources}
+        self.kind = "answer"
+
+    def expand(self) -> dict:
+        # The kind is carried forward the way the route carries it: the previous
+        # assistant message records what it was, and that is what lets a second
+        # "anything else?" be answered from the first one's verdict rather than by
+        # searching a document that has already been read out.
+        previous = previous_answer(self.sources, cited=self.shown, kind=self.kind)
+        done = list(self.assistant.ask_stream("anything else?", previous=previous))[-1]
+        self.kind = done["kind"]
+
+        return done
+
+    def record(self, sources) -> set[str]:
+        """What an expansion showed the reader, added to what the thread has shown.
+
+        Built the way the route builds it: every citation in the conversation is
+        what a later turn holds back, and it is the only place that state lives.
+        """
+        keys = {each["chunk_id"] for each in sources}
+        # Never a passage twice: the reader has read it, and re-quoting it is not
+        # "more".
+        self.assertEqual(keys & self.shown, set())
+        self.shown |= keys
+        self.sources += sources
+
+        return keys
+
+    def test_it_takes_two_expansions_to_read_a_seven_section_document(self):
+        answers = 1
+
+        while True:
+            done = self.expand()
+
+            if done["kind"] == "no_more_info":
+                break
+
+            self.assertEqual(done["kind"], "answer")
+            self.record(done["sources"])
+            answers += 1
+
+        # One section by the first answer and three by each of two expansions; the
+        # third finds the document read out. Every section was delivered once, which
+        # is what makes "that covers everything on this topic" true rather than
+        # merely early.
+        self.assertEqual(answers, 3)
+        self.assertEqual(len(self.shown), self.SECTIONS)
+
+    def test_the_generator_is_given_the_unread_sections_and_nothing_else(self):
+        done = self.expand()
+        context = self.asked[-1].split("Context")[-1]
+
+        for each in done["sources"]:
+            self.assertIn(each["section"], context)
+
+        # The section the first answer already quoted is not in the context of the
+        # second turn, and what it did say is in the prompt as covered — which is
+        # what stops the continuation restating it.
+        self.assertNotIn(self.sources[0]["section"], context)
+        self.assertIn("Already covered", self.asked[-1])
+
+    def test_asking_again_after_the_document_is_used_up_says_the_same_thing(self):
+        for _ in range(3):
+            done = self.expand()
+            if done["kind"] == "answer":
+                self.record(done["sources"])
+
+        asked_before = len(self.asked)
+
+        self.assertEqual(self.expand()["kind"], "no_more_info")
+        # Nothing was generated for it: the passages were already read out, so
+        # there was nothing to hand the model.
+        self.assertEqual(len(self.asked), asked_before)
 
 
 if __name__ == "__main__":

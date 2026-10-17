@@ -14,7 +14,7 @@ if it retrieves confidently, the floors are too low.
 
 from app.config import settings
 from app.rag.ingest import build_index
-from app.rag.retrieval import HybridRetriever, KeywordIndex
+from app.rag.retrieval import HybridRetriever, IndexedDocuments, KeywordIndex
 
 # (question, what a good result looks like, must retrieve nothing?)
 #
@@ -58,6 +58,7 @@ index = build_index()
 retriever = HybridRetriever(
     index.as_retriever(similarity_top_k=settings.vector_candidates),
     KeywordIndex(index.docstore.docs.values()),
+    documents=IndexedDocuments(index),
     top_k=settings.top_k,
     vector_candidates=settings.vector_candidates,
     keyword_candidates=settings.keyword_candidates,

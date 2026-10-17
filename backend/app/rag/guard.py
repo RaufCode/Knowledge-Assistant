@@ -555,6 +555,12 @@ CONVERSATIONAL_ADDRESSEES = {
 # with a greeting would be refusing to do the actual job.
 MAX_CONVERSATIONAL_LENGTH = 32
 
+# The same bound for a message that only makes sense against earlier turns. Long
+# enough for "anything else I should know?" and for "what about contractors?",
+# short enough that a real question which happens to mention a topic — "what about
+# parental leave and how do I claim it during maternity?" — is left alone.
+MAX_CONTEXT_DEPENDENT_LENGTH = 32
+
 
 def normalise(text: str) -> str:
     """The message as these rules read it.
@@ -645,10 +651,61 @@ def is_expansion(text: str) -> bool:
     """
     cleaned = normalise(text)
 
-    if not cleaned or len(cleaned) > MAX_CONVERSATIONAL_LENGTH:
+    if not cleaned or len(cleaned) > MAX_CONTEXT_DEPENDENT_LENGTH:
         return False
 
     return cleaned in EXPANSION_PHRASES
+
+
+# Messages that point at something said earlier rather than naming a subject. Each
+# is short, because a long message that mentions a topic is a question about it:
+# "what about parental leave and how do I claim it during maternity?" stands on its
+# own, and "what about parental leave?" only makes sense against a preceding turn.
+#
+# "what about" is in here because the phrase is a request to switch subject
+# *relative to something*, and in a conversation with nothing in it there is
+# nothing to switch from. The length bound is what stops that reading from
+# swallowing a real first question about the same subject.
+CONTEXT_REFERENCE_PATTERNS = [
+    r"\bwhat about\b",
+    r"\band about\b",
+    r"\bwhat about (?:that|it|this|those|these)\b",
+    r"\band (?:for )?(?:part-?time(?:rs)?|contractors|interns|new joiners?|temps?|the same|that|it|them)\b",
+    r"\b(?:what|how|why|when|who)\s+(?:about\s+)?(?:that|those|these|it)\b",
+    r"\bmore (?:on|about|of)\s+(?:that|it|this|those)\b",
+    r"\b(?:same|ditto)\s+(?:for me|question|answer|applies|goes for)\b",
+    r"\bwhat else (?:about|on)\s+(?:that|it|this|those)\b",
+    r"\b(?:explain|expand on|elaborate on)\s+(?:that|it|this)\b",
+    # A bare connective or a question with no subject at all: "and?", "so?",
+    # "why?". Written as separate alternatives rather than one pattern of optional
+    # parts, because every part being optional matches every word. "ok" is not in
+    # this list: it is an acknowledgement, which asks for nothing rather than for
+    # more, and answering one with "there is no earlier chat to build on" would be
+    # answering a question nobody asked.
+    r"^(?:and|so|but|then|next)\s*[?.!]*$",
+    r"^(?:and|so|but|then|next)\s+(?:why|how|when|where|who|what)\s*[?.!]*$",
+    r"^(?:why|how|when|where|who)\s*[?.!]*$",
+]
+
+
+def needs_earlier_context(text: str) -> bool:
+    """Whether this message only means something against earlier turns.
+
+    Broader than an expansion: a subject switch and a bare "why?" need the
+    conversation just as much as "anything else?" does. All three are decided here,
+    without a model call, because the answer to "do we have anything to continue?"
+    does not depend on what the classifier thinks the message is — and when the
+    answer is no, there is nothing to classify.
+    """
+    cleaned = normalise(text)
+
+    if not cleaned or len(cleaned) > MAX_CONTEXT_DEPENDENT_LENGTH:
+        return False
+
+    if cleaned in EXPANSION_PHRASES:
+        return True
+
+    return any(re.search(pattern, cleaned, re.I) for pattern in CONTEXT_REFERENCE_PATTERNS)
 
 
 def classify_by_rules(message: str) -> Category | None:
