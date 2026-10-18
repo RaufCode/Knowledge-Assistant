@@ -11,23 +11,36 @@ from openai import APIConnectionError, APIStatusError, OpenAI, OpenAIError
 
 from app.config import settings
 from app.rag.capabilities import (
+    ASSISTANT_FAQ,
     CAPABILITIES_BRIEF,
-    CAPABILITIES_REPLY,
     CONVERSATIONAL_FALLBACK,
+    FAQ_IDS,
+    LANGUAGES,
+    NOT_SURE_REPLY,
+    FaqEntry,
+    faq_catalogue,
+    faq_entry,
     pleasantry_reply,
+    script_correction,
     unreadable_reply,
 )
 from app.rag.guard import (
     CLASSIFIER_SYSTEM_PROMPT,
     Category,
     Classification,
-    asks_about_capabilities,
     build_classifier_prompt,
     classify_by_rules,
+    claimed_language,
+    dominant_script,
+    is_elaboration,
     is_greeting,
+    is_latin_script,
+    is_meta_question,
+    is_obvious_conversational,
     is_restricted_request,
     is_unintelligible,
     needs_earlier_context,
+    normalise,
     parse_classification,
 )
 from app.rag.retrieval import (
@@ -123,6 +136,11 @@ class PreviousAnswer:
     # rotates it. Both are read out of the messages, so a refresh changes neither.
     unreadable_streak: int = 0
     unreadable_seen: int = 0
+    # What this reader last typed, in their own words. Carried only so the script
+    # correction can check the claim being made about it: "that is chinese" is only
+    # a correction if what arrived really was Latin letters. Read from this
+    # conversation's own messages like everything else here.
+    previous_user: str = ""
 
 
 # The vocabulary the wire used before `kind` existed, kept so a client that has
@@ -132,7 +150,7 @@ class PreviousAnswer:
 # missing policy is a gap in what the corpus holds, and HR owns the corpus.
 FALLBACK_MSG = (
     "I couldn't find that in the company documents. "
-    "Please contact HR at hr@acmetech.example or +233 30 000 0000."
+    f"Please contact HR at {settings.hr_contact}."
 )
 # The refusal is the same whether the record is the asker's own or somebody else's,
 # and that is deliberate. It says what this assistant does not share; it does not
@@ -165,6 +183,23 @@ EXHAUSTED_MSG = (
     "That covers everything the documents say on this topic. "
     "Is there another policy I can look up?"
 )
+
+# "Anything else?" after a turn that found nothing.
+#
+# The defect this replaces is one of kind, not of wording. The previous turn
+# reported a gap in the corpus, and "anything else?" then reported that the *topic*
+# was exhausted — a claim about documents that were never found and never read. It
+# also ran a fresh search to support it, so a reader who had been told nothing
+# existed was then billed for another look and told nothing more existed.
+#
+# So there is nothing to add, and saying that is the whole of the answer. No search
+# runs: there is no document to continue from, which is exactly why the last turn
+# found nothing. HR is named because a gap in what the corpus holds is HR's to
+# close, which is the one thing a rephrase would not fix.
+NOTHING_TO_ADD_MSG = (
+    "I didn't find anything on that, so I have nothing to add. You could rephrase "
+    f"it, or contact HR at {settings.hr_contact}."
+)
 # Never in scope, so it is not a gap in the corpus and there is nothing for HR to
 # supply. This is deliberately a different sentence from FALLBACK_MSG: telling
 # somebody to contact HR about the number of presidents a country has had claims
@@ -187,7 +222,15 @@ Rules:
 - If the context does not contain the answer, reply with exactly: NOT_FOUND
 - If the question asks about the asker's own personal records (their own leave
   balance, salary, payslip, appraisal), reply with exactly: PERSONAL
-- Never use outside knowledge."""
+- If a passage lists a set of things and the question is about that set, cover all
+  of them. Answering two of ten listed items is not an answer to a question about
+  ten, and the reader cannot tell which were left out.
+- Never use outside knowledge.
+
+After your answer, on a line of its own, write:
+USED: <the key of every passage you actually used>
+listing only keys that appear in the context, separated by commas. This names what
+your answer rests on and decides which sources the reader is shown."""
 
 USER_PROMPT = """Context:
 {context}
@@ -221,7 +264,13 @@ Rules:
 - If the context does not contain the answer, reply with exactly: NOT_FOUND
 - If the question asks about the asker's own personal records (their own leave
   balance, salary, payslip, appraisal), reply with exactly: PERSONAL
-- Never use outside knowledge."""
+- If a passage lists a set of things and the question is about that set, cover all
+  of them, briefly.
+- Never use outside knowledge.
+
+After your answer, on a line of its own, write:
+USED: <the key of every passage you actually used>
+listing only keys that appear in the context, separated by commas."""
 
 # An expansion is told apart from a follow-up by its context, not its question:
 # everything here has already been answered, and the passages the previous answer
@@ -250,11 +299,57 @@ nothing else:
 - Do not repeat, restate or reword anything in the "already covered" list. The \
 reader has read it.
 - Do not open with "In addition" or any other connective. Begin with the new point.
+- If a passage lists a set of things, cover all of them, briefly.
 - If the context adds nothing beyond what was already covered, reply with exactly: \
 NOT_FOUND. It will be turned into a statement that those documents are exhausted, \
 which is the truth.
 - Never use outside knowledge, and never state a company fact that is not in the \
-context."""
+context.
+
+After your answer, on a line of its own, write:
+USED: <the key of every passage you actually used>
+listing only keys that appear in the context, separated by commas."""
+
+# An elaboration is told apart from an expansion by what it wants rather than by the
+# conversation it follows: the subject is the previous answer's subject, so the
+# passages that answer already quoted are in the pool instead of being held back from
+# it. That is the whole difference, and it is why this is a separate prompt rather
+# than a flag: the model has to be told that the passages in front of it overlap with
+# what the reader has read, and that repeating them is the point rather than the
+# mistake it is for an expansion.
+ELABORATION_USER_PROMPT = """Conversation so far:
+{conversation}
+
+The reader is asking for more about the same subject: "{subject}". Some of the
+passages below may be ones the last answer already used. That is expected — go into
+the ones that carry the detail the last answer left out.
+
+Context:
+{context}
+
+Question: {question}
+Answer:"""
+
+ELABORATION_SYSTEM_PROMPT = """You are the Internal Knowledge Assistant for Acme \
+Technologies. Answer the question using ONLY the context given in the user message.
+Be concise, and use numbered steps when the source describes a process.
+
+The reader is asking for more detail about a subject they have already been given \
+an answer on. Go further than that answer: give the specifics, the roles, the \
+numbers, the exceptions. The context may repeat what they have already read, and \
+where it does, prefer what they have not yet seen.
+
+Rules:
+- If the context does not contain the answer, reply with exactly: NOT_FOUND
+- If the question asks about the asker's own personal records (their own leave
+  balance, salary, payslip, appraisal), reply with exactly: PERSONAL
+- If a passage lists a set of things and the question is about that set, cover all
+  of them, briefly. Naming two of ten is not an answer to a question about ten.
+- Never use outside knowledge.
+
+After your answer, on a line of its own, write:
+USED: <the key of every passage you actually used>
+listing only keys that appear in the context, separated by commas."""
 
 # The generator signals "nothing here" by replying with a sentinel rather than an
 # answer, and the sentinel is compared as text. That is fragile in one direction
@@ -266,6 +361,139 @@ context."""
 NOT_FOUND_REPLY = re.compile(r"^(?:not[ _-]?found|nothing found|no information found)\.?$", re.I)
 
 PERSONAL_REPLY = re.compile(r"^personal\.?$", re.I)
+
+# The generator's own report of which passages its answer rests on, as a line it
+# writes after the answer.
+#
+# Structured output in the sense that matters here — a machine-readable line whose
+# grammar this code owns, on a channel the reader never sees, because `done`
+# replaces the answer with the text above it. It travels as text rather than as a
+# tool call or a JSON mode because the configured client is an OpenAI-compatible
+# endpoint with neither, and because a line that can be parsed is easier to keep
+# working than a stream that has to be reconstructed from fragments.
+_USAGE_LINE = re.compile(r"^[ \t]*USED[ \t]*:[ \t]*(?P<keys>.*)$", re.I | re.M)
+
+# Keys are written by a model copying them out of the context, so they arrive with
+# the punctuation of the sentence around them. Stripped rather than rejected, since
+# "abcd1234." is plainly that key and refusing it would throw away a real answer's
+# citations over a full stop. Commas and semicolons are separators, not part of a key.
+_KEY_NOISE = re.compile(r"[\s,;\[\]()<>.•*_'\"]+")
+
+# How many passages are shown when the generator named none that validate.
+#
+# Two, and no more: the fallback exists so that an answer is never drawn without the
+# evidence behind it, not so it can be drawn with an arbitrary number of passages the
+# reader did not ask for. The best two by score is what the rest of the system would
+# have shown in a well-behaved answer anyway.
+FALLBACK_SOURCE_COUNT = 2
+
+
+def _split_used_keys(text: str, sources: Sequence[Mapping[str, object]]) -> tuple[str, frozenset[str]]:
+    """The answer without the generator's usage line, and the keys it relied on.
+
+    Validated against the passages this answer was actually given, because the report
+    comes from a model and an unvalidated one is worse than none: a key that was
+    never offered would be persisted as a citation naming a passage the reader cannot
+    be shown, and would then be excluded from "anything else?" on the strength of a
+    passage that does not exist.
+
+    A bare number is accepted as well as a key, resolved against the same numbering
+    the context uses. That is a convenience, not a second source of truth: it is
+    resolved to the key of the passage it names, so an unrecognised number is
+    discarded exactly as an unrecognised key is.
+
+    Everything after the first usage line is dropped from the answer. A model that
+    writes the line and then carries on talking has stopped answering, and the tail
+    would be shown as though it were part of the reply.
+    """
+    matches = list(_USAGE_LINE.finditer(text or ""))
+
+    if not matches:
+        return (text or "").strip(), frozenset()
+
+    match = matches[0]
+    answer = (text[: match.start()] + text[match.end() :]).strip()
+
+    valid = {str(source.get("chunk_id")) for source in sources if source.get("chunk_id")}
+    # The context numbers its passages from one in the order it lists them, which is
+    # the order `sources` is in.
+    by_position = {
+        str(position): str(source.get("chunk_id"))
+        for position, source in enumerate(sources, start=1)
+        if source.get("chunk_id")
+    }
+
+    used: set[str] = set()
+
+    for token in _KEY_NOISE.split(match.group("keys")):
+        if not token:
+            continue
+
+        resolved = by_position.get(token) if token.isdigit() else token
+
+        if resolved in valid:
+            used.add(str(resolved))
+
+    return answer, frozenset(used)
+
+
+def _display_order(sources: Sequence[Mapping[str, object]]) -> list[dict]:
+    """The passages in the order they should be numbered in.
+
+    Passages from the same document are put next to each other, in the order that
+    document first appeared. Grouping is what the reader sees — a card shows each
+    document's citations under its own heading — so an answer whose passages
+    alternate between two documents is displayed 1, 3, 2: the third passage belongs
+    to the document under the first heading, and the numbers underneath it skip. This
+    removes the interleaving at the source, so the numbering a client derives from
+    array position is also the numbering on screen.
+    """
+    grouped: dict[str, list[dict]] = {}
+    order: list[str] = []
+
+    for source in sources:
+        document = str(source.get("document", ""))
+
+        if document not in grouped:
+            grouped[document] = []
+            order.append(document)
+
+        grouped[document].append(dict(source))
+
+    return [source for document in order for source in grouped[document]]
+
+
+def _displayed_sources(
+    sources: Sequence[Mapping[str, object]], used: frozenset[str]
+) -> list[dict]:
+    """Only the passages the answer used, in display order.
+
+    A citation is a claim that the passage supports the answer. Retrieval returns the
+    best few passages regardless — it cannot know which the model will reach for —
+    so displaying all of them asserts support for parts of the answer nothing behind
+    them exists. "How many departments do we have?" retrieved four passages and cited
+    four; the number came from one of them, and the other three were decoration.
+
+    Each one persisted carries `"used": true`. That is the whole of the schema for
+    this: the passage is in the list because it was used, the flag says so explicitly
+    rather than leaving it to be inferred, and a row stored before the flag existed
+    still reads as used — which is what it was.
+    """
+    if used:
+        selected = [source for source in sources if str(source.get("chunk_id")) in used]
+    else:
+        # No key validated. Showing the best few beats showing nothing at all: an
+        # answer with no evidence behind it is the one thing this must not produce.
+        selected = sorted(
+            sources, key=lambda source: float(source.get("score") or 0.0), reverse=True
+        )[:FALLBACK_SOURCE_COUNT]
+
+    displayed = _display_order(selected)
+
+    for source in displayed:
+        source["used"] = True
+
+    return displayed
 
 # Output budget for classifying a message. Two short lines, but the configured
 # model reasons before it writes, so the same reasoning-model budget as the other
@@ -346,6 +574,42 @@ Hard limits:
   retrieval, indexing or searching at all.
 - Never promise anything beyond the abilities described above.
 - No lists, no headings, no markdown, no emoji."""
+
+# =============================================================================
+# Choosing which FAQ entry answers a question about the assistant
+# =============================================================================
+# The rule layer catches the questions it was written for. This is what happens to
+# the rest, and the shape of it is the point: the model is asked to name an entry, not
+# to write an answer. It never sees an answer and could not produce one if it tried,
+# because the reply that follows is read out of a table by id.
+
+META_MAX_TOKENS = 64
+
+META_PICKER_SYSTEM_PROMPT = """You match a reader's question about an AI \
+assistant to the entry that answers it.
+
+You are given a numbered list of entries. Reply with one line and nothing else:
+
+ENTRY: <the id of the one entry that answers the question>
+
+Rules:
+- Reply with the id exactly as written in the list, and nothing else on the line.
+- Choose the single best entry. If the list contains nothing that answers the
+  question, reply with the line: ENTRY: none
+- Never write the answer itself, never explain your choice, and never invent an id."""
+
+META_PICKER_USER_PROMPT = """Entries:
+{catalogue}
+
+Conversation so far:
+{conversation}
+
+Question about the assistant: {message}"""
+
+# The reasoning model wraps whatever it thinks onto lines of its own before the
+# answer, so the first line carrying the marker is the answer and everything before
+# it is discarded. Same reading as the classifier's, for the same reason.
+_ENTRY_LINE = re.compile(r"entry\s*:\s*([a-z_]+)", re.I)
 
 
 def truncate_title(text: str, max_chars: int = TITLE_MAX_CHARS) -> str:
@@ -697,7 +961,7 @@ class Assistant:
             # earlier turn all have exactly one right answer, and a model asked to
             # improvise one produces a different sentence each time — including,
             # eventually, a sign-off on a conversation that has not started.
-            fixed = self.fixed_conversational_reply(question, previous)
+            fixed = self.fixed_conversational_reply(question, previous, history)
 
             if fixed is not None:
                 for piece in _stream_pieces(fixed):
@@ -745,7 +1009,9 @@ class Assistant:
             return
 
         if classification.category is Category.EXPANSION:
-            yield from self._expansion_events(question, history, previous)
+            yield from self._expansion_events(
+                question, history, previous, classification.elaboration
+            )
             return
 
         candidates = self._retrieve(classification, previous)
@@ -796,7 +1062,7 @@ class Assistant:
         classification = classification or self.classify(question, history, previous)
 
         if classification.category is Category.CONVERSATIONAL:
-            fixed = self.fixed_conversational_reply(question, previous)
+            fixed = self.fixed_conversational_reply(question, previous, history)
 
             if fixed is not None:
                 return _result(fixed, ResponseKind.CONVERSATIONAL)
@@ -812,7 +1078,7 @@ class Assistant:
             return _result(PERSONAL_MSG, ResponseKind.RESTRICTED)
 
         if classification.category is Category.EXPANSION:
-            return self._expansion(question, history, previous)
+            return self._expansion(question, history, previous, classification.elaboration)
 
         candidates = self._retrieve(classification, previous)
 
@@ -903,6 +1169,19 @@ class Assistant:
             logger.info("no earlier turn to continue from; answering %r as chat", question)
             return Classification(Category.CONVERSATIONAL, question)
 
+        # An elaboration, whatever else it may also look like. Before everything
+        # below it, and before the classifier, because it is a shape of wording the
+        # rules recognise outright: "anything about these departments?" names no
+        # document, so an expansion rule misses it and the classifier — which sees
+        # the conversation rather than the words — reads it as an ordinary topic
+        # shift and retrieves "these departments" against the corpus.
+        #
+        # Guarded on there being documents to elaborate from. With none, "explain
+        # that" has nothing to explain and is a fresh question like any other.
+        if is_elaboration(question) and _can_continue(previous):
+            logger.info("continuation reads as an elaboration: %r", question)
+            return Classification(Category.EXPANSION, question, elaboration=True)
+
         if by_rule is not None:
             if by_rule is Category.EXPANSION:
                 # A refusal has no passages behind it, so there is nothing an
@@ -911,6 +1190,15 @@ class Assistant:
                 # a refusal rather than being told a topic is exhausted.
                 if previous is not None and previous.kind == ResponseKind.RESTRICTED.value:
                     return Classification(Category.RESTRICTED, question)
+
+                # The last turn found nothing, so there is nothing to continue and
+                # nothing to add. Said as conversational rather than searched: the
+                # search would return the same nothing, and reporting it a second
+                # time as "those documents are exhausted" claims the reader was given
+                # a passage that was never found.
+                if _after_a_gap(previous, question):
+                    logger.info("expansion after a gap; nothing to add")
+                    return Classification(Category.CONVERSATIONAL, question)
 
                 # Already exhausted, so still an expansion: same passages, same
                 # answer, rather than a fresh search of documents already read.
@@ -946,10 +1234,12 @@ class Assistant:
 
         # An expansion the model found rather than the rules: the same question as
         # above, and the same requirement of something to continue from.
-        if classification.category is Category.EXPANSION and not _can_continue(
-            previous
-        ):
-            return Classification(Category.FOLLOW_UP, question)
+        if classification.category is Category.EXPANSION:
+            if _after_a_gap(previous, question):
+                return Classification(Category.CONVERSATIONAL, question)
+
+            if not _can_continue(previous):
+                return Classification(Category.FOLLOW_UP, question)
 
         # The guard, again, on whatever will actually be retrieved or generated
         # against. Rules first so a rewrite cannot smuggle a request past them, and
@@ -988,6 +1278,7 @@ class Assistant:
         question: str,
         history: Sequence[tuple[str, str]],
         previous: PreviousAnswer | None,
+        elaboration: bool = False,
     ) -> Iterator[dict]:
         """"Anything else?", answered from what those documents had left.
 
@@ -997,7 +1288,9 @@ class Assistant:
         """
         yield {"type": "status", "stage": "writing"}
 
-        answer, kind, sources, confidence = self._expansion(question, history, previous)
+        answer, kind, sources, confidence = self._expansion(
+            question, history, previous, elaboration
+        )
 
         for piece in _stream_pieces(answer):
             yield {"type": "delta", "text": piece}
@@ -1009,6 +1302,7 @@ class Assistant:
         question: str,
         history: Sequence[tuple[str, str]],
         previous: PreviousAnswer | None,
+        elaboration: bool = False,
     ) -> tuple[str, ResponseKind, list[dict], int | None]:
         """The continuation, as text, kind, citations and confidence.
 
@@ -1020,7 +1314,18 @@ class Assistant:
 
         When there is nothing left, that is said plainly rather than reported as a
         gap in the corpus.
+
+        An elaboration runs the same reader with the exclusion switched off. The two
+        want opposite things from the same passages — "anything else?" wants what the
+        last answer did *not* say, "tell me about those" wants *more about the same
+        subject* — and holding back the passages that hold the answer is what made
+        "anything about these departments?" return two of ten departments from a
+        document that lists all ten. The subject is carried into the prompt rather
+        than retrieved, because the follow-up names no document either.
         """
+        if elaboration:
+            return self._elaborate(question, history, previous)
+
         exhausted = (EXHAUSTED_MSG, ResponseKind.NO_MORE_INFO, [], None)
 
         if previous is None or not previous.documents or _topic_is_exhausted(previous):
@@ -1059,24 +1364,115 @@ class Assistant:
 
         # The generator saying it has nothing left is the same fact as the passages
         # having nothing left, and it is reported the same way.
-        if _declined(text) == "not_found" or not text:
+        answer, used = _split_used_keys(
+            text, [_source(candidate) for candidate in candidates]
+        )
+
+        if _declined(answer) == "not_found" or not answer:
             return exhausted
 
         sources = [_source(candidate) for candidate in candidates]
 
-        return text, ResponseKind.ANSWER, sources, retrieval_confidence(candidates)
+        return (
+            answer,
+            ResponseKind.ANSWER,
+            _displayed_sources(sources, used),
+            retrieval_confidence(candidates),
+        )
+
+    def _elaborate(
+        self,
+        question: str,
+        history: Sequence[tuple[str, str]],
+        previous: PreviousAnswer | None,
+    ) -> tuple[str, ResponseKind, list[dict], int | None]:
+        """More about the subject the last answer was about, from the same documents.
+
+        Retrieval is the continuation reader's, because the document is the same one —
+        "anything about these departments?" names no document either, and the
+        documents the last answer cited are the only place the answer can be. What
+        differs is that nothing is held back: the passages the last answer used are
+        exactly the ones holding the detail being asked for.
+
+        Anchored on the question that started the thread *plus* the follow-up, because
+        the follow-up alone ranks on a demonstrative and a noun ("these departments")
+        and the question carries the terms that reach the right passage.
+        """
+        if previous is None or not previous.documents:
+            # Nothing was cited, so there is no subject to elaborate on. Said as
+            # nothing-to-add rather than searched for: the follow-up names no
+            # document, and a search for a demonstrative finds nothing in any of
+            # them.
+            return NOTHING_TO_ADD_MSG, ResponseKind.CONVERSATIONAL, [], None
+
+        anchor = f"{previous.question} {question}".strip()
+        candidates = self.retrieval.retrieve_continuation(
+            anchor, previous.documents, frozenset()
+        )
+
+        if not candidates:
+            return NOTHING_TO_ADD_MSG, ResponseKind.CONVERSATIONAL, [], None
+
+        user_prompt = ELABORATION_USER_PROMPT.format(
+            conversation=_conversation(history, 600),
+            subject=previous.question or previous.answer,
+            context=_context(candidates),
+            question=question,
+        )
+
+        try:
+            parts: list[str] = []
+            for delta in self._stream(
+                user_prompt, system_prompt=ELABORATION_SYSTEM_PROMPT
+            ):
+                parts.append(delta)
+
+            text = "".join(parts).strip()
+        except LlmUnavailable as exc:
+            logger.warning("elaboration unavailable: %s", exc.reason)
+            return NOTHING_TO_ADD_MSG, ResponseKind.CONVERSATIONAL, [], None
+
+        sources = [_source(candidate) for candidate in candidates]
+        answer, used = _split_used_keys(text, sources)
+        declined = _declined(answer)
+
+        # A follow-up to a refusal is a refusal here as everywhere else, and the
+        # confidentiality guard is re-applied to it by the classifier before this
+        # point; this is the last thing standing between a rewritten message and the
+        # page.
+        if declined == "personal":
+            return PERSONAL_MSG, ResponseKind.RESTRICTED, [], None
+
+        if not answer or declined == "not_found":
+            return NOTHING_TO_ADD_MSG, ResponseKind.CONVERSATIONAL, [], None
+
+        logger.info("elaborated %r via %s", question, settings.llm_model)
+
+        return (
+            answer,
+            ResponseKind.ANSWER,
+            _displayed_sources(sources, used),
+            retrieval_confidence(candidates),
+        )
 
     def fixed_conversational_reply(
-        self, message: str, previous: PreviousAnswer | None
+        self,
+        message: str,
+        previous: PreviousAnswer | None,
+        history: Sequence[tuple[str, str]] = (),
     ) -> str | None:
         """The reply to this message, when there is only one right reply.
 
-        Four kinds of message, all of which ask nothing of the documents and all of
+        Five kinds of message, all of which ask nothing of the documents and all of
         which are better served by words chosen once than by words invented:
 
-        - a question about what this assistant is, answered from the capabilities
-          description rather than generated, because an improvised answer to "what
-          can you do?" is a promise nobody checked;
+        - a question about what this assistant is, answered from the FAQ rather than
+          generated, because an improvised answer to "what can you do?" is a promise
+          nobody checked, and because the description it used to be checked against
+          said nothing about languages, so "do you understand Chinese?" matched
+          nothing and was answered with an invitation to ask a question;
+        - a message whose script did not survive transmission, corrected and then
+          answered from the same table;
         - a message that needed an earlier turn this conversation does not have,
           which is said plainly rather than searched for;
         - a message that could not be read, which gets a warmer reply the more of
@@ -1088,14 +1484,23 @@ class Assistant:
         question", "that's not what I asked" — which is the one conversational
         message that is genuinely a reply to something, and the one worth writing.
         """
-        if asks_about_capabilities(message):
-            return CAPABILITIES_REPLY
+        meta = self.meta_reply(message, history, previous)
+
+        if meta is not None:
+            return meta
 
         # Before the gibberish check: "anything else?" with no earlier turn has a
         # true answer whatever it is made of, and the answer is that there is
         # nothing to continue.
         if orphaned_context_question(message, previous):
             return NO_PRIOR_TOPIC_MSG
+
+        # "Anything else?" after a turn that found nothing. Ahead of the pleasantry
+        # pool because it is a question and deserves an answer to it, and ahead of
+        # the unreadable check because a reader who has been told the documents do
+        # not cover something is not confused.
+        if _after_a_gap(previous, message):
+            return NOTHING_TO_ADD_MSG
 
         streak = previous.unreadable_streak if previous else 0
         seen = previous.unreadable_seen if previous else 0
@@ -1105,7 +1510,13 @@ class Assistant:
         # also a run of letters: "hhhhh" is in no word list, and reading it as a
         # keyboard accident would answer somebody's laugh with "did your keyboard
         # slip?".
-        if classify_by_rules(message) is Category.CONVERSATIONAL:
+        #
+        # The narrow reading rather than `classify_by_rules`, which now also returns
+        # CONVERSATIONAL for a question about the assistant and for a message in
+        # another script. Answering "that is chinese" — where `meta_reply` has
+        # already decided there is nothing to correct — with "Hello, ask me anything"
+        # would be treating a reader's observation as a greeting.
+        if is_obvious_conversational(message):
             replies = previous.assistant_replies if previous else 0
             invited = previous.invitation_given if previous else False
 
@@ -1115,6 +1526,133 @@ class Assistant:
             return unreadable_reply(streak + 1, seen)
 
         return None
+
+    def meta_reply(
+        self,
+        message: str,
+        history: Sequence[tuple[str, str]] = (),
+        previous: PreviousAnswer | None = None,
+    ) -> str | None:
+        """The approved answer to a question about this assistant, or None.
+
+        Rules first, then the model, then the table — and the model never gets past
+        the third step. A question the rules recognise is answered from its entry
+        directly. A question they do not is offered to the model as a choice between
+        the entry ids, and whichever id it names is read back from the same table. An
+        id that is not in the table, a reply that names none, and a model that cannot
+        be reached all produce the same reply: the honest one that says it does not
+        know and then says what it can do.
+
+        That ordering is the whole fix. The previous behaviour let the model write
+        this reply, and the model's instructions for this path were explicit that it
+        must not state facts about the assistant — so the only thing it could do with
+        "do you understand Chinese?" was to improvise, and what it improvised was
+        "I'm happy to help with any questions you have. Just let me know what you
+        need".
+
+        The two script cases come before the question test because they are not
+        questions at all — a Chinese sentence and a complaint about a Chinese sentence
+        both have to be answered, and neither would be recognised as a question about
+        the assistant.
+        """
+        written_in = dominant_script(message)
+
+        if written_in is not None:
+            return self._script_reply(message, written_in)
+
+        language = claimed_language(message)
+
+        if (
+            language
+            and previous is not None
+            and previous.previous_user
+            and is_latin_script(previous.previous_user)
+        ):
+            # Only believed because what arrived really was Latin letters. A reader
+            # saying "that was Chinese" about a message that arrived as Chinese
+            # characters has not been let down by anything, and telling them it came
+            # through as random letters would be inventing a fault that is not there.
+            logger.info(
+                "correcting a transmission the reader reports as %s", language.lower()
+            )
+
+            return f"{script_correction(language)} {LANGUAGES.answer}"
+
+        if not is_meta_question(message):
+            return None
+
+        entry = match_faq_entry(message)
+
+        if entry is not None:
+            logger.info("answered a question about the assistant from the %r entry", entry.id)
+
+            return entry.answer
+
+        entry_id = self._choose_faq_entry(message, history)
+
+        if entry_id is None:
+            return NOT_SURE_REPLY
+
+        chosen = faq_entry(entry_id)
+
+        return chosen.answer if chosen else NOT_SURE_REPLY
+
+    def _script_reply(self, message: str, script: str) -> str:
+        """What to answer a message written in a script a Latin keyboard cannot produce.
+
+        The languages entry, in English, and the script named rather than guessed
+        into a language: Cyrillic is not Russian and the observation that a message
+        arrived in a script the assistant cannot read is the true part of it.
+
+        Whether the same question in English would retrieve the right document is the
+        limitation the entry states, so it is stated here too rather than leaving a
+        reader who asked in Chinese to discover it as a "not found".
+        """
+        logger.info("message arrived in %s script; answering in English", script)
+
+        return (
+            f"I can see that arrived as {script} script. {LANGUAGES.answer}"
+        )
+
+    def _choose_faq_entry(
+        self, message: str, history: Sequence[tuple[str, str]]
+    ) -> str | None:
+        """Which FAQ entry the model says this question is about, or None.
+
+        A choice between ids, never a draft. The model is shown the ids and what each
+        one covers and is asked for one word back; whatever it writes is looked up in
+        the table, so an id that does not exist resolves to nothing and the caller
+        says it does not know. That is why this can involve a model at all without
+        putting invented facts within its reach.
+        """
+        prompt = META_PICKER_USER_PROMPT.format(
+            conversation=_conversation(history, 400) or "(this is the first message)",
+            catalogue=faq_catalogue(),
+            message=message,
+        )
+
+        try:
+            reply = self._complete(
+                prompt, system_prompt=META_PICKER_SYSTEM_PROMPT, max_tokens=META_MAX_TOKENS
+            )
+        except LlmUnavailable as exc:
+            logger.warning("no FAQ entry chosen, saying so: %s", exc.reason)
+            return None
+
+        match = _ENTRY_LINE.search(reply or "")
+
+        if match is None:
+            return None
+
+        chosen = match.group(1).strip().strip("\"'").lower()
+
+        if chosen not in FAQ_IDS:
+            logger.info("FAQ pick %r is not an entry this deployment has", chosen)
+            return None
+
+        logger.info("answered a question about the assistant from the %r entry", chosen)
+
+        return chosen
 
     def conversational_pieces(
         self, message: str, history: Sequence[tuple[str, str]] = ()
@@ -1258,7 +1796,13 @@ def _settle(text: str, sources: list[dict], confidence: int | None) -> dict:
     A refusal drops the citations and the figure on the way through: neither is
     evidence when the answer is that nothing is shared, and a confidence score
     beside a refusal would describe a measurement nobody made.
+
+    The generator's usage line is read and removed here rather than shown, and what
+    it named decides which passages are displayed. A model that answered and did not
+    report — a truncated stream, a reasoning model that spent its budget thinking —
+    falls back to the best two, so the answer is never drawn with nothing behind it.
     """
+    text, used = _split_used_keys(text, sources)
     declined = _declined(text)
 
     if declined == "personal":
@@ -1267,15 +1811,21 @@ def _settle(text: str, sources: list[dict], confidence: int | None) -> dict:
     if declined == "not_found":
         return _result(FALLBACK_MSG, ResponseKind.NOT_FOUND)
 
-    return _result(text, ResponseKind.ANSWER, sources, confidence)
+    return _result(text, ResponseKind.ANSWER, _displayed_sources(sources, used), confidence)
 
 
 def _context(candidates: Sequence[Candidate]) -> str:
-    """The passages a generator is given, each labelled with where it came from."""
+    """The passages a generator is given, each labelled with where it came from.
+
+    Labelled with its key as well, and numbered, because the generator is asked to
+    report which passages it used and cannot name one it was not shown. The number
+    is a convenience for copying; the key is what the report is validated against.
+    """
     return "\n\n".join(
-        f"({candidate.node.metadata['policy_title']} > {candidate.node.metadata['section']})\n"
+        f"[{position}] ({candidate.node.metadata['policy_title']} > "
+        f"{candidate.node.metadata['section']}) key: {chunk_key(candidate.node)}\n"
         f"{candidate.node.get_content(metadata_mode=MetadataMode.NONE)}"
-        for candidate in candidates
+        for position, candidate in enumerate(candidates, start=1)
     )
 
 
@@ -1337,8 +1887,60 @@ def _topic_is_exhausted(previous: PreviousAnswer | None) -> bool:
     would search the same documents for the same passages, and either restate the
     previous answer or come back as a false gap in the corpus — the two things this
     path exists to avoid. So the same answer is given again, which is the truth.
+
+    Only reachable from an answer, and the documents are what say so: a turn that
+    cited something read passages, and those passages can be exhausted. A turn that
+    found nothing never cited anything, so the thread has no documents, and "nothing
+    left" would be a claim about documents that were never opened. That is
+    `_after_a_gap`'s case, and it is answered differently on purpose.
     """
-    return previous is not None and previous.kind == ResponseKind.NO_MORE_INFO.value
+    return (
+        previous is not None
+        and previous.kind == ResponseKind.NO_MORE_INFO.value
+        and bool(previous.documents)
+    )
+
+
+def _after_a_gap(previous: PreviousAnswer | None, message: str = "") -> bool:
+    """Whether this message is asking for more after a turn that found nothing.
+
+    Two conditions, and both are needed. The last turn must have been a gap in the
+    corpus — anything else and the ordinary paths have something true to say. And
+    the message must be asking for more of it: "anything else?" after a not-found is
+    that, while "ok" or "thanks" after one is not, and answering an acknowledgement
+    with "I didn't find anything on that" would be answering something nobody said.
+    """
+    return (
+        previous is not None
+        and previous.kind == ResponseKind.NOT_FOUND.value
+        and needs_earlier_context(message)
+    )
+
+
+def match_faq_entry(message: str) -> FaqEntry | None:
+    """The FAQ entry whose triggers this message matches, or None.
+
+    Longest trigger wins, so a specific phrase beats a general one: "do you remember
+    our chats" is more exactly the memory entry than any one-word trigger in it, and
+    "are my messages saved" is more exactly the privacy entry than "are my" anything.
+
+    Read on the normalised message, which folds case, trailing punctuation and
+    stretched letters — the same reading every other rule in this system uses, so
+    "do you remembr our chats" reaches the same entry as the spelling of it.
+    """
+    cleaned = normalise(message)
+
+    if not cleaned:
+        return None
+
+    best: tuple[int, FaqEntry] | None = None
+
+    for entry in ASSISTANT_FAQ:
+        for trigger in entry.triggers:
+            if trigger in cleaned and (best is None or len(trigger) > best[0]):
+                best = (len(trigger), entry)
+
+    return best[1] if best else None
 
 
 def _result(
