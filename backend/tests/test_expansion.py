@@ -432,7 +432,11 @@ class ReadingTheDocumentTest(unittest.TestCase):
 
         def complete(user_prompt: str, system_prompt: str = "", max_tokens=None) -> str:
             self.asked.append(user_prompt)
-            return "There is more to say."
+            # Every passage it was given is one it used, which is what the model is
+            # asked to report and what decides what is displayed. Without the report
+            # this answer would show the best two passages only, and reading a
+            # seven-section document out would take four turns instead of three.
+            return f"There is more to say.\nUSED: 1, 2, 3"
 
         def stream(user_prompt: str, system_prompt: str = "", max_tokens=None):
             yield complete(user_prompt, system_prompt, max_tokens)

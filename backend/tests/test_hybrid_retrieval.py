@@ -729,6 +729,41 @@ class ContinuationRetrievalTest(unittest.TestCase):
         return {node.metadata["section"] for node in self.chunks[title]}
 
 
+# Questions the corpus does not answer, and the reason it does not. The reason is
+# part of the entry: a correct `not_found` is only correct while the reason holds, and
+# the moment it stops holding is the moment the expectation needs looking at rather
+# than deleting.
+#
+# Measured on the deployed corpus rather than assumed. "who is the head of the IT
+# department?" was reported as not_found and the first question was whether that was
+# a retrieval defect. It is not: the corpus contains no individual at all. Every
+# document carries an owning team ("Owner: IT Support & Security", "Owner: Office of
+# the CTO"), and a sweep of all 62 chunks for head / lead / director / chief / owner
+# / manager returns roles and offices and never a person. The question's best chunk
+# is the IT & VPN guide at cosine 0.354 with BM25 0.35 — under `min_score` of 0.40,
+# and beside passages the keyword leg rescued at BM25 2.79 purely on "IT" and "head"
+# appearing in document headers. There is no right chunk to reach for, so no floor
+# was touched: lowering `min_score` to 0.354 would admit those same passages and turn
+# a correct gap into a confident wrong answer about who runs a department.
+EXPECTED_GAPS = {
+    "who is the head of the IT department?": (
+        "No document names any individual. The IT documents are owned by "
+        "'IT Support & Security' and the technical one by 'Office of the CTO', both "
+        "offices rather than people, so there is no chunk that answers this however "
+        "far the floor is lowered."
+    ),
+    "who leads the IT team?": (
+        "The same finding, asked the other way round. The directory names an IT "
+        "Service Desk phone number and a mailbox, which is where to ask — not who "
+        "runs it."
+    ),
+    "who is the head of engineering?": (
+        "No document names an engineering lead. The compensation policy mentions a "
+        "'department head' as a step in a pay review, without saying who holds it."
+    ),
+}
+
+
 class GoldenRetrievalTest(unittest.TestCase):
     """What an ordinary question retrieves, pinned.
 
@@ -845,6 +880,85 @@ class GoldenRetrievalTest(unittest.TestCase):
             ],
             [section for _, section, _, _ in self.GOLDEN["What is the notice period?"]],
         )
+
+
+class ExpectedGapTest(unittest.TestCase):
+    """Questions the corpus genuinely does not hold, and must keep saying so.
+
+    The other half of the golden set. `GOLDEN` pins what an answerable question
+    retrieves; this pins questions whose correct reply is `not_found`, so a change
+    that starts handing one of them an answer is caught rather than celebrated.
+
+    Each carries the reason, because "the corpus does not hold this" is only a
+    correct answer if that is true — and it stops being true the moment somebody adds
+    a document, which is the moment this needs to be looked at again.
+
+    "who is the head of the IT department?" is here because it was checked rather
+    than assumed. The corpus names no individual anywhere: every document carries an
+    owning *team* ("Owner: IT Support & Security", "Owner: Office of the CTO") and a
+    sweep of all 62 chunks for head/lead/director/chief/owner/manager returns roles
+    and offices, never a person. On the deployed corpus the question's best chunk is
+    the IT & VPN guide at cosine 0.354 and BM25 0.35 — under `min_score` (0.40), and
+    beside passages the keyword leg rescued at BM25 2.79 from the words "IT" and
+    "head" appearing in a document header. Nothing there answers the question, so
+    there is no right chunk to lower a floor for: lowering `min_score` to reach 0.354
+    would admit the same passages and turn a correct gap into a confident wrong
+    answer.
+    """
+
+    def test_a_gap_stays_a_gap(self):
+        index = policy_index(
+            ("Employee Expectations", ContinuationRetrievalTest.EXPECTATIONS),
+            ("IT & VPN Guide", ContinuationRetrievalTest.VPN),
+            ("Code of Conduct", ContinuationRetrievalTest.CONDUCT),
+            ("Facilities Notice", ContinuationRetrievalTest.NOTICE),
+        )
+        retriever = HybridRetriever(
+            index.as_retriever(similarity_top_k=4),
+            KeywordIndex(index.docstore.docs.values()),
+            documents=IndexedDocuments(index),
+            top_k=4,
+            vector_candidates=10,
+            keyword_candidates=10,
+            min_score=0.40,
+            keyword_min_score=2.0,
+            recall_floor=0.15,
+            recall_candidates=4,
+        )
+
+        for question in EXPECTED_GAPS:
+            with self.subTest(question=question):
+                found = retriever.retrieve(question)
+
+                # Nothing here clears any floor. If one of these ever does, the
+                # reason above is out of date and the expectation is with it.
+                self.assertEqual(
+                    [(c.node.metadata["section"], c.similarity) for c in found],
+                    [],
+                )
+
+    def test_every_gap_says_why_it_is_one(self):
+        for question, why in EXPECTED_GAPS.items():
+            with self.subTest(question=question):
+                self.assertTrue(why.strip(), f"{question} has no stated reason")
+
+    def test_the_real_corpus_names_no_individual_to_be_the_head_of_anything(self):
+        # The check behind the entry above, against the corpus that ships rather
+        # than the stand-in one: an owning team is not a person, and a document that
+        # starts naming people is a document that has to be read again before this
+        # expectation is trusted.
+        from app.rag.ingest import load_documents
+
+        documents = load_documents()
+        self.assertTrue(documents)
+
+        for document in documents:
+            with self.subTest(document=document.metadata.get("policy_title", "")):
+                self.assertNotRegex(
+                    document.get_content(),
+                    r"(?i)\b(?:headed by|is led by|leads the|reports to)\b",
+                    "the corpus appears to name a department head",
+                )
 
 
 if __name__ == "__main__":
