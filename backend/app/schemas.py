@@ -49,6 +49,11 @@ class Source(BaseModel):
     # stored citations.
     chunk_id: str | None = None
     score: float
+    # That the answer was drawn from this passage rather than merely retrieved
+    # alongside it. Always true on a stored row — only used passages are persisted —
+    # and absent on a row written before the distinction existed, which reads as
+    # used because those passages were displayed.
+    used: bool = True
 
 
 class MessageDto(BaseModel):

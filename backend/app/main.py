@@ -23,6 +23,7 @@ from app.database import (
     assistant_replies,
     cited_chunk_ids,
     cited_documents,
+    last_user_message,
     create_conversation,
     get_owned_conversation,
     has_usable_topic,
@@ -335,6 +336,7 @@ def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None
     that answers the next greeting.
     """
     reply_count = assistant_replies(db, conversation_id)
+    typed = last_user_message(db, conversation_id)
 
     if reply_count == 0:
         return None
@@ -352,6 +354,7 @@ def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None
             invitation_given=invited,
             unreadable_streak=unreadable_streak,
             unreadable_seen=unreadable_seen,
+            previous_user=typed,
         )
 
     question, answer = last_exchange(db, conversation_id)
@@ -368,6 +371,7 @@ def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None
             invitation_given=invited,
             unreadable_streak=unreadable_streak,
             unreadable_seen=unreadable_seen,
+            previous_user=typed,
         )
 
     return PreviousAnswer(
@@ -382,6 +386,7 @@ def _previous_answer(db: Session, conversation_id: str) -> PreviousAnswer | None
         invitation_given=invited,
         unreadable_streak=unreadable_streak,
         unreadable_seen=unreadable_seen,
+        previous_user=typed,
     )
 
 

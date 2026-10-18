@@ -432,13 +432,25 @@ def cited_documents(db: SessionLocal, conversation_id: str) -> frozenset[str]:
 
 
 def cited_chunk_ids(db: SessionLocal, conversation_id: str) -> frozenset[str]:
-    """Every chunk id this conversation has already put in front of the reader.
+    """Every chunk this conversation has already put in front of the reader.
 
     Across the whole thread rather than the last answer: "anything else?" three
     turns later must not re-quote the passage the first answer used, and only the
     whole thread knows which passages those are. A conversation of any size holds
     tens of rows, and the sources are already loaded to read them, so this is a
     pass over data in memory rather than a query of its own.
+
+    These are the *used* chunks, and that needs no column of its own. Only the
+    passages an answer was actually drawn from are persisted, each flagged
+    `"used": true`, so every chunk id in here is one the answer rested on — which is
+    what an exclusion needs, since holding back a passage the answer never used
+    would deny the reader the next "anything else?" the very thing it is for.
+
+    Rows stored before that flag existed hold every retrieved passage rather than
+    only the used ones, and they read as their own citations. That is the right
+    fallback: the passages behind those answers were displayed, so treating them as
+    shown keeps "anything else?" from repeating them, and no migration can recover a
+    distinction that was never recorded.
     """
     rows = db.scalars(
         select(Message.sources).where(
@@ -453,6 +465,29 @@ def cited_chunk_ids(db: SessionLocal, conversation_id: str) -> frozenset[str]:
         for sources in rows
         for source in (sources or [])
         if isinstance(source, dict) and source.get("chunk_id")
+    )
+
+
+def last_user_message(db: SessionLocal, conversation_id: str) -> str:
+    """The most recent thing this reader typed in this conversation.
+
+    Carried only so the script correction can check a claim made about it: "that is
+    Chinese" is a correction of the transmission if what arrived was Latin letters,
+    and a mistake if what arrived was Chinese characters. The check needs the message
+    itself, not a summary of it, and it has to be this thread's own — the same
+    isolation every other read here is scoped by.
+    """
+    return (
+        db.scalar(
+            select(Message.content)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.role == "user",
+            )
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(1)
+        )
+        or ""
     )
 
 

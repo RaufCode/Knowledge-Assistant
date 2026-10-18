@@ -8,15 +8,28 @@ from app.config import settings
 NOISE = ["file_path", "file_type", "file_size", "creation_date", "last_modified_date"]
 
 
-def build_index() -> VectorStoreIndex:
+def load_documents(data_dir: str | None = None):
+    """The corpus as documents, with each one's policy title in its metadata.
+
+    Split out of `build_index` so the corpus can be read without an embedding key:
+    a question whose answer depends on whether the documents say something at all
+    has to be decidable without embedding them, which is also the only way that
+    question gets asked honestly rather than assumed.
+    """
     docs = SimpleDirectoryReader(
-        settings.data_dir, required_exts=[".md"]
+        data_dir or settings.data_dir, required_exts=[".md"]
     ).load_data()
 
     # Policy title = the first "# " heading of each file
     for d in docs:
         first_line = d.text.strip().splitlines()[0]
         d.metadata["policy_title"] = first_line.lstrip("# ").strip()
+
+    return docs
+
+
+def build_index() -> VectorStoreIndex:
+    docs = load_documents()
 
     # One chunk per markdown section
     nodes = MarkdownNodeParser().get_nodes_from_documents(docs)
