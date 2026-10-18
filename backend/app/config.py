@@ -91,6 +91,20 @@ class Settings(BaseSettings):
     llm_max_attempts: int = 3
     llm_retry_base_seconds: float = 0.5
 
+    # ------------------------------------------------------------------ hr ----
+    # Who to name when a reply has to route a reader to a human. Configured rather
+    # than written into the strings themselves because it changes per deployment
+    # and must not be able to drift: one place to correct, and every reply that
+    # names HR picks the change up at the same time. Defaults are the contact the
+    # HR directory document publishes.
+    hr_email: str = "hr@acmetech.example"
+    hr_phone: str = "+233 30 000 0000"
+
+    @property
+    def hr_contact(self) -> str:
+        """HR as one reader-ready string, for a sentence rather than a table cell."""
+        return f"{self.hr_email} or {self.hr_phone}"
+
     # ---------------------------------------------------------------- auth ----
     # The one secret both token types are signed with. It is never sent anywhere
     # and never returned, and rotating it signs every existing session out at once

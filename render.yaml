@@ -115,6 +115,15 @@ services:
       - key: FRONTEND_BASE_URL
         value: "https://knowledge-assistant-chatbot-app.onrender.com"
 
+      # Who a reply names when it has to route a reader to a human — a gap in the
+      # documents, or a question about the assistant itself. Configured so a
+      # deployment corrects the contact in one place rather than in every reply
+      # string that names it.
+      - key: HR_EMAIL
+        value: "hr@acmetech.example"
+      - key: HR_PHONE
+        value: "+233 30 000 0000"
+
       # Neon, set in the Render dashboard. This service no longer provisions a
       # database of its own, so local and deployed run against the same Neon
       # instance and a migration cannot land in only one of them.
