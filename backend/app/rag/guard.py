@@ -49,6 +49,7 @@ hundred ways, and the confidentiality guard's rule patterns are trivially bypass
 by rephrasing — so the model is its backstop, not its replacement.
 """
 
+import difflib
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -409,10 +410,18 @@ class Classification:
     An expansion has no query worth retrieving: it names no subject, and what it
     wants is more of the passages the previous answer was drawn from. So its query
     is the message as sent, and it never reaches the retrieval path at all.
+
+    `elaboration` is the flag that splits the continuation reader in two. It carries
+    no new category — an elaboration is still an expansion as far as the wire is
+    concerned, and still produces `kind=answer` — but it is read differently: the
+    subject is the previous answer's subject, so the passages that answer already
+    quoted are included rather than held back. Set by rule, never by the classifier:
+    see `is_elaboration`.
     """
 
     category: Category
     query: str
+    elaboration: bool = False
 
 
 # Openers, acknowledgements and sign-offs that ask for nothing. A fast path, not
@@ -888,6 +897,24 @@ def is_laughter(text: str) -> bool:
     return False
 
 
+# How much of a message has to be made of tokens no word list carries before the
+# message is called a keyboard accident.
+#
+# A ratio rather than a count, and the reason is the defect this replaced: "heyjffdk
+# hdj this" carries a real word, and any rule of the form "a familiar word exempts
+# the message" read that as a message worth answering. It got a generated reply, so
+# the *next* gibberish message in the conversation was answered as though it were
+# the first one — the streak never started, and a reader whose keyboard was broken
+# got the shrug-and-try-again reply twice in a row instead of the examples.
+#
+# Sixty per cent is the majority, and the direction of the error is the whole choice:
+# a real question contains several ordinary words, so it clears the bar comfortably
+# ("what does the leave policy say" is one unknown of four), while anything typed by
+# accident is nearly all unknown by construction. A message that sits near the line is
+# left to the classifier, which can see the conversation this counting cannot.
+MAJORITY_NON_WORD = 0.6
+
+
 def is_unintelligible(text: str, vocabulary: frozenset[str] = frozenset()) -> bool:
     """Whether this message is a keyboard accident rather than a message.
 
@@ -920,26 +947,32 @@ def is_unintelligible(text: str, vocabulary: frozenset[str] = frozenset()) -> bo
     if any(_is_exempt(token) for token in tokens):
         return False
 
-    # One familiar word is enough. Every real message has several, and this is the
-    # rule that keeps "whats the leav policy" — one misspelt word in an ordinary
-    # sentence — out of this path.
-    if any(token.lower() in known for token in tokens):
-        return False
-
     # A capitalised word in the middle of a sentence is a name, and people are
     # named in messages. A sentence's own first word is not evidence of anything,
     # which is why it does not count here.
     if _names_a_person(text):
         return False
 
-    if any(_is_nonsense(token.lower()) for token in tokens):
-        return True
+    # One word, so there is nothing to weigh it against. "grievance" is in no word
+    # list this check knows, and a majority reading of a single word says nothing:
+    # it is 100% unknown whatever it is. A lone word is judged by its shape instead,
+    # which is what asks the question a spelling check can actually answer.
+    if len(tokens) == 1:
+        return _is_nonsense(tokens[0].lower())
 
-    # Nothing known and nothing obviously typed by accident: several words in a
-    # row none of which is a word is a foreign language or a typo rather than a
-    # hand on the keyboard, and the classifier is better placed than a spelling
-    # check to say what it is.
-    return len(tokens) > 1
+    unknown = sum(1 for token in tokens if token.lower() not in known)
+
+    # The majority rule, and nothing else. A message that is mostly words this code
+    # cannot read is left to the classifier, which can see the conversation this
+    # counting cannot: "whats the leav policy" is a question with two typos in it,
+    # and answering it with "did your keyboard slip?" would be refusing to answer a
+    # question the documents hold.
+    #
+    # The shape test is deliberately not applied as well. It fires on ordinary words
+    # with awkward spelling — "approves" and "period" both read as a keyboard run to
+    # it — and while no-token-is-known used to hold it back, a majority rule that
+    # lets one real word through must not reintroduce it on that basis.
+    return unknown / len(tokens) >= MAJORITY_NON_WORD
 
 
 def _is_exempt(token: str) -> bool:
@@ -1060,11 +1093,253 @@ def is_obvious_conversational(text: str) -> bool:
 def asks_about_capabilities(text: str) -> bool:
     """Whether this message is a question about what the assistant is and does.
 
-    These are answered verbatim from the capabilities description rather than
-    generated, which is the only way the assistant cannot describe abilities it
-    does not have: an improvised answer is a promise nobody checked.
+    Superseded by `is_meta_question`, which covers this and the abilities the
+    description does not mention. Kept because it is the narrow, exact reading the
+    title logic and the tests use, and narrowing is what that logic wants: a thread
+    opened by "what can you do?" is small talk, while "what can you do about my
+    payslip?" is a refusal and must not be caught by it.
     """
     return normalise(text) in CAPABILITY_QUESTIONS
+
+
+# =============================================================================
+# Questions about the assistant itself
+# =============================================================================
+# A question the reader is asking *us* rather than the documents. The defect these
+# rules exist to close is a reader asking "do you understand Chinese?" and being told
+# "I'm happy to help with any questions you have. Just let me know what you need":
+# a direct question answered with an invitation to ask one.
+#
+# The failure has two halves and both are fixed here rather than in the prompt. The
+# description of the assistant did not mention languages, so a question about them
+# matched nothing and fell through to the conversational path, which has no facts and
+# can only improvise; and the conversational path is explicitly barred from stating
+# facts about the assistant, so improvising was all it could do. Naming the
+# question here routes it to an approved answer instead of to improvisation.
+#
+# Matched as patterns over the whole message rather than as a set of exact strings,
+# because the same question is asked a dozen ways and a list of exact phrasings
+# catches only the ones somebody thought of. Every pattern is anchored on something
+# the question cannot avoid: it must be addressed *to* the assistant, or be about the
+# conversation with it.
+#
+# The hard part is not catching the questions but not catching the policies, and both
+# halves are narrow on purpose. A bare `\blanguages?\b` would claim "what does the
+# Code of Conduct say about languages at work?", which is a real question with an
+# answer in the corpus; `what is this` has to be the whole of a short message, or it
+# claims "what is this policy about?". When a pattern cannot be made safe, the entry
+# is left to the model picker instead of to a rule — which still answers it, and does
+# so from the same closed table.
+
+# A phrase that names the assistant. Second person, because every one of these
+# questions is addressed to somebody.
+_ASSISTANT = r"(?:you|u|your|assistant|bot)"
+
+META_PATTERNS = [
+    # Identity and abilities.
+    r"\bwho\s+(?:are|r)\s+(?:you|u)\b",
+    r"\bwhat\s+(?:are|is)\s+(?:you|u)\b",
+    r"\bwhat\s+(?:can|do|will|would)\s+(?:you|u)\b",
+    r"\bwhat\s+(?:can|do|will|would)\s+(?:the\s+)?(?:assistant|bot|chatbot)\b",
+    r"\bintroduce\s+yoursel(?:f|ves)\b",
+    r"\bwhat\s+(?:do|can)\s+you\s+know\b",
+    r"\bwhat\s+are\s+you\s+(?:for|here\s+for)\b",
+    r"\b(?:are|you)\s+(?:you\s+)?(?:an?\s+)?(?:ai|robot|bot|chatbot|human)\b",
+    # "what is this" only as the whole of a short message. Elsewhere "what is this
+    # policy about?" is a question about a document.
+    r"^what(?:'s| is) this\s*[?.!]*$",
+    # Languages. The whole reason this exists.
+    r"\b(?:do|can|could|will|would)\s+(?:you|u)\s+(?:speak|talk|read|write|understand|"
+    r"reply|respond|answer|translate)\b",
+    r"\b(?:what|which)\s+language",
+    # A language named in a message that also addresses us. Naming a language alone
+    # is a policy question far more often than it is a question about us.
+    r"\b(?:you|u|your)\b[^.?!]*\bin\s+(?:chinese|french|spanish|german|portuguese|italian|"
+    r"dutch|arabic|russian|japanese|hindi|twi|pidgin|english|korean|swahili|yoruba|"
+    r"igbo|hausa|amharic|thai|vietnamese|tagalog)\b",
+    r"\b(?:in|into)\s+(?:another|other|a\s+different)\s+language\b",
+    r"\bother\s+languages?\b",
+    r"\blanguage\s+support\b",
+    # Memory across conversations.
+    r"\b(?:do|can|will|would)\s+(?:you|u)\s+(?:remember|recall)\b",
+    r"\b(?:do|can|will)\s+(?:you|u)\s+(?:know|recognise|recognize)\s+me\b",
+    r"\b(?:have|had)\s+(?:we|i)\s+(?:spoken|talked|met|chatted)\b",
+    r"\b(?:in|during|from)\s+(?:our|the|my|last)\s+(?:last|previous)\s+"
+    r"(?:conversation|chat|thread|time)\b",
+    r"\b(?:do|does)\s+(?:you|u|this|the\s+assistant)\s+(?:keep|save|store|log|retain)\b",
+    # Privacy, retention and sharing.
+    r"\b(?:is|are)\s+(?:this|my|our|it)\s+(?:private|confidential|secure|safe|encrypted|anonymous)\b",
+    r"\b(?:who|what)\s+can\s+(?:see|read|access|view)\b",
+    r"\b(?:do|does)\s+(?:you|u)\s+(?:share|send|store|keep|log|report)\b",
+    r"\bwhere\s+(?:is|are)\s+(?:my|our|this)\s+(?:data|messages?|question|conversation|chat)\b",
+    r"\bhow\s+long\s+(?:do\s+(?:you|u)|will\s+(?:you|u)|is\s+(?:this|it))\s+"
+    r"(?:keep|store|retain|hold|save)\b",
+    r"\b(?:are|is)\s+(?:my|our)\s+(?:messages?|data|chats?|questions?|conversations?)\s+"
+    r"(?:saved|stored|logged|kept|private|secure)\b",
+    # Accuracy and confidence.
+    r"\bhow\s+(?:accurate|reliable)\s+are\s+(?:you|u)\b",
+    r"\bhow\s+(?:confident|sure|certain)\s+are\s+(?:you|u)\b",
+    r"\b(?:do|can|would)\s+(?:you|u)\s+(?:make\s+(?:things|stuff|it)\s+up|hallucinate|guess)\b",
+    # What the assistant cannot do.
+    r"\bwhat\s+(?:can'?t|cannot|can\s+not|won't|will\s+not)\s+(?:you|u)\b",
+    r"\b(?:can|do)\s+(?:you|u)\s+(?:access|reach|browse|look\s+up|search)\s+"
+    r"(?:the\s+)?(?:internet|web|outside)\b",
+    r"\b(?:do|can)\s+(?:you|u)\s+(?:have\s+(?:internet|web\s+access)|browse)\b",
+    r"\byour\s+(?:limits|limitations|capabilities|abilities)\b",
+]
+
+# A tuple, like `_KEYBOARD_ROWS` and `_SCRIPT_RE` below: a module-level table of
+# fixed patterns, holding nothing that any conversation wrote.
+_META_RE = tuple(re.compile(pattern, re.I) for pattern in META_PATTERNS)
+
+# A question about the assistant, as opposed to one that merely mentions a word from
+# the same family. The bound is what stops a real company question from being caught
+# by a trigger: "what does the Code of Conduct say about languages at work?" is a
+# policy question and is longer than this, so it is left alone and retrieved.
+MAX_META_LENGTH = 80
+
+
+def is_meta_question(text: str) -> bool:
+    """Whether this message is a question about the assistant rather than the documents.
+
+    Decided before the classifier and without a model call, because the answer to it
+    does not depend on the conversation and must not depend on the model being
+    reachable: a reader asking "do you speak French?" at the same moment as an outage
+    still deserves an honest answer rather than an error.
+    """
+    cleaned = normalise(text)
+
+    if not cleaned or len(cleaned) > MAX_META_LENGTH:
+        return False
+
+    # A question mark is what makes these questions rather than remarks, and every
+    # pattern above was written to stand on its own without it so that "do you speak
+    # french." and a bare "languages?" are caught too.
+    return any(pattern.search(cleaned) for pattern in _META_RE)
+
+
+# The scripts a message can arrive in, and the language each is named by when the
+# assistant has to refer to it. Cyrillic is deliberately not called Russian: it is
+# not, and the correction reads better naming the script than guessing a language
+# from it.
+SCRIPT_RANGES = (
+    ("Han", r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"),
+    ("Arabic", r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]"),
+    ("Cyrillic", r"[\u0400-\u04ff]"),
+)
+
+# A tuple, not a generator: `dominant_script` walks this on every message, and a
+# generator is exhausted by the first walk — which silently reduced the whole
+# function to "is this Han?" for every caller after the first.
+_SCRIPT_RE = tuple(
+    (name, re.compile(pattern)) for name, pattern in SCRIPT_RANGES
+)
+
+# How much of a message has to be in one non-Latin script before the message is
+# treated as being written in that script rather than as a Latin sentence with a
+# quotation in it. Sixty per cent is deliberately a majority rather than a couple of
+# characters: "my password is 密码" is an English message that happens to contain
+# something else, and treating it as Chinese would answer the wrong question.
+MAJORITY_SCRIPT = 0.6
+
+
+def dominant_script(text: str) -> str | None:
+    """The script most of this message is written in, or None for Latin and below.
+
+    Counts characters rather than words, because a script that a Latin keyboard cannot
+    produce arrives as runs of characters and a single word of it is enough to be
+    visible. Returns the script's name rather than a language, because the two are
+    not the same thing and only the name is defensible.
+    """
+    letters = [character for character in text if character.isalpha()]
+
+    if not letters:
+        return None
+
+    total = len(letters)
+
+    for name, pattern in _SCRIPT_RE:
+        if len(pattern.findall(text)) / total >= MAJORITY_SCRIPT:
+            return name
+
+    return None
+
+
+def is_latin_script(text: str) -> bool:
+    """Whether this message is readable as ordinary Latin-alphabet text.
+
+    The other half of the script correction: the claim being checked is about the
+    *previous* message, and it can only be believed if that message really was Latin
+    letters in the first place. A reader who says "that was Chinese" about a message
+    that arrived as Chinese characters has not mis-typed anything and must not be
+    told it arrived as random letters.
+    """
+    return not dominant_script(text)
+
+
+# Asking the assistant to see a language in what it received, which is the shape a
+# transmission failure takes: "that is chinese", "was that arabic?", "I wrote that in
+# Japanese". The captured word is the language name, used verbatim in the correction.
+#
+# The verb is allowed on either side of the demonstrative because both orders are how
+# people say it, and "was that arabic?" is exactly as much a correction as "that is
+# arabic".
+SAID_IT_WAS_LANGUAGE_RE = re.compile(
+    r"\b(?:that|it|this|the\s+last\s+(?:message|one|question))"
+    r"\s+(?:was\s+in|is\s+in|was|is|in)\s+([a-z]+)"
+    r"|\b(?:was|is)\s+(?:that|it|this)\s+([a-z]+)\b",
+    re.I,
+)
+
+# The languages a reader is likely to name. Open-ended on purpose — the correction
+# quotes whatever name they used — so this only has to recognise the word as a
+# language at all, not to be the complete list of them.
+LANGUAGE_WORDS = frozenset(
+    """
+    chinese mandarin cantonese french spanish german portuguese italian dutch
+    arabic russian ukrainian polish czech greek hebrew hindi urdu bengali punjabi
+    tamil telugu malayalam kannada marathi gujarati nepali sinhala thai vietnamese
+    korean japanese tagalog indonesian malay swahili yoruba igbo hausa twi pidgin
+    pidgin english ghanaian amharic somali swedish norwegian danish finnish
+    """.split()
+)
+
+
+def claimed_language(text: str) -> str | None:
+    """The language a reader says they wrote in, or None if they did not say.
+
+    Read from their own words rather than guessed from the letters in front of us:
+    in the case this exists for the letters are the ones that failed to survive, so
+    anything inferred from them would be the thing that is already known to be
+    wrong.
+    """
+    match = SAID_IT_WAS_LANGUAGE_RE.search(text)
+
+    if match is None:
+        return None
+
+    word = (match.group(1) or match.group(2) or "").lower()
+
+    # Rejected on being an ordinary English word rather than on being absent from a
+    # list of languages. "that is good" is not a claim about a language; "that is
+    # chineese" is one, misspelled, and a list of correctly spelled names would throw
+    # it away — which is the whole failure this exists for. A near-miss on a known
+    # language is put right, so the correction quotes a word the reader recognises as
+    # their own.
+    if len(word) < MIN_LANGUAGE_WORD_LENGTH or not word.isalpha():
+        return None
+
+    if word in COMMON_WORDS or word in CASUAL_WORDS:
+        return None
+
+    corrected = difflib.get_close_matches(word, LANGUAGE_WORDS, n=1, cutoff=0.8)
+
+    return (corrected[0] if corrected else word).capitalize()
+
+
+# Short enough to be a word rather than a language name. "that is a" is not a claim
+# about anything, and "a" is what the capture reaches there.
+MIN_LANGUAGE_WORD_LENGTH = 3
 
 
 # Asking for more of what has just been answered, with no subject of its own.
@@ -1170,12 +1445,136 @@ def needs_earlier_context(text: str) -> bool:
     return any(re.search(pattern, cleaned, re.I) for pattern in CONTEXT_REFERENCE_PATTERNS)
 
 
+# =============================================================================
+# Elaboration: "tell me about those", not "tell me more"
+# =============================================================================
+# The two are opposites and they were being treated as one. "Anything else?" names
+# no subject and wants what the answer has *not* said; "anything about these
+# departments?" names a subject it expects the reader to still be holding — the ten
+# departments the previous answer just listed — and wants *more about that same
+# subject*. Served as an expansion, the second one is excluded from the very passage
+# that holds the answer: the previous answer cited "Departments and their roles" and
+# displayed it, so the expansion reader held it back and a two-line answer about two
+# of ten departments was the best the corpus could produce.
+#
+# Detected by rule, before the classifier, because the two shapes are fixed vocabulary
+# and the classifier cannot be asked to tell them apart reliably from a single
+# message. It sees the conversation, not the words, so it would read "anything about
+# these departments" as a topic shift like any other.
+
+# A demonstrative pointing back at what was just said. The list is the closed set of
+# English ones; anything else is not English.
+DEMONSTRATIVES = frozenset({"these", "those", "that", "them", "they", "it"})
+
+# Openers that ask for more *of* something rather than naming a new subject. "explain
+# that" and "tell me about them" both carry the subject themselves.
+ELABORATION_OPENERS = (
+    "tell me about",
+    "explain",
+    "elaborate on",
+    "expand on",
+    "go into",
+    "more on",
+    "more about",
+    "what about",
+    "anything about",
+    "details on",
+    "details about",
+    "tell me more about",
+    "say more about",
+    "more detail on",
+    "more details on",
+)
+
+# A noun is what follows the demonstrative. Proving a word is a noun is not possible
+# without a lexicon, so the shape is used instead: a word of at least three letters
+# that is not a question word and not a stopword. "these departments", "those
+# policies", "explain that process" all match; "what else does that say" does not,
+# because nothing follows "that".
+_NOUN_LIKE_MIN = 3
+
+_TRAILING_QUESTION_WORDS = frozenset(
+    {"say", "says", "said", "mean", "means", "meant", "happen", "happens", "tell",
+     "know", "suppose", "think", "exactly", "more", "else"}
+)
+
+STOPWORDISH = frozenset(
+    """
+    a an the and or but of for to in on at by with from as is are was were be been
+    being do does did have has had will would can could should about into over under
+    """.split()
+)
+
+
+def _demonstrative_is_followed_by_a_noun(text: str) -> bool:
+    """Whether a demonstrative here has a noun after it, which is what makes it a subject.
+
+    "about these departments" is a subject. "about these" is a subject the reader
+    expects us to have. "what else does that say" has a demonstrative and nothing
+    after it, and is the expansion this path must not capture.
+    """
+    tokens = re.findall(r"[a-z']+", text.lower())
+
+    for index, token in enumerate(tokens[:-1]):
+        if token not in DEMONSTRATIVES:
+            continue
+
+        follower = tokens[index + 1]
+
+        if (
+            len(follower) >= _NOUN_LIKE_MIN
+            and follower.isalpha()
+            and follower not in STOPWORDISH
+            and follower not in _TRAILING_QUESTION_WORDS
+        ):
+            return True
+
+    return False
+
+
+def is_elaboration(text: str) -> bool:
+    """Whether this asks for more about the subject the last answer was about.
+
+    Two shapes, and both are decided here rather than by the classifier:
+
+    - an opener that asks about something ("tell me about", "explain", "more on",
+      "details about"), which carries the subject itself;
+    - a demonstrative with a noun after it ("these departments", "that policy").
+
+    The two are checked in that order and the second is deliberately the stricter: a
+    bare demonstrative with nothing after it is an expansion, which is what "what else
+    does that say" is, and capturing it here would break a path that works.
+    """
+    cleaned = normalise(text)
+
+    if not cleaned:
+        return False
+
+    # An expansion is one of the two by definition — it names no subject — and the
+    # two shapes overlap heavily ("tell me more" is an expansion phrase and an
+    # elaboration opener). Resolved in favour of the expansion, which is what the
+    # phrase list is for.
+    if cleaned in EXPANSION_PHRASES:
+        return False
+
+    if any(cleaned.startswith(opener) for opener in ELABORATION_OPENERS):
+        return True
+
+    return _demonstrative_is_followed_by_a_noun(cleaned)
+
+
 def classify_by_rules(message: str) -> Category | None:
     """The category these rules decide on their own, or None to ask the model.
 
-    The confidentiality guard is checked first because it is a refusal on grounds
-    of what the data is, and it has to win over any reading of the message's shape
+    The confidentiality guard is checked first because it is a refusal on grounds of
+    what the data is, and it has to win over any reading of the message's shape
     — "thanks, but what is my leave balance?" is a restricted request.
+
+    A question about the assistant comes next, and is a conversational turn: nothing
+    is being asked of the documents. It is here rather than in
+    `is_obvious_conversational` because it is a much wider set than that function's
+    length bound is willing to hold — "do you remember our chats from last month?" is
+    thirty-eight characters and is the question this rule exists for.
 
     An expansion is returned here too, and the caller downgrades it to a follow-up
     when there is no previous answer to continue from: "anything else?" as the
@@ -1184,6 +1583,27 @@ def classify_by_rules(message: str) -> Category | None:
     """
     if is_restricted_request(message):
         return Category.RESTRICTED
+
+    if is_meta_question(message):
+        return Category.CONVERSATIONAL
+
+    # A message written in a script a Latin keyboard cannot produce. Not a question
+    # the documents can be asked: they are English, the retrieval is on English, and
+    # a question in another script retrieves nothing — which the generator then
+    # reports as "the documents do not cover this". Measured on this model, a
+    # Chinese question about leave came back as a confident claim that the leave
+    # policy was not documented. Answered in English from the languages entry
+    # instead, which is true and does not invent a gap in the corpus.
+    if dominant_script(message):
+        return Category.CONVERSATIONAL
+
+    # A claim about the language of the last message. Not a question about the
+    # documents under any reading — "that is chinese" names no policy and "that is
+    # arabic" names no department — so it belongs with the conversational turns,
+    # where it is answered by saying what happened to the text and what that means
+    # for the answer.
+    if claimed_language(message):
+        return Category.CONVERSATIONAL
 
     if is_obvious_conversational(message):
         return Category.CONVERSATIONAL
