@@ -39,7 +39,7 @@ backend/
 │       ├── __init__.py
 │       ├── engine.py      # RAG assistant (classify + retrieve + generate)
 │       ├── guard.py       # Classification and the confidentiality guard (conversational / question / follow-up / expansion / out of scope / restricted)
-│       ├── capabilities.py # What the assistant is and covers, for questions about itself
+│       ├── capabilities.py # The assistant FAQ: every question about itself, with its approved answer
 │       ├── ingest.py      # Document loading & indexing
 │       └── retrieval.py   # Hybrid retrieval: vector + keyword, merged with RRF
 ├── data/                  # Policy markdown documents (13 files)
@@ -56,7 +56,9 @@ backend/
 │   ├── test_conversational.py # Everything that is not a request, answered without retrieval
 │   ├── test_confidentiality.py # What the guard refuses, and what it must not
 │   ├── test_expansion.py       # Continuing an answer from the passages it used
-│   ├── test_hybrid_retrieval.py  # Both searches, and their fusion
+│   ├── test_hybrid_retrieval.py  # Both searches, their fusion, and the golden set
+│   ├── test_transcript_fixes.py  # One conversation, replayed turn by turn
+│   ├── test_stored_citations.py   # Citations as stored and read back
 │   └── test_intent.py      # Which path a message takes before retrieval
 ├── Dockerfile
 ├── requirements.txt
@@ -176,6 +178,8 @@ it is the page's scheme that decides, not the hop behind it.
 | `EMBED_MODEL` | No | `nvidia/nemotron-3-embed-1b` | Model used for retrieval embeddings |
 | `DATABASE_URL` | No | `postgresql://user:password@localhost:5432/knowledge_assistant` | PostgreSQL connection string |
 | `ALLOWED_ORIGINS` | No | `*` | Comma-separated CORS origins. Needed in production because the CSRF origin check compares against it. The browser itself reaches the API through the app's own `/api` proxy, so this no longer governs whether cookies are sent |
+| `HR_EMAIL` | No | `hr@acmetech.example` | Who a reply names when it routes a reader to a human: a gap in the documents, or a question about the assistant |
+| `HR_PHONE` | No | `+233 30 000 0000` | The same contact's number. Configured rather than written into the reply strings so a deployment corrects it in one place |
 | `ENVIRONMENT` | No | `development` | `production` forces `Secure` cookies and refuses the seeded admin |
 | `AUTH_SECRET_KEY` | Yes | — | Signs both token types. At least 32 characters |
 | `COMPANY_EMAIL_DOMAIN` | No | `acmetech.example` | The only domain an account may be created against |
@@ -316,7 +320,7 @@ before it.
 | Conversational | "hey", "thanks", "ok", "there is no question", "who are you?" | A short reply that acknowledges what was said. No retrieval. |
 | Company question | "How many sick days do I get?" | Retrieved and answered from the documents, with citations. |
 | Follow-up | "what about contractors?" | Rewritten into a standalone question first — *what does the Code of Conduct say about contractors?* — then retrieved as above. |
-| Expansion | "anything else?", "tell me more" | Continued from the documents the last answer cited, minus the chunks this thread already showed. Never a gap in the corpus. |
+| Expansion | "anything else?", "tell me more" | Continued from the documents the last answer cited, minus the chunks this thread already **used**. Never a gap in the corpus. |
 | Out of scope | "how many presidents has Ghana had?" | A statement of what the assistant is for. No retrieval. |
 | Restricted | "what is Ama's salary?", "what is my salary?" | The confidentiality notice. No retrieval. |
 
@@ -343,6 +347,73 @@ plus a classification. Everything else goes to the classifier, whose reply is
 validated against a strict schema: an unreadable or unknown category falls back to
 *company question*, so a classifier quirk can never turn an answer the documents
 hold into a refusal.
+
+### Questions about the assistant
+
+"do you understand chinese?" used to be answered *"I'm happy to help with any
+questions you have. Just let me know what you need."* Two things had to be true for
+that, and both were wrong. The description of the assistant said nothing about
+languages, so the question matched no rule and fell through to the conversational
+path; and that path's instructions explicitly **forbid** it from stating facts about
+the assistant, so improvising was all it could do. A direct question cannot be
+answered with an invitation to ask one.
+
+So every fact the assistant states about itself now lives in one editable file,
+`app/rag/capabilities.py`, as a table of entries. Each has an id, the phrases that
+reach it, and the **approved answer**:
+
+| id | covers |
+| --- | --- |
+| `identity` | what it is and what it is for |
+| `topics` | which subjects the documents cover |
+| `sources` | how an answer is produced and how it is cited |
+| `confidence` | what the confidence figure measures |
+| `limits` | what it cannot do — no internet, documents only |
+| `personal_records` | no access to payslips, leave balances or anyone's records |
+| `contact` | who to contact, from `HR_EMAIL` / `HR_PHONE` |
+| `languages` | which languages it can be used in |
+| `memory` | whether earlier conversations are remembered — **unknown** |
+| `privacy` | whether chats are private and how long they are kept — **unknown** |
+
+Three rules, and the order matters:
+
+1. **Rules first.** A recognised question is answered from its entry directly, with
+   no model call.
+2. **Then the model picks an entry id** from the closed list. It never writes an
+   answer, so it cannot invent one — the reply that follows is read out of the table
+   by id.
+3. **An id that does not exist, or a model that cannot be reached,** is answered
+   honestly: *"I'm not sure about that one. I can help with questions about company
+   policies, onboarding, leave and IT setup."*
+
+**The two unknown entries are the point of the table.** Nobody has established what
+this deployment does with a conversation once it is closed, or who can see one, and
+an invented assurance about a reader's data is the worst answer available to either
+question. Each carries a `TODO` marker for whoever edits the file and says *"I don't
+know"* in the answer itself, because "is TODO" is not an answer to anybody.
+
+**The languages entry was measured, not guessed.** The configured model was asked
+the same questions in Chinese and French. It follows both correctly — it identified
+the subject of 公司的请假政策是什么？ and answered a French question accurately given
+the context — but the **documents are English only**, so a question in another
+language retrieves nothing, and the model's own answer to that was to report that
+the documents did not cover the topic: a confident false `not_found` produced
+entirely by the language of the question. The entry therefore claims comprehension
+and states where it bites, and claims no fluency, because none was measured.
+
+**Scripts.** A message mostly in Han, Arabic or Cyrillic is answered **in English**
+from the languages entry, naming the script rather than guessing a language from it
+(Cyrillic is not Russian). And when a reader says *"that is chinese"* about a
+message that arrived as Latin letters, the reply says so first — *"That came through
+as random letters rather than Chinese,"* — then answers. The claim is checked against
+what actually arrived, so a reader whose Chinese arrived intact is never told it
+became random letters. The language named is **the reader's own word**, near-miss
+corrected: *"chineese"* is a language claim, and a list of correctly spelled names
+would throw it away.
+
+The script helper reads the *script*, so a **French or Spanish question is not
+detected** — Latin script cannot be told from English by character alone. That is a
+known limit of this approach, and the languages entry is what covers it.
 
 ### The confidentiality guard
 
@@ -426,10 +497,70 @@ When those documents are read out, the reply is `no_more_info`: *that covers
 everything the documents say on this topic*. Not `not_found`, which claims the
 corpus has a gap, and not a repeated search that finds the same passages again.
 
+`no_more_info` is reachable **only from an answer**, and that is what the cited
+documents decide: a turn that cited something read passages, and passages can be
+exhausted. A turn that found nothing cited nothing, so the thread has no documents
+at all, and *there is nothing left* would be a claim about documents that were never
+opened. So "anything else?" after a `not_found` is answered instead with
+
+> I didn't find anything on that, so I have nothing to add. You could rephrase it, or
+> contact HR at hr@acmetech.example or +233 30 000 0000.
+
+as a `conversational` turn, with **no search run at all**. The documents were never
+found, so there is nothing to continue from; reporting the topic as exhausted would
+be the second false claim about the same absence.
+
+### Elaboration, which is the opposite of an expansion
+
+`anything else?` and `anything about these departments?` both continue the documents
+behind the last answer, and they want **opposite things** from them.
+
+| | subject | passages already shown |
+|---|---|---|
+| **Expansion** — "anything else", "what else", "go on" | none named | held back |
+| **Elaboration** — "anything about these…", "tell me about them", "explain that", "details on…" | the previous answer's subject | **included** |
+
+Treated as one, the second was excluded from the very passage that holds its answer.
+"how many departments do we have?" cited *Departments and their roles*, used it only
+for the number ten, and displayed it — so the elaboration reader held it back and a
+two-line answer about two of ten departments was the best the corpus could produce,
+at a confidence of 3. Read as an elaboration, it is anchored on the previous
+question plus the follow-up and nothing is held back, and it reads all ten out of
+the one passage.
+
+Detection is by rule, **before** the classifier, from a demonstrative with a noun
+after it or an opener that carries the subject (*tell me about*, *explain*, *more
+on*, *details about*). The classifier cannot be asked to do it: it sees the
+conversation rather than the wording, so it reads both as a continuation of the same
+topic. A bare demonstrative with nothing after it — *what else does that say* — is an
+expansion, and the rule says so.
+
 A topic-shifting follow-up keeps the rewrite, and if the rewrite retrieves nothing
 the question it continues is tried in its place: a paraphrase is a worse handle on
 the corpus than the question the reader actually asked. Only when that finds
 nothing either is the turn a gap in the corpus.
+
+### A message nobody can read
+
+A keyboard accident is answered with the first of a small ladder, escalating as more
+of them arrive in a row: a shrug the first time, two example questions the second,
+patience after that. The count is read out of the conversation's stored messages
+rather than remembered, so a reload changes neither number.
+
+The rule is a **majority, not a single word**: a message is unreadable when at least
+**60%** of its tokens are not words, after the allowlist of acronyms, corpus
+vocabulary, names and pidgin. The old rule was "a familiar word exempts the
+message", which "heyjffdk hdj this" defeated with its trailing *this*. It was
+answered as a real message, so the **next** gibberish message in that conversation
+was answered as though it were the first — the streak never started, and a reader
+whose keyboard was broken got the shrug twice instead of the examples.
+
+Sixty per cent is a majority on purpose, because the two errors are not equal: a
+real question contains several ordinary words and clears the bar comfortably (*what
+does the leave policy say* is one unknown of four), while anything typed by accident
+is nearly all unknown by construction. A **single** word is judged by its shape
+instead — *grievance* is in no word list, and a majority reading of one word is
+meaningless, since it is 100% unknown whatever it is.
 
 Only the retrieval path may report a gap in the corpus. That is the whole reason
 each response carries a `kind` rather than an "answered: false": *not found* means
@@ -499,6 +630,39 @@ at all, which is why no answer that works today changes.
 `MIN_SCORE` and `KEYWORD_MIN_SCORE` are separate floors because the two scores are
 not comparable. Raising either makes questions look "not found" with no error
 anywhere, so change them with the corpus in mind.
+
+### "Who is the head of the IT department?"
+
+Asked because it answered `not_found`, which is either correct or a retrieval defect,
+and the difference had to be established rather than assumed. **It is correct.**
+
+**The corpus names no individual anywhere.** Every document carries an owning *team*
+or office — `Owner: IT Support & Security`, `Owner: Office of the CTO`,
+`Owner: People & Culture (HR)` — and a sweep of all 62 chunks for *head / lead /
+director / chief / owner / manager* returns roles (*"your line manager"*, *"the
+department head"*, as a step in a pay review) and offices, never a person. There is
+no chunk that answers the question.
+
+What retrieval returns for it, measured on the deployed corpus:
+
+| chunk | cosine | BM25 |
+| --- | --- | --- |
+| IT & VPN Setup Guide > IT & VPN Setup Guide | **0.354** | 0.35 |
+| Technical Departments & Tech Stack > Overview | 0.316 | 2.79 |
+| Company Overview > Company Overview | 0.314 | 2.76 |
+| Technical Departments > Technical Departments | 0.265 | 2.42 |
+
+The best chunk is at 0.354, under `MIN_SCORE` of 0.40, and the keyword leg's higher
+BM25 scores are the words *"IT"* and *"head"* matching document headers. **No floor
+was touched.** There is no right chunk to lower a floor *for* — dropping `MIN_SCORE`
+to 0.354 would admit those same passages and turn a correct gap into a confident
+wrong answer about who runs a department.
+
+It is pinned in the golden set's other half, `EXPECTED_GAPS`, next to the questions
+that *should* retrieve something. A correct `not_found` is only correct while its
+reason holds, so each entry carries the reason and the set fails if one of them ever
+starts retrieving — which is the signal to add the document that answers it and
+revisit the expectation.
 
 ## API Endpoints
 
@@ -657,9 +821,9 @@ draws each outcome as its own thing rather than inferring it from the citations:
 | --- | --- | --- |
 | `answer` | Answered from the documents. | Yes |
 | `not_found` | In scope, and the documents do not cover it. HR owns the gap. | No |
-| `no_more_info` | "Anything else?" on a topic those passages have already covered. Not a gap. | No |
+| `no_more_info` | "Anything else?" on a topic whose documents have been read out. Only reachable from an answer. Not a gap. | No |
 | `out_of_scope` | A real request that was never something this assistant answers. | No |
-| `conversational` | Not a request: a greeting, an acknowledgement, a remark, a question about the assistant. | No |
+| `conversational` | Not a request: a greeting, an acknowledgement, a remark, a question about the assistant. Also "anything else?" after a `not_found`, which has nothing to add. | No |
 | `restricted` | A person's private records, the asker's or anybody else's. Not shared through here. | No |
 
 `not_found` is produced by exactly one path — retrieval and generation for a real
@@ -670,8 +834,48 @@ as a false gap in the corpus.
 
 Each citation carries a `chunk_id`: a hash of the document, section and text of
 the passage, stable across restarts of the index. It is how a continuation knows
-which passages it has already shown, and it is stored with the message rather than
+which passages it has already used, and it is stored with the message rather than
 held in memory, so "anything else?" works the same after a reload.
+
+**Only the passages the answer actually used are cited.** Retrieval returns the best
+few regardless — it cannot know which the model will reach for — and displaying all
+of them asserts support for parts of the answer nothing stands behind. "How many
+departments do we have?" retrieved four passages and cited four; the number came
+from one, and *Company size* and *Cross-cutting tools* were decoration.
+
+So the generator is asked to report which passages it used, on a line after the
+answer that `done` strips before anyone sees it:
+
+```
+There are ten departments.
+USED: dc01fffb90892d9d
+```
+
+Those keys are validated against the passages that answer was actually given, and
+an unknown key is discarded — a key that was never offered would be a citation
+naming a passage the reader cannot be shown, and would then be held back from
+"anything else?" on the strength of a passage that does not exist. If nothing
+validates (a truncated stream, or a model that spent its budget thinking), the best
+**two** by score are shown: an answer drawn with no evidence behind it is the one
+outcome this must not produce.
+
+The same set is what an expansion excludes, so "anything else?" never re-quotes a
+passage the reader has read, and an elaboration — which wants more about the *same*
+subject — can go back to the passage the previous answer only counted from.
+
+Citations are then **numbered in display order**, with a document's passages kept
+together. The client derives the number from array position and groups by document
+on the card, so passages that alternate between two documents were displayed
+*1, 3, 2*: the third belongs under the first document's heading. *Grounded in N
+documents* is counted from the displayed passages only.
+
+**No schema change was needed, and none was made.** The used passages are the
+persisted ones, each marked `"used": true`, inside the `sources` JSON the column
+already holds — so there is no migration, no nullable column and no second head.
+Rows written before the flag existed hold every retrieved passage rather than only
+the used ones; they load unchanged and their citations are treated as used, because
+those passages *were* displayed and no migration can recover a distinction that was
+never recorded.
 
 `done` also carries the older `status` and `answered` for a client that has not
 been redeployed, and every stored message carries both, so a thread written before
