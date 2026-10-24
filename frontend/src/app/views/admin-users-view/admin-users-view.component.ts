@@ -15,6 +15,7 @@ import {
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
   COMPANY_EMAIL_DOMAIN,
+  NAME_ALLOWED_PATTERN,
   isCompanyEmail,
   looksLikeEmailAddress,
 } from '../../core/models/auth.model';
@@ -314,7 +315,7 @@ interface HandedOver {
         <button app-button type="button" variant="ghost" (click)="closeCreate()">
           Go back
         </button>
-        <button app-button type="button" [disabled]="isBusy()" (click)="createUser()">
+        <button app-button type="button" [disabled]="!canCreateUser() || isBusy()" (click)="createUser()">
           {{ isBusy() ? 'Creating…' : 'Create account' }}
         </button>
       </div>
@@ -509,8 +510,34 @@ export class AdminUsersViewComponent {
   /** Whether the add-user dialog is showing. */
   protected readonly isCreating = signal(false);
 
+  private clearTimer(timer: ReturnType<typeof setTimeout>): void {
+    clearTimeout(timer);
+    this.timers.delete(timer);
+  }
+
+  private scheduleAutoClear(): void {
+    for (const timer of this.timers) {
+      this.clearTimer(timer);
+    }
+
+    const timer = setTimeout(() => {
+      this.timers.delete(timer);
+      this.notice.set('');
+    }, 7000);
+
+    this.timers.add(timer);
+  }
+
+  private clearAllTimers(): void {
+    for (const timer of Array.from(this.timers)) {
+      this.clearTimer(timer);
+    }
+  }
+
   protected openCreate(): void {
     this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.resetCreateForm();
     this.isCreating.set(true);
   }
@@ -518,6 +545,8 @@ export class AdminUsersViewComponent {
   protected closeCreate(): void {
     this.isCreating.set(false);
     this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.resetCreateForm();
   }
 
@@ -525,6 +554,9 @@ export class AdminUsersViewComponent {
   protected readonly createEmail = signal('');
   protected readonly createPassword = signal('');
   protected readonly createRole = signal<Role>('employee');
+
+  /** Timers used to auto-clear transient notices. */
+  private readonly timers = new Set<ReturnType<typeof setTimeout>>();
 
   /** The account whose role is being changed, or null. */
   protected readonly roleTarget = signal<UserSummaryDto | null>(null);
@@ -568,18 +600,27 @@ export class AdminUsersViewComponent {
 
   /** Feeds the name field into the form and the signal together. */
   protected onCreateNameChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.createName.set(value);
     this.createForm.controls.name.setValue(value);
   }
 
   /** Feeds the email field into the form and the signal together. */
   protected onCreateEmailChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.createEmail.set(value);
-    this.createForm.controls.email.setValue(value);
+    this.createForm.controls.email.setValue(value.trim());
   }
 
   /** Feeds the password field into the form and the signal together. */
   protected onCreatePasswordChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.createPassword.set(value);
     this.createForm.controls.password.setValue(value);
   }
@@ -589,13 +630,17 @@ export class AdminUsersViewComponent {
       return '';
     }
 
-    const value = this.createName().trim();
+    const raw = this.createName();
+    const value = raw.trim();
 
     if (value === '') {
       return 'Enter their full name';
     }
     if (value.length > MAX_NAME_LENGTH) {
       return `Use at most ${MAX_NAME_LENGTH} characters`;
+    }
+    if (!NAME_ALLOWED_PATTERN.test(value)) {
+      return 'Name can only contain letters, spaces, hyphens and apostrophes';
     }
 
     return '';
@@ -630,6 +675,12 @@ export class AdminUsersViewComponent {
 
     if (value === '') {
       return 'Choose a password for them';
+    }
+    if (value.trim() === '') {
+      return 'Password cannot be only spaces';
+    }
+    if (/\s/.test(value)) {
+      return 'Password cannot contain spaces';
     }
     if (value.length < MIN_PASSWORD_LENGTH) {
       return `Use at least ${MIN_PASSWORD_LENGTH} characters`;
@@ -702,10 +753,45 @@ export class AdminUsersViewComponent {
     }
   }
 
+  /** Whether the create-user button should be enabled. */
+  protected readonly canCreateUser = computed(() => {
+    if (this.isBusy()) {
+      return false;
+    }
+
+    const name = this.createName().trim();
+    const email = this.createEmail().trim();
+    const password = this.createPassword();
+
+    if (name === '' || email === '' || password === '') {
+      return false;
+    }
+    if (name.length > MAX_NAME_LENGTH || !NAME_ALLOWED_PATTERN.test(name)) {
+      return false;
+    }
+    if (password.trim() === '' || /\s/.test(password)) {
+      return false;
+    }
+    if (password.length < MIN_PASSWORD_LENGTH || password.length > MAX_PASSWORD_LENGTH) {
+      return false;
+    }
+    if (!looksLikeEmailAddress(email) || !isCompanyEmail(email)) {
+      return false;
+    }
+
+    return this.createForm.valid;
+  });
+
   /** Creates the account and shows the password once. */
   protected createUser(): void {
     this.submitted.set(true);
     this.notice.set('');
+    this.clearAllTimers();
+
+    if (!this.canCreateUser()) {
+      this.scheduleAutoClear();
+      return;
+    }
 
     // The messages are what the reader sees, but the form's own validity is checked
     // too: it is the same set of rules, and having only one of the two decide is how
@@ -716,6 +802,7 @@ export class AdminUsersViewComponent {
       this.createPasswordError() ||
       this.createForm.invalid
     ) {
+      this.scheduleAutoClear();
       return;
     }
 
@@ -727,6 +814,7 @@ export class AdminUsersViewComponent {
     this.auth.createAccount(name, email, this.createRole(), password).subscribe({
       next: (user) => {
         this.isBusy.set(false);
+        this.clearAllTimers();
         this.closeCreate();
         this.handedOver.set({
           heading: `${user.name} can sign in now`,
@@ -738,6 +826,7 @@ export class AdminUsersViewComponent {
       error: (error: unknown) => {
         this.isBusy.set(false);
         this.notice.set(readFailure(error, 'The account could not be created.'));
+        this.scheduleAutoClear();
       },
     });
   }

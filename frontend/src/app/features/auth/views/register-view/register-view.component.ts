@@ -10,6 +10,7 @@ import {
   MAX_NAME_LENGTH,
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
+  NAME_ALLOWED_PATTERN,
   isCompanyEmail,
   looksLikeEmailAddress,
 } from '../../../../core/models/auth.model';
@@ -128,7 +129,7 @@ import { GENERIC_REFUSAL, readRefusalOr } from '../../utils/read-backend-refusal
             (valueChange)="onConfirmPasswordChange($event)"
           />
 
-          <button app-button type="submit" size="lg" [fullWidth]="true" [disabled]="isSubmitting()">
+          <button app-button type="submit" size="lg" [fullWidth]="true" [disabled]="!canSubmit() || isSubmitting()">
             @if (isSubmitting()) {
               <app-icon name="loader-2" [size]="16" class="animate-spin" />
               <span>Sending…</span>
@@ -208,6 +209,9 @@ export class RegisterViewComponent {
   /** The password as typed a second time, to check it against the first. */
   protected readonly confirmPassword = signal('');
 
+  /** Timers used to auto-clear transient notices/errors. */
+  private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+
   /** Whether the form has been sent at all, which is what turns errors on. */
   private readonly submitted = signal(false);
 
@@ -226,13 +230,17 @@ export class RegisterViewComponent {
       return '';
     }
 
-    const name = this.name().trim();
+    const raw = this.name();
+    const name = raw.trim();
 
     if (name === '') {
       return 'Enter your full name';
     }
     if (name.length > MAX_NAME_LENGTH) {
       return `Use at most ${MAX_NAME_LENGTH} characters`;
+    }
+    if (!NAME_ALLOWED_PATTERN.test(name)) {
+      return 'Name can only contain letters, spaces, hyphens and apostrophes';
     }
 
     return '';
@@ -264,17 +272,50 @@ export class RegisterViewComponent {
     return '';
   });
 
+  private clearTimer(timer: ReturnType<typeof setTimeout>): void {
+    clearTimeout(timer);
+    this.timers.delete(timer);
+  }
+
+  private scheduleAutoClear(): void {
+    for (const timer of this.timers) {
+      this.clearTimer(timer);
+    }
+
+    const timer = setTimeout(() => {
+      this.timers.delete(timer);
+      this.notice.set('');
+    }, 7000);
+
+    this.timers.add(timer);
+  }
+
+  private clearAllTimers(): void {
+    for (const timer of Array.from(this.timers)) {
+      this.clearTimer(timer);
+    }
+  }
+
   protected onNameChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.name.set(value);
     this.form.controls.name.setValue(value);
   }
 
   protected onEmailChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.email.set(value);
     this.form.controls.email.setValue(value);
   }
 
   protected onPasswordChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.password.set(value);
     this.form.controls.password.setValue(value);
   }
@@ -304,6 +345,9 @@ export class RegisterViewComponent {
   });
 
   protected onConfirmPasswordChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.confirmPassword.set(value);
     this.form.controls.confirmPassword.setValue(value);
   }
@@ -319,6 +363,12 @@ export class RegisterViewComponent {
     if (value === '') {
       return 'Choose a password';
     }
+    if (value.trim() === '') {
+      return 'Password cannot be only spaces';
+    }
+    if (/\s/.test(value)) {
+      return 'Password cannot contain spaces';
+    }
     if (value.length < MIN_PASSWORD_LENGTH) {
       return `Use at least ${MIN_PASSWORD_LENGTH} characters`;
     }
@@ -329,9 +379,48 @@ export class RegisterViewComponent {
     return '';
   });
 
+  /** Whether the register button should be enabled. */
+  protected readonly canSubmit = computed(() => {
+    if (this.isSubmitting() || this.isSent()) {
+      return false;
+    }
+
+    const name = this.name().trim();
+    const email = this.email().trim();
+    const password = this.password();
+    const confirmPassword = this.confirmPassword();
+
+    if (name === '' || email === '' || password === '' || confirmPassword === '') {
+      return false;
+    }
+    if (name.length > MAX_NAME_LENGTH || !NAME_ALLOWED_PATTERN.test(name)) {
+      return false;
+    }
+    if (password.trim() === '' || /\s/.test(password)) {
+      return false;
+    }
+    if (password.length < MIN_PASSWORD_LENGTH || password.length > MAX_PASSWORD_LENGTH) {
+      return false;
+    }
+    if (confirmPassword !== password) {
+      return false;
+    }
+    if (!looksLikeEmailAddress(email) || !isCompanyEmail(email)) {
+      return false;
+    }
+
+    return this.form.valid;
+  });
+
   protected onSubmit(): void {
     this.submitted.set(true);
     this.notice.set('');
+    this.clearAllTimers();
+
+    if (!this.canSubmit()) {
+      this.scheduleAutoClear();
+      return;
+    }
 
     if (
       this.nameError() ||
@@ -340,6 +429,7 @@ export class RegisterViewComponent {
       this.confirmPasswordError() ||
       this.form.invalid
     ) {
+      this.scheduleAutoClear();
       return;
     }
 
@@ -347,8 +437,8 @@ export class RegisterViewComponent {
 
     this.auth
       .requestAccess(
-        this.form.controls.name.value,
-        this.form.controls.email.value,
+        this.form.controls.name.value.trim(),
+        this.form.controls.email.value.trim(),
         // Nobody chooses this. The form holds the least privileged role, so the
         // request asks for an employee account and an administrator can raise it when
         // they look at it.
@@ -359,10 +449,12 @@ export class RegisterViewComponent {
         next: () => {
           this.isSubmitting.set(false);
           this.isSent.set(true);
+          this.clearAllTimers();
         },
         error: (error: unknown) => {
           this.isSubmitting.set(false);
           this.notice.set(readRequestFailure(error));
+          this.scheduleAutoClear();
         },
       });
   }
