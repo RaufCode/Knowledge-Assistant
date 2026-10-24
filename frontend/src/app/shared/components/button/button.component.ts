@@ -75,7 +75,8 @@ const RADIUS_CLASSES: Record<ButtonSize, string> = {
   host: {
     class:
       'inline-flex cursor-pointer items-center justify-center font-medium whitespace-nowrap ' +
-      'transition-colors disabled:pointer-events-none disabled:opacity-50',
+      'transition-[color,background-color,border-color,opacity] duration-200 ' +
+      'disabled:pointer-events-none disabled:opacity-40 disabled:saturate-50',
     '[class]': 'classes()',
   },
   // The host element is a real button or link, so the component only adds
