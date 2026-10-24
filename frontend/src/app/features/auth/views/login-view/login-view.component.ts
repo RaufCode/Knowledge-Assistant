@@ -5,7 +5,11 @@ import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { ButtonComponent } from '../../../../shared/components/button/button.component';
 import { FormFieldComponent } from '../../../../shared/components/form-field/form-field.component';
 import { IconComponent } from '../../../../shared/components/icon/icon.component';
-import { COMPANY_EMAIL_DOMAIN, isCompanyEmail } from '../../../../core/models/auth.model';
+import {
+  COMPANY_EMAIL_DOMAIN,
+  isCompanyEmail,
+  looksLikeEmailAddress,
+} from '../../../../core/models/auth.model';
 import { AuthService } from '../../../../core/services/auth.service';
 import { AuthLayoutComponent } from '../../components/auth-layout/auth-layout.component';
 import { GENERIC_REFUSAL, readRefusalOr } from '../../utils/read-backend-refusal';
@@ -90,7 +94,7 @@ const SIGNED_OUT_ROUTES = new Set(['/login', '/register', '/accept-invite', '/pe
           <span>Remember me</span>
         </label>
 
-        <button app-button type="submit" size="lg" [fullWidth]="true" [disabled]="isSubmitting()">
+        <button app-button type="submit" size="lg" [fullWidth]="true" [disabled]="!canSubmit() || isSubmitting()">
           @if (isSubmitting()) {
             <app-icon name="loader-2" [size]="16" class="animate-spin" />
             <span>Signing in…</span>
@@ -184,23 +188,26 @@ export class LoginViewComponent {
   /** Explanatory message shown after an attempt. */
   protected readonly notice = signal('');
 
+  /** Timers used to auto-clear transient notices/errors. */
+  private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+
   /** Email error, once the form has been sent. */
   protected readonly emailError = computed(() => {
     if (!this.submitted()) {
       return '';
     }
 
-    const control = this.form.controls.email;
+    const address = this.email().trim();
 
-    if (control.hasError('required')) {
+    if (address === '') {
       return 'Enter your work email';
     }
-    if (control.hasError('email')) {
+    if (!looksLikeEmailAddress(address)) {
       return 'That does not look like an email address';
     }
     // Worth saying before the round trip, because a personal address is the
     // likeliest mistake here and the server will refuse it anyway.
-    if (!isCompanyEmail(control.value)) {
+    if (!isCompanyEmail(address)) {
       return `Use your @${this.companyDomain} work email`;
     }
 
@@ -213,7 +220,19 @@ export class LoginViewComponent {
       return '';
     }
 
-    return this.form.controls.password.hasError('required') ? 'Enter your password' : '';
+    const value = this.password();
+
+    if (value === '') {
+      return 'Enter your password';
+    }
+    if (value.trim() === '') {
+      return 'Password cannot be only spaces';
+    }
+    if (/\s/.test(value)) {
+      return 'Password cannot contain spaces';
+    }
+
+    return '';
   });
 
   constructor() {
@@ -236,36 +255,93 @@ export class LoginViewComponent {
     }
   }
 
+  private clearTimer(timer: ReturnType<typeof setTimeout>): void {
+    clearTimeout(timer);
+    this.timers.delete(timer);
+  }
+
+  private scheduleAutoClear(): void {
+    for (const timer of this.timers) {
+      this.clearTimer(timer);
+    }
+
+    const timer = setTimeout(() => {
+      this.timers.delete(timer);
+      this.notice.set('');
+    }, 7000);
+
+    this.timers.add(timer);
+  }
+
+  private clearAllTimers(): void {
+    for (const timer of Array.from(this.timers)) {
+      this.clearTimer(timer);
+    }
+  }
+
   /** Feeds the field into the form, which owns the validation. */
   protected onEmailChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.email.set(value);
-    this.form.controls.email.setValue(value);
+    this.form.controls.email.setValue(value.trim());
   }
 
   /** Feeds the field into the form, which owns the validation. */
   protected onPasswordChange(value: string): void {
+    this.submitted.set(false);
+    this.notice.set('');
+    this.clearAllTimers();
     this.password.set(value);
     this.form.controls.password.setValue(value);
   }
 
+  /** Whether the sign-in button should be enabled. */
+  protected readonly canSubmit = computed(() => {
+    if (this.isSubmitting()) {
+      return false;
+    }
+
+    const email = this.email().trim();
+    const password = this.password();
+
+    if (email === '' || password === '') {
+      return false;
+    }
+    if (password.trim() === '' || /\s/.test(password)) {
+      return false;
+    }
+    if (!looksLikeEmailAddress(email) || !isCompanyEmail(email)) {
+      return false;
+    }
+
+    return this.form.valid;
+  });
+
   /**
    * Sends the form to the backend.
-   *
-   * `markAllAsTouched` first, so that a submit with nothing typed in shows every
-   * message rather than only the first one the reader runs into.
    */
   protected onSubmit(): void {
     this.submitted.set(true);
     this.notice.set('');
+    this.clearAllTimers();
+
+    if (!this.canSubmit()) {
+      this.scheduleAutoClear();
+      return;
+    }
 
     if (this.emailError() || this.passwordError() || this.form.invalid) {
+      this.scheduleAutoClear();
       return;
     }
 
     this.isSubmitting.set(true);
 
-    this.auth.login(this.form.controls.email.value, this.form.controls.password.value).subscribe({
+    this.auth.login(this.form.controls.email.value.trim(), this.password()).subscribe({
       next: (user) => {
+        this.clearAllTimers();
         // `null` is the server's "your password was right and an administrator has to
         // approve this account". A separate screen, because nothing is wrong and a 401
         // here would send somebody to reset a password that is fine.
@@ -286,6 +362,7 @@ export class LoginViewComponent {
         this.auth.verifySession().subscribe({
           next: (persists) => {
             this.isSubmitting.set(false);
+            this.clearAllTimers();
 
             if (persists) {
               void this.router.navigate([this.returnUrl()]);
@@ -309,9 +386,11 @@ export class LoginViewComponent {
                 'rather than https, because the session cookie is only stored on a ' +
                 'secure connection. Sign in again once that is sorted.',
             );
+            this.scheduleAutoClear();
           },
           error: () => {
             this.isSubmitting.set(false);
+            this.clearAllTimers();
             void this.router.navigate([this.returnUrl()]);
           },
         });
@@ -319,6 +398,7 @@ export class LoginViewComponent {
       error: (error: unknown) => {
         this.isSubmitting.set(false);
         this.notice.set(readSignInFailure(error));
+        this.scheduleAutoClear();
       },
     });
   }
