@@ -11,10 +11,12 @@ import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 
 import {
+  MAX_NAME_LENGTH,
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
   COMPANY_EMAIL_DOMAIN,
   isCompanyEmail,
+  looksLikeEmailAddress,
 } from '../../core/models/auth.model';
 import type { Role } from '../../core/models/auth.model';
 import type { UserSummaryDto } from '../../core/models/access-request.model';
@@ -246,8 +248,9 @@ interface HandedOver {
           autocomplete="off"
           placeholder="Ama Konadu"
           [required]="true"
-          [(value)]="createName"
+          [value]="createName()"
           [error]="createNameError()"
+          (valueChange)="onCreateNameChange($event)"
         />
 
         <app-form-field
@@ -258,8 +261,9 @@ interface HandedOver {
           autocomplete="off"
           [placeholder]="'you@' + companyDomain"
           [required]="true"
-          [(value)]="createEmail"
+          [value]="createEmail()"
           [error]="createEmailError()"
+          (valueChange)="onCreateEmailChange($event)"
         />
 
         <app-form-field
@@ -269,8 +273,9 @@ interface HandedOver {
           autocomplete="new-password"
           placeholder="Something they can remember"
           [required]="true"
-          [(value)]="createPassword"
+          [value]="createPassword()"
           [error]="createPasswordError()"
+          (valueChange)="onCreatePasswordChange($event)"
         />
 
         <p class="-mt-2 text-xs text-muted-foreground">
@@ -505,14 +510,14 @@ export class AdminUsersViewComponent {
   protected readonly isCreating = signal(false);
 
   protected openCreate(): void {
-    this.submitted = false;
+    this.submitted.set(false);
     this.resetCreateForm();
     this.isCreating.set(true);
   }
 
   protected closeCreate(): void {
     this.isCreating.set(false);
-    this.submitted = false;
+    this.submitted.set(false);
     this.resetCreateForm();
   }
 
@@ -551,14 +556,53 @@ export class AdminUsersViewComponent {
     ],
   });
 
-  private submitted = false;
+  /**
+   * Whether an attempt has been made, which is when the fields start complaining.
+   *
+   * A signal rather than a plain field: the error computeds below read it, and a
+   * plain field is not something a `computed` can depend on. It cached the empty
+   * message from before the first attempt and never recomputed, so every attempt
+   * looked valid and an empty form went to the backend.
+   */
+  private readonly submitted = signal(false);
 
-  protected readonly createNameError = computed(() =>
-    this.submitted && this.createName().trim() === '' ? 'Enter their full name' : '',
-  );
+  /** Feeds the name field into the form and the signal together. */
+  protected onCreateNameChange(value: string): void {
+    this.createName.set(value);
+    this.createForm.controls.name.setValue(value);
+  }
+
+  /** Feeds the email field into the form and the signal together. */
+  protected onCreateEmailChange(value: string): void {
+    this.createEmail.set(value);
+    this.createForm.controls.email.setValue(value);
+  }
+
+  /** Feeds the password field into the form and the signal together. */
+  protected onCreatePasswordChange(value: string): void {
+    this.createPassword.set(value);
+    this.createForm.controls.password.setValue(value);
+  }
+
+  protected readonly createNameError = computed(() => {
+    if (!this.submitted()) {
+      return '';
+    }
+
+    const value = this.createName().trim();
+
+    if (value === '') {
+      return 'Enter their full name';
+    }
+    if (value.length > MAX_NAME_LENGTH) {
+      return `Use at most ${MAX_NAME_LENGTH} characters`;
+    }
+
+    return '';
+  });
 
   protected readonly createEmailError = computed(() => {
-    if (!this.submitted) {
+    if (!this.submitted()) {
       return '';
     }
 
@@ -566,6 +610,9 @@ export class AdminUsersViewComponent {
 
     if (value === '') {
       return 'Enter their work email';
+    }
+    if (!looksLikeEmailAddress(value)) {
+      return 'That does not look like an email address';
     }
     if (!isCompanyEmail(value)) {
       return `Use their @${this.companyDomain} work email`;
@@ -575,7 +622,7 @@ export class AdminUsersViewComponent {
   });
 
   protected readonly createPasswordError = computed(() => {
-    if (!this.submitted) {
+    if (!this.submitted()) {
       return '';
     }
 
@@ -657,18 +704,27 @@ export class AdminUsersViewComponent {
 
   /** Creates the account and shows the password once. */
   protected createUser(): void {
-    this.submitted = true;
+    this.submitted.set(true);
     this.notice.set('');
 
-    if (this.createNameError() || this.createEmailError() || this.createPasswordError()) {
+    // The messages are what the reader sees, but the form's own validity is checked
+    // too: it is the same set of rules, and having only one of the two decide is how
+    // the two drifted apart in the first place.
+    if (
+      this.createNameError() ||
+      this.createEmailError() ||
+      this.createPasswordError() ||
+      this.createForm.invalid
+    ) {
       return;
     }
 
     this.isBusy.set(true);
+    const name = this.createName().trim();
     const email = this.createEmail().trim();
     const password = this.createPassword();
 
-    this.auth.createAccount(this.createName().trim(), email, this.createRole(), password).subscribe({
+    this.auth.createAccount(name, email, this.createRole(), password).subscribe({
       next: (user) => {
         this.isBusy.set(false);
         this.closeCreate();

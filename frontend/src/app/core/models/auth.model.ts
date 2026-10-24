@@ -99,6 +99,39 @@ export const MAX_NAME_LENGTH = 120;
 export const COMPANY_EMAIL_DOMAIN = 'acmetech.example';
 
 /**
+ * The longest address the backend will accept.
+ *
+ * Mirrored here for the same reason as the password and name limits: a value the
+ * field accepts only to have the server refuse it is a round trip that told the
+ * reader nothing the form could not have told them sooner.
+ */
+export const MAX_EMAIL_LENGTH = 254;
+
+/**
+ * A deliberately small shape check: something before the `@`, something after it,
+ * and a dot in the domain.
+ *
+ * It is not an attempt to implement RFC 5322. The point is to catch the mistakes a
+ * person actually makes — a missing `@`, a missing domain, a trailing dot — before
+ * the request leaves the browser. The backend uses a real address parser and is
+ * still the one that decides.
+ */
+const EMAIL_ADDRESS_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Whether an address has the shape of an email address.
+ *
+ * Separate from {@link isCompanyEmail} so the two mistakes can be told apart: a
+ * malformed address is a typo, while a well-formed address at another domain is a
+ * person using the wrong account. One message for both would be wrong for one.
+ */
+export function looksLikeEmailAddress(value: string): boolean {
+  const address = value.trim();
+
+  return address.length <= MAX_EMAIL_LENGTH && EMAIL_ADDRESS_PATTERN.test(address);
+}
+
+/**
  * Whether an address looks like it belongs to the company.
  *
  * A convenience for the message under the field, and nothing more: the same check
@@ -111,6 +144,7 @@ export function isCompanyEmail(value: string): boolean {
 
   return domain === COMPANY_EMAIL_DOMAIN;
 }
+
 
 /** Human-readable names for each role, as they are shown to a person. */
 export const ROLE_LABELS: Record<Role, string> = {

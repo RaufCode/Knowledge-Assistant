@@ -7,9 +7,11 @@ import { FormFieldComponent } from '../../../../shared/components/form-field/for
 import { IconComponent } from '../../../../shared/components/icon/icon.component';
 import {
   COMPANY_EMAIL_DOMAIN,
+  MAX_NAME_LENGTH,
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
   isCompanyEmail,
+  looksLikeEmailAddress,
 } from '../../../../core/models/auth.model';
 import type { Role } from '../../../../core/models/auth.model';
 import { AuthService } from '../../../../core/services/auth.service';
@@ -219,9 +221,22 @@ export class RegisterViewComponent {
   protected readonly notice = signal('');
 
   /** Name error, once the form has been sent. */
-  protected readonly nameError = computed(() =>
-    this.submitted() && this.name().trim() === '' ? 'Enter your full name' : '',
-  );
+  protected readonly nameError = computed(() => {
+    if (!this.submitted()) {
+      return '';
+    }
+
+    const name = this.name().trim();
+
+    if (name === '') {
+      return 'Enter your full name';
+    }
+    if (name.length > MAX_NAME_LENGTH) {
+      return `Use at most ${MAX_NAME_LENGTH} characters`;
+    }
+
+    return '';
+  });
 
   /** Address error, once the form has been sent. */
   protected readonly emailError = computed(() => {
@@ -238,7 +253,7 @@ export class RegisterViewComponent {
     // Two different mistakes, and they are told apart: something that is not an
     // address at all is a typo, and something that is an address somewhere else is a
     // person in the wrong place. One message for both would be wrong for one of them.
-    if (!address.includes('@')) {
+    if (!looksLikeEmailAddress(address)) {
       return 'That does not look like an email address';
     }
 

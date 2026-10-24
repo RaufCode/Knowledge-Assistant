@@ -8,6 +8,8 @@ import { AuthService } from '../../core/services/auth.service';
 import { AdminUsersViewComponent } from './admin-users-view.component';
 
 const USERS_URL = `${API_BASE_URL}/api/auth/users?page=1`;
+const ACCOUNTS_URL = `${API_BASE_URL}/api/auth/accounts`;
+const DOMAIN = 'acmetech.example';
 
 /** Accounts, as the backend pages them. */
 const USERS = [
@@ -45,6 +47,36 @@ describe('AdminUsersViewComponent', () => {
     Array.from(element().querySelectorAll<HTMLButtonElement>('button')).find(
       (candidate) => candidate.textContent?.trim().includes(label),
     ) as HTMLButtonElement;
+
+  /** The input inside the field whose label starts with this text. */
+  const createField = (label: string): HTMLInputElement => {
+    const field = Array.from(
+      element().querySelectorAll<HTMLElement>('app-form-field'),
+    ).find((candidate) =>
+      candidate.querySelector('label')?.textContent?.trim().startsWith(label),
+    );
+
+    return field?.querySelector('input') as HTMLInputElement;
+  };
+
+  /** Types into the add-user dialog the way the browser does. */
+  const typeIntoCreateField = (label: string, value: string): void => {
+    const input = createField(label);
+
+    input.value = value;
+    input.dispatchEvent(new Event('input'));
+    fixture.detectChanges();
+  };
+
+  const openCreateDialog = async (): Promise<void> => {
+    button('Add a user').click();
+    await render();
+  };
+
+  const submitNewUser = async (): Promise<void> => {
+    button('Create account').click();
+    await render();
+  };
 
   const signedInAs = async (role: 'employee' | 'admin'): Promise<void> => {
     const bootstrap = TestBed.inject(AuthService).bootstrap();
@@ -160,6 +192,68 @@ describe('AdminUsersViewComponent', () => {
       // re-read: only a page emptied out from under the pager needs the server.
       expect(element().textContent).not.toContain('ama@acmetech.example');
       http.expectNone(USERS_URL);
+    });
+
+    it('validates the add-user form before sending anything', async () => {
+      await openCreateDialog();
+
+      // Submitting empty fields must show errors and never reach the server.
+      await submitNewUser();
+
+      expect(element().textContent).toContain('Enter their full name');
+      expect(element().textContent).toContain('Enter their work email');
+      expect(element().textContent).toContain('Choose a password for them');
+      http.expectNone(ACCOUNTS_URL);
+
+      // A malformed address and a short password are refused on the client side too.
+      typeIntoCreateField('Full name', 'Kofi Mensah');
+      typeIntoCreateField('Work email', 'kofi');
+      typeIntoCreateField('Password', 'short');
+      await submitNewUser();
+
+      expect(element().textContent).toContain('That does not look like an email address');
+      expect(element().textContent).toContain('Use at least 8 characters');
+      http.expectNone(ACCOUNTS_URL);
+
+      // An address outside the company is refused before a round trip.
+      typeIntoCreateField('Work email', `kofi@gmail.com`);
+      await submitNewUser();
+
+      expect(element().textContent).toContain(`Use their @${DOMAIN} work email`);
+      http.expectNone(ACCOUNTS_URL);
+    });
+
+    it('trims the name and email but never trims the password when creating a user', async () => {
+      await openCreateDialog();
+
+      typeIntoCreateField('Full name', '  Kofi Mensah  ');
+      typeIntoCreateField('Work email', `  kofi@${DOMAIN}  `);
+      typeIntoCreateField('Password', '  their-own-pass1  ');
+      await submitNewUser();
+
+      const request = http.expectOne(ACCOUNTS_URL);
+
+      expect(request.request.method).toBe('POST');
+      expect(request.request.body).toEqual({
+        name: 'Kofi Mensah',
+        email: `kofi@${DOMAIN}`,
+        role: 'employee',
+        password: '  their-own-pass1  ',
+      });
+      request.flush({
+        user: {
+          id: 'u2',
+          name: 'Kofi Mensah',
+          email: `kofi@${DOMAIN}`,
+          role: 'employee',
+        },
+      });
+      await render();
+
+      expect(element().textContent).toContain('Kofi Mensah can sign in now');
+      expect(element().textContent).toContain('kofi@acmetech.example');
+      expect(element().textContent).toContain('their-own-pass1');
+      http.expectOne(USERS_URL).flush(PAGE);
     });
   });
 
