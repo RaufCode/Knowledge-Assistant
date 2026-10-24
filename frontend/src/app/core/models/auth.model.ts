@@ -95,6 +95,15 @@ export const MAX_PASSWORD_LENGTH = 128;
  */
 export const MAX_NAME_LENGTH = 120;
 
+/**
+ * A full name must only contain letters, spaces, hyphens and apostrophes.
+ *
+ * Digits are not allowed because names do not contain them, and rejecting them
+ * catches accidental input like phone numbers or IDs before they reach the
+ * backend.
+ */
+export const NAME_ALLOWED_PATTERN = /^[A-Za-zÀ-ÖØ-öø-ÿ\s'-]+$/;
+
 /** The company domain an address has to be in, for the hint on the login screen. */
 export const COMPANY_EMAIL_DOMAIN = 'acmetech.example';
 
