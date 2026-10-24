@@ -90,11 +90,11 @@ describe('RegisterViewComponent', () => {
     expect(element().textContent).toContain('Sign in with the password you just chose');
   });
 
-  it('trims the name and the address but never the password', async () => {
+  it('trims the name and the address before sending them', async () => {
     type(0, '  Kofi Mensah  ');
     type(1, `  kofi@${DOMAIN}  `);
-    type(2, '  their-own-pass1  ');
-    type(3, '  their-own-pass1  ');
+    type(2, 'their-own-pass1');
+    type(3, 'their-own-pass1');
     await submit();
 
     const request = http.expectOne(REQUEST_URL);
@@ -104,12 +104,20 @@ describe('RegisterViewComponent', () => {
       name: 'Kofi Mensah',
       email: `kofi@${DOMAIN}`,
       role: 'employee',
-      // Deliberately untrimmed. A password is whatever the person chose, and quietly
-      // removing a space from it gives them a password they have never typed and will
-      // be told is wrong.
-      password: '  their-own-pass1  ',
+      password: 'their-own-pass1',
     });
     request.flush({ status: 'received' });
+  });
+
+  it('refuses a password containing spaces before a round trip', async () => {
+    type(0, 'Kofi Mensah');
+    type(1, `kofi@${DOMAIN}`);
+    type(2, 'their own pass1');
+    type(3, 'their own pass1');
+    await submit();
+
+    expect(element().textContent).toContain('Password cannot contain spaces');
+    http.expectNone(REQUEST_URL);
   });
 
   it('never shows a choice of role, and asks for the least privileged one', async () => {

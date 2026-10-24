@@ -13,7 +13,15 @@ import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { ButtonComponent } from '../../../../shared/components/button/button.component';
 import { FormFieldComponent } from '../../../../shared/components/form-field/form-field.component';
 import { IconComponent } from '../../../../shared/components/icon/icon.component';
-import { MIN_PASSWORD_LENGTH } from '../../../../core/models/auth.model';
+import {
+  COMPANY_EMAIL_DOMAIN,
+  MAX_NAME_LENGTH,
+  MAX_PASSWORD_LENGTH,
+  MIN_PASSWORD_LENGTH,
+  NAME_ALLOWED_PATTERN,
+  isCompanyEmail,
+  looksLikeEmailAddress,
+} from '../../../../core/models/auth.model';
 import { AuthService } from '../../../../core/services/auth.service';
 import { AuthLayoutComponent } from '../../components/auth-layout/auth-layout.component';
 
@@ -145,7 +153,7 @@ interface PasswordRule {
             (valueChange)="onConfirmationChange($event)"
           />
 
-          <button app-button type="submit" size="lg" [fullWidth]="true" [disabled]="isSubmitting()">
+          <button app-button type="submit" size="lg" [fullWidth]="true" [disabled]="!canSubmit() || isSubmitting()">
             @if (isSubmitting()) {
               <app-icon name="loader-2" [size]="16" class="animate-spin" />
               <span>Saving…</span>
@@ -270,29 +278,86 @@ export class AcceptInviteViewComponent {
         label: `At least ${MIN_PASSWORD_LENGTH} characters`,
         met: value.length >= MIN_PASSWORD_LENGTH,
       },
+      {
+        label: 'No spaces',
+        met: !/\s/.test(value),
+      },
+      {
+        label: `At most ${MAX_PASSWORD_LENGTH} characters`,
+        met: value.length <= MAX_PASSWORD_LENGTH,
+      },
     ];
   });
 
   /** Whether every password rule is satisfied. */
   private readonly isPasswordValid = computed(() => this.rules().every((rule) => rule.met));
 
+  /** Whether the button should be enabled, which is only when the whole form is valid. */
+  protected readonly canSubmit = computed(() => {
+    if (this.isSubmitting() || !this.isInvitationValid()) {
+      return false;
+    }
+
+    const name = this.name().trim();
+    const email = this.email().trim();
+    const password = this.password();
+
+    if (name === '' || email === '' || password === '' || this.confirmation() === '') {
+      return false;
+    }
+    if (name.length > MAX_NAME_LENGTH || !NAME_ALLOWED_PATTERN.test(name)) {
+      return false;
+    }
+    if (!looksLikeEmailAddress(email) || !isCompanyEmail(email)) {
+      return false;
+    }
+    if (!this.isPasswordValid() || password !== this.confirmation()) {
+      return false;
+    }
+
+    return this.form.valid;
+  });
+
   /** Name error, once the form has been sent. */
-  protected readonly nameError = computed(() =>
-    this.submitted() && this.name().trim() === '' ? 'Enter your full name' : '',
-  );
+  protected readonly nameError = computed(() => {
+    if (!this.submitted()) {
+      return '';
+    }
+
+    const value = this.name().trim();
+
+    if (value === '') {
+      return 'Enter your full name';
+    }
+    if (value.length > MAX_NAME_LENGTH) {
+      return `Use at most ${MAX_NAME_LENGTH} characters`;
+    }
+    if (!NAME_ALLOWED_PATTERN.test(value)) {
+      return 'Name can only contain letters, spaces, hyphens and apostrophes';
+    }
+
+    return '';
+  });
 
   /** Email error, once the form has been sent. */
   protected readonly emailError = computed(() => {
     if (!this.submitted()) {
       return '';
     }
-    if (this.email().trim() === '') {
+
+    const address = this.email().trim();
+
+    if (address === '') {
       return 'Enter your work email';
     }
+    if (!looksLikeEmailAddress(address)) {
+      return 'That does not look like an email address';
+    }
+    if (!isCompanyEmail(address)) {
+      return `Use your @${COMPANY_EMAIL_DOMAIN} work email`;
+    }
 
-    return this.form.controls.email.hasError('email')
-      ? 'That does not look like an email address'
-      : '';
+    return '';
   });
 
   /** Password error, once the form has been sent. */
@@ -300,8 +365,23 @@ export class AcceptInviteViewComponent {
     if (!this.submitted()) {
       return '';
     }
-    if (this.password() === '') {
+
+    const value = this.password();
+
+    if (value === '') {
       return 'Choose a password';
+    }
+    if (value.trim() === '') {
+      return 'Password cannot be only spaces';
+    }
+    if (/\s/.test(value)) {
+      return 'Password cannot contain spaces';
+    }
+    if (value.length < MIN_PASSWORD_LENGTH) {
+      return `Use at least ${MIN_PASSWORD_LENGTH} characters`;
+    }
+    if (value.length > MAX_PASSWORD_LENGTH) {
+      return `Use at most ${MAX_PASSWORD_LENGTH} characters`;
     }
 
     return this.isPasswordValid() ? '' : 'Choose a password that satisfies every rule below';
@@ -368,7 +448,7 @@ export class AcceptInviteViewComponent {
     this.submitted.set(true);
     this.notice.set('');
 
-    if (this.hasErrors()) {
+    if (!this.canSubmit() || this.hasErrors()) {
       return;
     }
 

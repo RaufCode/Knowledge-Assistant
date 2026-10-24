@@ -194,41 +194,40 @@ describe('AdminUsersViewComponent', () => {
       http.expectNone(USERS_URL);
     });
 
-    it('validates the add-user form before sending anything', async () => {
+    it('keeps the add-user button disabled until every field is valid', async () => {
       await openCreateDialog();
 
-      // Submitting empty fields must show errors and never reach the server.
+      // An empty form cannot be submitted at all.
+      expect(button('Create account').disabled).toBe(true);
       await submitNewUser();
-
-      expect(element().textContent).toContain('Enter their full name');
-      expect(element().textContent).toContain('Enter their work email');
-      expect(element().textContent).toContain('Choose a password for them');
       http.expectNone(ACCOUNTS_URL);
 
-      // A malformed address and a short password are refused on the client side too.
+      // A malformed address and a short password keep it disabled.
       typeIntoCreateField('Full name', 'Kofi Mensah');
       typeIntoCreateField('Work email', 'kofi');
       typeIntoCreateField('Password', 'short');
+      expect(button('Create account').disabled).toBe(true);
       await submitNewUser();
-
-      expect(element().textContent).toContain('That does not look like an email address');
-      expect(element().textContent).toContain('Use at least 8 characters');
       http.expectNone(ACCOUNTS_URL);
 
-      // An address outside the company is refused before a round trip.
+      // So does an address outside the company.
       typeIntoCreateField('Work email', `kofi@gmail.com`);
+      expect(button('Create account').disabled).toBe(true);
       await submitNewUser();
-
-      expect(element().textContent).toContain(`Use their @${DOMAIN} work email`);
       http.expectNone(ACCOUNTS_URL);
+
+      // Only a complete, valid form enables it.
+      typeIntoCreateField('Work email', `kofi@${DOMAIN}`);
+      typeIntoCreateField('Password', 'their-own-pass1');
+      expect(button('Create account').disabled).toBe(false);
     });
 
-    it('trims the name and email but never trims the password when creating a user', async () => {
+    it('trims the name and email before creating a user', async () => {
       await openCreateDialog();
 
       typeIntoCreateField('Full name', '  Kofi Mensah  ');
       typeIntoCreateField('Work email', `  kofi@${DOMAIN}  `);
-      typeIntoCreateField('Password', '  their-own-pass1  ');
+      typeIntoCreateField('Password', 'their-own-pass1');
       await submitNewUser();
 
       const request = http.expectOne(ACCOUNTS_URL);
@@ -238,7 +237,7 @@ describe('AdminUsersViewComponent', () => {
         name: 'Kofi Mensah',
         email: `kofi@${DOMAIN}`,
         role: 'employee',
-        password: '  their-own-pass1  ',
+        password: 'their-own-pass1',
       });
       request.flush({
         user: {
@@ -254,6 +253,18 @@ describe('AdminUsersViewComponent', () => {
       expect(element().textContent).toContain('kofi@acmetech.example');
       expect(element().textContent).toContain('their-own-pass1');
       http.expectOne(USERS_URL).flush(PAGE);
+    });
+
+    it('refuses a password with spaces before sending anything', async () => {
+      await openCreateDialog();
+
+      typeIntoCreateField('Full name', 'Kofi Mensah');
+      typeIntoCreateField('Work email', `kofi@${DOMAIN}`);
+      typeIntoCreateField('Password', 'their own pass1');
+
+      expect(button('Create account').disabled).toBe(true);
+      await submitNewUser();
+      http.expectNone(ACCOUNTS_URL);
     });
   });
 

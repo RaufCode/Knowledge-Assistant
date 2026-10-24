@@ -7,7 +7,7 @@ import { API_BASE_URL } from '../../../../core/api.config';
 import { AcceptInviteViewComponent } from './accept-invite-view.component';
 
 const TOKEN = 'a-token-long-enough-to-be-one';
-const PASSWORD = 'correct horse 1!';
+const PASSWORD = 'correct-horse-1!';
 
 describe('AcceptInviteViewComponent', () => {
   let fixture: ComponentFixture<AcceptInviteViewComponent>;
@@ -136,7 +136,7 @@ describe('AcceptInviteViewComponent', () => {
       type(3, 'short');
       await submit();
 
-      expect(element().textContent).toContain('satisfies every rule');
+      expect(element().textContent).toContain('Use at least 8 characters');
       http.expectNone(`${API_BASE_URL}/api/auth/accept-invite`);
     });
 
@@ -145,7 +145,7 @@ describe('AcceptInviteViewComponent', () => {
       await render();
 
       type(2, PASSWORD);
-      type(3, 'something else 2@');
+      type(3, 'something-else-2@');
       await submit();
 
       expect(element().textContent).toContain('Passwords do not match');

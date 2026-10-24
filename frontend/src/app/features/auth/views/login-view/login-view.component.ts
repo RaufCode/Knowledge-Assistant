@@ -7,6 +7,8 @@ import { FormFieldComponent } from '../../../../shared/components/form-field/for
 import { IconComponent } from '../../../../shared/components/icon/icon.component';
 import {
   COMPANY_EMAIL_DOMAIN,
+  MAX_PASSWORD_LENGTH,
+  MIN_PASSWORD_LENGTH,
   isCompanyEmail,
   looksLikeEmailAddress,
 } from '../../../../core/models/auth.model';
@@ -231,6 +233,12 @@ export class LoginViewComponent {
     if (/\s/.test(value)) {
       return 'Password cannot contain spaces';
     }
+    if (value.length < MIN_PASSWORD_LENGTH) {
+      return `Use at least ${MIN_PASSWORD_LENGTH} characters`;
+    }
+    if (value.length > MAX_PASSWORD_LENGTH) {
+      return `Use at most ${MAX_PASSWORD_LENGTH} characters`;
+    }
 
     return '';
   });
@@ -310,6 +318,9 @@ export class LoginViewComponent {
       return false;
     }
     if (password.trim() === '' || /\s/.test(password)) {
+      return false;
+    }
+    if (password.length < MIN_PASSWORD_LENGTH || password.length > MAX_PASSWORD_LENGTH) {
       return false;
     }
     if (!looksLikeEmailAddress(email) || !isCompanyEmail(email)) {

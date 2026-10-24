@@ -40,7 +40,7 @@ describe('LoginViewComponent', () => {
   /** Types a valid pair and sends the form. */
   const signIn = async (
     email = 'ama.mensah@acmetech.example',
-    password = 'correct horse 1!',
+    password = 'correct-horse-1!',
   ): Promise<void> => {
     type(0, email);
     type(1, password);
@@ -171,7 +171,7 @@ describe('LoginViewComponent', () => {
     expect(request.request.method).toBe('POST');
     expect(request.request.body).toEqual({
       email: 'ama.mensah@acmetech.example',
-      password: 'correct horse 1!',
+      password: 'correct-horse-1!',
     });
 
     // Cookies are the session, so the call has to be allowed to carry them.
@@ -458,6 +458,6 @@ describe('LoginViewComponent', () => {
     );
 
     // The one thing that must never be written down, whatever else happens.
-    expect(JSON.stringify(localStorage)).not.toContain('correct horse 1!');
+    expect(JSON.stringify(localStorage)).not.toContain('correct-horse-1!');
   });
 });
