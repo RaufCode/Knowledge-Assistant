@@ -135,9 +135,11 @@ that tells you what to fix rather than one that looks like a broken interceptor.
 ### Where the API is, and why the phone was different
 
 `frontend/public/config.json` is `""`, which means the app serves `/api` from its
-own origin: the dev-server proxy in `proxy.conf.json` in development, and the
-Express reverse proxy in `src/server.ts` in production. The backend's address is
-`API_ORIGIN`, and the browser is never told it — every request it makes is to the
+own origin: the dev-server proxy in `proxy.conf.json` in development, the Express
+reverse proxy in `src/server.ts` when the app is server-rendered on Render, and the
+external rewrite in `frontend/vercel.json` when it is static on Vercel. The
+backend's address is `API_ORIGIN` on Render and the rewrite `destination` on
+Vercel, and the browser is never told it — every request it makes is to the
 address the page came from.
 
 That is what makes the session stick. The session is `httpOnly` cookies, and a
@@ -1050,9 +1052,9 @@ calls the app's address:
 
 - `API_ORIGIN` on the app service is the backend, and is what the proxy forwards to.
 - `ALLOWED_ORIGINS` and `CSRF_TRUSTED_ORIGINS` govern CORS and the CSRF origin
-  check. Neither needs the app's own origin listed: the request reaches the backend
-  naming the host it was sent to, which the backend recognises as its own. They still
-  matter for anything calling the backend directly.
+  check. The Express proxy rewrites the forwarded `Origin` to the backend's own, so
+  on Render the app's origin does not have to be listed. They still matter for
+  anything calling the backend directly — and for the Vercel rewrite, see below.
 - `FRONTEND_BASE_URL` is where invitation links point.
 
 `render.yaml` sets all of these, including `API_ORIGIN`. Nothing has to be read off
@@ -1094,6 +1096,68 @@ The service log holds the literal `API_ORIGIN is not set`. Note that a service c
 before a key was added to `render.yaml` never receives it, because a blueprint only
 applies env vars when it creates or re-syncs the service — so set it in the dashboard
 and check the build command matches the blueprint's `npm ci && npm run build`.
+
+## Deployment (Vercel)
+
+The same app deploys to Vercel without a second code path. `frontend/vercel.json`
+publishes the browser bundle and does the two jobs the Express server does on Render:
+
+| Vercel route | What it does |
+| --- | --- |
+| `/api/:path*` | External rewrite to `https://knowledge-assistant-black.vercel.app/api/:path*` |
+| `/(.*)` | SPA fallback to `/index.csr.html`, so client-side routes survive a refresh |
+
+The rewrite is the important one. The browser still calls `/api` on the address the
+page came from, so the session cookies stay first-party and `AUTH_COOKIE_SAMESITE`
+can stay at `lax`. No CORS is involved, because from the browser's point of view
+there is only one origin. Caching is disabled for the rewritten routes, since they
+carry per-user responses and `Set-Cookie`.
+
+SSR stays a Render feature: on Vercel the deployment is the static client bundle, so
+the client-rendered routes are rendered on the client. The login screen is one of
+them, which only means the first paint arrives a moment later than it does on Render.
+
+### Frontend
+
+1. Import the repo and set **Root Directory** to `frontend`, framework preset
+   **Angular**.
+2. Build command and output directory come from `frontend/vercel.json`
+   (`npm run build`, `dist/frontend/browser`); leave the dashboard overrides empty.
+3. No environment variables are required. `config.json` stays `""`, which points at
+   the rewrite.
+
+### Backend
+
+Deploy `backend/` as a Python project, then set:
+
+| Variable | Value |
+| --- | --- |
+| `ALLOWED_ORIGINS` | Include `https://internal-knowledge-assistant-fawn.vercel.app` |
+| `CSRF_TRUSTED_ORIGINS` | Same origin, spelled exactly (scheme, host, no trailing slash) |
+| `FRONTEND_BASE_URL` | `https://internal-knowledge-assistant-fawn.vercel.app` |
+| `AUTH_COOKIE_SAMESITE` | `lax` — the rewrite makes the calls same-origin |
+
+The origin entries are not optional on Vercel the way they are on Render. The Express
+proxy rewrites `Origin` to the backend's own; a Vercel rewrite forwards the browser's
+`Origin` unchanged, so the backend sees the frontend's address and compares it against
+`CSRF_TRUSTED_ORIGINS`. Missing it fails the first write with
+`403 ... which is not an allowed origin`, while reads and sign-in still look fine.
+
+Preview deployment hostnames change per build, so either add the specific preview
+origin you are testing or give the project a stable domain and trust that one.
+
+### Switching the backend
+
+The backend address appears in exactly two files:
+
+- `frontend/vercel.json` — the `/api` rewrite `destination`, used by the Vercel app.
+- `render.yaml` — `API_ORIGIN`, used by the Render app's Express proxy.
+
+Change both when the API moves, and add the frontend origins to
+`CSRF_TRUSTED_ORIGINS` on the backend. On a backend deployed somewhere that cannot
+edit env vars, `ALLOWED_ORIGINS=*` with an empty `CSRF_TRUSTED_ORIGINS` makes the
+origin check a no-op and leaves the double-submit token as the protection; it is a
+deliberate trade, not the default.
 
 ## API Docs
 
