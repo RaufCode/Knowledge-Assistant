@@ -17,7 +17,7 @@ python-jose[cryptography]
 # backend at import time and raises on 4.1+, with a message about password length
 # that points nowhere near the real cause.
 passlib[bcrypt]
-bcrypt==4.0.1
+bcrypt==5.0.0
 
 # Rate limiting on the two endpoints worth guessing against.
 slowapi
